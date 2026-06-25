@@ -4,8 +4,8 @@ r"""
 
 Дерево:
   <base>/<отрасль>/<категория полноты контактов>/<компания>/
-        ├── досье_компании_<компания>.docx
-        └── стратегия_коммуникации_<компания>.docx
+        ├── досье_компании_<компания>.docx          (карта бизнес-процессов, агент-1)
+        └── контакты_и_точки_входа_<компания>.docx  (контакты/роли/филиалы, агент-2)
 
 Категория считается по 4 полям: email, телефон, сайт, контактное лицо (ЛПР):
   все есть       -> "есть все контактные данные"
@@ -14,8 +14,10 @@ r"""
   нет ничего     -> "нет контактов"
 
 Файлы .docx сейчас — ВАЛИДНЫЕ ЗАГОТОВКИ (шапка + реквизиты + источники).
-Когда будет готов генератор контента, подмени тела generate_dossier()/
-generate_strategy() — сигнатуры и остальной конвейер не трогаются.
+Содержательные документы рендерят агенты (company_research_agent — карта процессов,
+contact_research_agent — контакты); заготовки generate_dossier()/generate_contacts()
+используются для --dry-run и как подстраховка. generate_strategy() оставлена на
+случай возврата документа стратегии.
 
 Диск дёргается через CLI `yacli` (та же OAuth-сессия, что в скилле yacli-disk):
   yacli disk mkdir  <disk:/путь>
@@ -224,6 +226,32 @@ def generate_strategy(lead, path):
     _make_docx(path, P)
 
 
+def generate_contacts(lead, path):
+    """ЗАГОТОВКА контактов и точек входа. Содержательный отчёт рендерит агент-2."""
+    P = [
+        ("Контакты и точки входа", True),
+        (lead.get("name") or "", True),
+        (f"ИНН: {lead.get('_inn', '')} · ОГРН: {lead.get('_ogrn', '')}", False),
+        ("", False),
+        ("Ключевые точки входа", True),
+        (f"Известный ЛПР: {lead.get('contact_person', '')} "
+         f"— {lead.get('_lpr_post', '')}", False),
+        ("", False),
+        ("Контакты", True),
+        (f"Телефон: {lead.get('phone', '')}", False),
+        (f"Email: {lead.get('email', '')}", False),
+        (f"Сайт: {lead.get('website', '')}", False),
+        ("", False),
+        ("Филиалы", True), ("(заполнить)", False),
+        ("", False),
+        ("Источники", True),
+        (f"RusProfile: {lead.get('_rusprofile_url', '')}", False),
+        ("", False),
+        ("— Документ-заготовка. Контакты будут собраны вторым агентом. —", False),
+    ]
+    _make_docx(path, P)
+
+
 # ------------------------------- yacli (Диск) --------------------------------
 
 def _yacli(args, account=None):
@@ -313,11 +341,11 @@ def organize_to_disk(leads, base="disk:/Лиды", account=None, workers=4,
         _mkdir(comp_dir, account)                 # родитель уже создан
         dn = _safe(lead.get("name"))
         d_local = os.path.join(tmp, f"{idx}_d.docx")
-        s_local = os.path.join(tmp, f"{idx}_s.docx")
+        c_local = os.path.join(tmp, f"{idx}_c.docx")
         generate_dossier(lead, d_local)
-        generate_strategy(lead, s_local)
+        generate_contacts(lead, c_local)
         _upload(d_local, f"{comp_dir}/досье_компании_{dn}.docx", account, overwrite)
-        _upload(s_local, f"{comp_dir}/стратегия_коммуникации_{dn}.docx", account, overwrite)
+        _upload(c_local, f"{comp_dir}/контакты_и_точки_входа_{dn}.docx", account, overwrite)
         return 2
 
     try:
