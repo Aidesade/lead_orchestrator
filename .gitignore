@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets / sessions — НЕ коммитим
+.rp_cookies.json
+.rp_profile/
+*.token
+settings.local.json
+.env
+
+# Outputs / артефакты прогонов
+*.xlsx
+leads_*.json
+_*.json
+_*.html
+*.docx
+
+# OS
+Thumbs.db
+desktop.ini

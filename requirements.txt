@@ -1,0 +1,13 @@
+# Lead Orchestrator — внешние зависимости
+# (stdlib-модули: json, urllib, asyncio, subprocess, zipfile и т.п. — не перечислены)
+
+claude-agent-sdk>=0.2.103   # SDK-обёртки orchestrator_agent / company_research_agent
+anyio                       # увод блокирующего сбора в поток внутри async-инструментов SDK
+undetected-chromedriver     # обход Cloudflare у RusProfile (uc, НЕ Playwright)
+openpyxl                    # сборка Excel по шаблону D:\лиды
+python-docx                 # рендер досье/стратегии .docx (опционально, у заготовок свой stdlib-zip)
+
+# Внешние требования среды (не pip):
+#   - реальный Chrome (uc подбирает ChromeDriver под версию через browser_util.chrome_major)
+#   - yacli CLI (Яндекс Диск): %LOCALAPPDATA%\Programs\yacli\bin\yacli.exe, разовый `yacli login disk`
+#   - ENV: ANTHROPIC_API_KEY (фаза research), DADATA_TOKEN, CHECKO_TOKEN (обогащение — опционально)
