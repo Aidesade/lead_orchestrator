@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 r"""
-Оркестратор второй фазы: по каждой собранной компании — глубокий ресёрч и
-ДВА документа (досье + стратегия коммуникации), которые ПЕРЕЗАПИСЫВАЮТ заготовки
-в папке компании на Яндекс Диске (папки уже создал первый агент / disk_organize).
+Оркестратор второй фазы: по каждой собранной компании — последовательно ДВА агента и
+ДВА документа (карта бизнес-процессов + контакты/точки входа), которые ПЕРЕЗАПИСЫВАЮТ
+заготовки в папке компании на Яндекс Диске (папки создаёт первый этап / disk_organize).
 
 Архитектура (детерминированный Python-оркестратор, НЕ LLM-оркестратор):
-  leads.json (тот же, что у агента 1)
+  leads.json (тот же, что на этапе сбора)
     └─ по каждой компании, пул из --workers параллельно:
-         1 ресёрч-сессия (opus + WebSearch, ОДИН раз) рендерит ОБА .docx во temp
-         → upload во ВЖЕ существующую папку disk:/Лиды/<отрасль>/<полнота>/<компания>/
-           перезаписывая досье_компании_<имя>.docx и стратегия_коммуникации_<имя>.docx
+         агент-1 (карта бизнес-процессов, opus+WebSearch) рендерит досье во temp и
+         отдаёт payload агенту-2 (контакты, opus+WebSearch) — оба .docx во temp
+         → upload во УЖЕ существующую папку disk:/Лиды/<отрасль>/<полнота>/<компания>/
+           перезаписывая досье_компании_<имя>.docx и контакты_и_точки_входа_<имя>.docx
 
 Путь на Диске считается ровно теми же функциями disk_organize, что и у агента 1,
 поэтому файлы ложатся в его папки (mkdir идемпотентный — папка уже есть).
@@ -48,162 +49,30 @@ except Exception:
     pass
 
 
-# ----------------------------- рендер .docx -----------------------------
+# ----------------------- контекст карты процессов -----------------------
 
-def _strategy_doc(payload, path):
-    """Стратегия коммуникации -> компактный .docx (≤1 стр.). python-docx."""
-    from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
+def _biz_context(dossier):
+    """Сжать payload карты бизнес-процессов агента-1 в короткий текст для агента-2.
 
-    GRAY = RGBColor(0x5A, 0x5A, 0x5A)
-    doc = Document()
-    sec = doc.sections[0]
-    for m in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
-        setattr(sec, m, Cm(1.2))
-    normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = Pt(9.5)
-    normal.paragraph_format.space_after = Pt(2)
-    normal.paragraph_format.line_spacing = 1.0
-
-    def heading(text):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(5)
-        p.paragraph_format.space_after = Pt(2)
-        r = p.add_run(text)
-        r.bold = True
-        r.font.size = Pt(11)
-
-    def bullet(lead, rest=""):
-        p = doc.add_paragraph(style="List Bullet")
-        p.paragraph_format.space_after = Pt(1)
-        p.add_run(lead).bold = True
-        if rest:
-            p.add_run(" — " + rest)
-
-    title = doc.add_paragraph()
-    title.paragraph_format.space_after = Pt(1)
-    tr = title.add_run(payload.get("company") or "Стратегия коммуникации")
-    tr.bold = True
-    tr.font.size = Pt(13)
-    if payload.get("subtitle"):
-        sp = doc.add_paragraph()
-        sp.paragraph_format.space_after = Pt(3)
-        sr = sp.add_run(payload["subtitle"])
-        sr.font.size = Pt(8.5)
-        sr.font.color.rgb = GRAY
-
-    if payload.get("summary"):
-        heading("Сводка")
-        doc.add_paragraph(payload["summary"])
-    if payload.get("channel"):
-        heading("Канал захода и ЛПР")
-        doc.add_paragraph(payload["channel"])
-    if payload.get("first_touch"):
-        heading("Первое касание")
-        doc.add_paragraph(payload["first_touch"])
-    if payload.get("script"):
-        heading("Сценарий разговора")
-        for b in payload["script"]:
-            doc.add_paragraph(b, style="List Bullet").paragraph_format.space_after = Pt(1)
-    if payload.get("offer_fit"):
-        heading("Оффер под боли (on-prem LLM + RAG)")
-        for f in payload["offer_fit"]:
-            bullet((f.get("pain") or "").rstrip(":"), f.get("solution", ""))
-    if payload.get("objections"):
-        heading("Возражения и ответы")
-        for o in payload["objections"]:
-            bullet((o.get("q") or "").rstrip(":"), o.get("a", ""))
-    if payload.get("next_step"):
-        heading("Следующий шаг")
-        doc.add_paragraph(payload["next_step"])
-    if payload.get("sources"):
-        sp = doc.add_paragraph()
-        sp.paragraph_format.space_before = Pt(4)
-        sr = sp.add_run(payload["sources"])
-        sr.font.size = Pt(8)
-        sr.font.color.rgb = GRAY
-    doc.save(path)
-
-
-# --------------------- схемы инструментов для агента ---------------------
-
-DOSSIER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "company": {"type": "string", "description": "Заголовок: «Досье компании — ...»"},
-        "subtitle": {"type": "string", "description": "ИНН · ОГРН · ОКВЭД · город · 'для on-premise LLM + RAG'"},
-        "profile": {"type": "string", "description": "Раздел 1: профиль деятельности (абзац)"},
-        "scale": {"type": "array", "items": {"type": "string"},
-                  "description": "Раздел 2: Численность: ...; Выручка: ...; Госзаказ/риски: ..."},
-        "owner_lpr": {"type": "array", "items": {"type": "string"},
-                      "description": "Раздел 3: Собственник / Гендиректор / расхождения / Контакты"},
-        "pains": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"label": {"type": "string"}, "text": {"type": "string"}},
-            "required": ["label", "text"]},
-            "description": "Раздел 4: боль -> решение через LLM/RAG (акцент 152-ФЗ/on-prem)"},
-        "mentions": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "date": {"type": "string"}},
-            "required": ["title", "url"]},
-            "description": "Раздел 5: СМИ — ТОЛЬКО проверенные WebFetch'ем ссылки"},
-        "sources": {"type": "string", "description": "Строка 'Источники: ...'"},
-    },
-    "required": ["company", "profile"],
-}
-
-STRATEGY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "company": {"type": "string", "description": "Заголовок"},
-        "subtitle": {"type": "string", "description": "ИНН · отрасль · ЛПР"},
-        "summary": {"type": "string", "description": "1–2 предложения: кто это и почему интересен под оффер"},
-        "channel": {"type": "string", "description": "Через кого и как заходить к ЛПР (канал: email/звонок/тендерная площадка)"},
-        "first_touch": {"type": "string", "description": "Текст первого касания (короткое сообщение)"},
-        "script": {"type": "array", "items": {"type": "string"}, "description": "Тезисы сценария разговора"},
-        "offer_fit": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"pain": {"type": "string"}, "solution": {"type": "string"}},
-            "required": ["pain", "solution"]},
-            "description": "Связка: боль компании -> что закрывает on-prem LLM / RAG"},
-        "objections": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"q": {"type": "string"}, "a": {"type": "string"}},
-            "required": ["q", "a"]},
-            "description": "Возможные возражения и ответы"},
-        "next_step": {"type": "string", "description": "Следующий шаг и срок"},
-        "sources": {"type": "string", "description": "Источники (опц.)"},
-    },
-    "required": ["company", "offer_fit"],
-}
-
-COMBINED_SYSTEM = (
-    "Ты — аналитик B2B-продаж для вендора, который продаёт: (1) LLM на ЛОКАЛЬНЫХ "
-    "серверах клиента — данные не уходят в облако, снимает риски 152-ФЗ; "
-    "(2) RAG-вопрос-ответ по внутренней документации/нормативке. Тебе дают ОДНУ компанию.\n"
-    "ПОРЯДОК (ресёрч делаешь ОДИН раз, оба документа — из одних и тех же находок):\n"
-    "1) deep_research(company_name, inn) — официальная база: выручка (ГИР БО), карточка "
-    "ЕГРЮЛ/ЛПР/ОКВЭД/адрес (Dadata), контакты (Checko).\n"
-    "2) WebSearch + WebFetch: профиль, ЧИСЛЕННОСТЬ, собственник/бенефициар, актуальное "
-    "руководство, госзакупки/тендеры/суды/ФАС, упоминания в СМИ за 5 лет. КАЖДУЮ ссылку "
-    "раздела «СМИ» открой WebFetch'ем и убедись, что страница реальна и про эту компанию; "
-    "выдуманные/битые НЕ включай.\n"
-    "3) Вызови save_dossier_docx: 5 разделов (профиль; масштаб и показатели; собственник/ЛПР/"
-    "контакты; боли отрасли -> что закрываем LLM/RAG с акцентом 152-ФЗ/on-prem; СМИ + Источники).\n"
-    "4) На ТЕХ ЖЕ данных вызови save_strategy_docx: план коммуникации (summary; channel — через "
-    "кого и как заходить к ЛПР; first_touch — текст первого касания; script — тезисы разговора; "
-    "offer_fit — связки боль->решение on-prem LLM/RAG; objections — возражения и ответы; next_step).\n"
-    "ТРЕБОВАНИЯ: каждый документ — СТРОГО ≤1 страница, по делу, цифры со ссылкой/источником. "
-    "Бухгалтерскую выручку и оборот по счёту НЕ путать. Заверши кратким резюме."
-)
-
-ALLOWED = [
-    "mcp__research__deep_research",
-    "mcp__research__save_dossier_docx",
-    "mcp__research__save_strategy_docx",
-    "WebSearch", "WebFetch",
-]
+    Передаём агенту-2 профиль, домены AS-IS и точки внедрения ИИ (процесс/домен/боль),
+    чтобы он приоритизировал точки входа под реально релевантные функции компании."""
+    if not dossier:
+        return ""
+    lines = []
+    if dossier.get("profile"):
+        lines.append("Профиль: " + str(dossier["profile"]))
+    asis = dossier.get("asis") or []
+    labels = [(x.get("label") or "").rstrip(":") for x in asis if x.get("label")]
+    if labels:
+        lines.append("Процессы AS-IS: " + "; ".join(labels))
+    points = dossier.get("points") or []
+    if points:
+        lines.append("Точки внедрения ИИ (процесс — домен — боль):")
+        for p in points[:12]:
+            seg = " — ".join(s for s in (p.get("process"), p.get("domain"), p.get("pain")) if s)
+            if seg:
+                lines.append("  • " + seg)
+    return "\n".join(lines)
 
 
 def _handle(lead):
@@ -214,51 +83,10 @@ def _handle(lead):
     }
 
 
-async def _research_one(lead, idx, d_tmp, s_tmp, model):
-    """Один ресёрч-проход: рендерит оба .docx во временные пути. Возвращает $-стоимость."""
-    import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
-    import company_research_agent as CRA
+async def _run_agent(options, handoff, label):
+    """Прогнать одну сессию ClaudeSDKClient, печатать вызовы инструментов, вернуть $-стоимость."""
     from claude_agent_sdk import (
-        tool, create_sdk_mcp_server, ClaudeAgentOptions, ClaudeSDKClient,
-        ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
-    )
-
-    # Инструменты сохранения — замыкания на временные пути ЭТОЙ компании (потокобезопасно).
-    @tool("save_dossier_docx", "Сохранить готовое досье (≤1 стр.). Ссылки в mentions — только проверенные.", DOSSIER_SCHEMA)
-    async def _save_dossier(args):
-        a = dict(args)
-        a["filename"] = f"_orq_d_{idx}.docx"          # уникальное имя -> кладём в «Загрузки», затем переносим
-        dl = await asyncio.to_thread(CRA._write_dossier_docx, a)
-        await asyncio.to_thread(shutil.move, dl, d_tmp)
-        return {"content": [{"type": "text", "text": "досье сохранено"}]}
-
-    @tool("save_strategy_docx", "Сохранить план коммуникации (≤1 стр.) на основе тех же находок.", STRATEGY_SCHEMA)
-    async def _save_strategy(args):
-        await asyncio.to_thread(_strategy_doc, dict(args), s_tmp)
-        return {"content": [{"type": "text", "text": "стратегия сохранена"}]}
-
-    server = create_sdk_mcp_server(
-        name="research", version="3.0.0",
-        tools=[CRA.deep_research, _save_dossier, _save_strategy],
-    )
-    options = ClaudeAgentOptions(
-        model=model,
-        system_prompt=COMBINED_SYSTEM,
-        mcp_servers={"research": server},
-        allowed_tools=ALLOWED,
-        disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        setting_sources=[],
-        max_turns=60,
-    )
-    h = _handle(lead)
-    handoff = (
-        "Подготовь ДОСЬЕ и СТРАТЕГИЮ коммуникации, сохрани оба .docx. Значения для инструментов:\n"
-        f"  company_name = {h['company_name']!r}\n"
-        f"  inn          = {h['inn']!r}\n"
-        f"  aspects      = {h['aspects']!r}\n"
-        "Сначала deep_research, потом веб-ресёрч (СМИ — только проверенные ссылки), "
-        "затем save_dossier_docx и save_strategy_docx на одних и тех же данных."
+        ClaudeSDKClient, ResultMessage, AssistantMessage, ToolUseBlock,
     )
     cost = 0.0
     async with ClaudeSDKClient(options=options) as client:
@@ -267,16 +95,93 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, ToolUseBlock):
-                        print(f"    [{idx}] → {getattr(block, 'name', '')}")
+                        print(f"    [{label}] → {getattr(block, 'name', '')}")
             elif isinstance(message, ResultMessage):
                 if getattr(message, "total_cost_usd", None):
                     cost = message.total_cost_usd
+    return cost
 
-    # подстраховка: если агент не сохранил — кладём заготовку, чтобы upload не упал
+
+async def _research_one(lead, idx, d_tmp, c_tmp, model):
+    """Две стадии на компанию: агент-1 (карта бизнес-процессов) -> агент-2 (контакты).
+    Рендерит оба .docx во временные пути. Возвращает суммарную $-стоимость."""
+    import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
+    import company_research_agent as CRA
+    import contact_research_agent as CCA
+    from claude_agent_sdk import tool, create_sdk_mcp_server, ClaudeAgentOptions
+
+    h = _handle(lead)
+    captured = {}        # payload карты бизнес-процессов -> контекст для агента-2
+    cost = 0.0
+    base_opts = dict(
+        disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
+        permission_mode="bypassPermissions",
+        setting_sources=[],
+        max_turns=60,
+    )
+
+    # ---------- Стадия A: агент-1 — карта бизнес-процессов (AS-IS -> ИИ -> TO-BE) ----------
+    # save-инструмент — замыкание на временный путь ЭТОЙ компании (потокобезопасно).
+    @tool("save_dossier_docx",
+          "Сохранить карту бизнес-процессов (AS-IS -> точки ИИ -> TO-BE) в .docx. "
+          "Ссылки в mentions/sources — только проверенные WebFetch'ем.",
+          CRA.DOSSIER_DOCX_SCHEMA)
+    async def _save_dossier(args):
+        a = dict(args)
+        a["filename"] = f"_orq_d_{idx}.docx"          # уникальное имя -> «Загрузки», затем переносим
+        dl = await asyncio.to_thread(CRA._write_dossier_docx, a)
+        await asyncio.to_thread(shutil.move, dl, d_tmp)
+        captured["dossier"] = a                        # отдаём payload агенту-2
+        return {"content": [{"type": "text", "text": "карта бизнес-процессов сохранена"}]}
+
+    server_a = create_sdk_mcp_server(
+        name="research", version="3.0.0", tools=[CRA.deep_research, _save_dossier])
+    options_a = ClaudeAgentOptions(
+        model=model, system_prompt=CRA.DOSSIER_SYSTEM,
+        mcp_servers={"research": server_a},
+        allowed_tools=["mcp__research__deep_research", "mcp__research__save_dossier_docx",
+                       "WebSearch", "WebFetch"],
+        **base_opts)
+    handoff_a = (
+        "Построй карту бизнес-процессов (AS-IS -> точки внедрения ИИ -> TO-BE) и сохрани .docx. "
+        "Значения для инструментов:\n"
+        f"  company_name = {h['company_name']!r}\n"
+        f"  inn          = {h['inn']!r}\n"
+        f"  aspects      = {h['aspects']!r}\n"
+        "Следуй порядку из системного промпта. Разделы СМИ/Источники — только проверенные ссылки."
+    )
+    cost += await _run_agent(options_a, handoff_a, f"{idx}/A")
+
+    # подстраховка: агент-1 не сохранил карту -> заготовка, чтобы upload не упал
     if not os.path.exists(d_tmp):
         await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
-    if not os.path.exists(s_tmp):
-        await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
+
+    # ---------- Стадия B: агент-2 — контакты и точки входа (по JSON + карте процессов) ----------
+    @tool("save_contacts_docx",
+          "Сохранить отчёт по контактам и точкам входа (key_contacts/roles/branches/sources) "
+          "в .docx. Ссылки в profiles/sources — только проверенные WebFetch'ем.",
+          CCA.CONTACTS_SCHEMA)
+    async def _save_contacts(args):
+        a = dict(args)
+        a["filename"] = f"_orq_c_{idx}.docx"
+        cl = await asyncio.to_thread(CCA._write_contacts_docx, a)
+        await asyncio.to_thread(shutil.move, cl, c_tmp)
+        return {"content": [{"type": "text", "text": "контакты сохранены"}]}
+
+    server_b = create_sdk_mcp_server(
+        name="contacts", version="1.0.0", tools=[CRA.deep_research, _save_contacts])
+    options_b = ClaudeAgentOptions(
+        model=model, system_prompt=CCA.CONTACTS_SYSTEM,
+        mcp_servers={"contacts": server_b},
+        allowed_tools=["mcp__contacts__deep_research", "mcp__contacts__save_contacts_docx",
+                       "WebSearch", "WebFetch"],
+        **base_opts)
+    handoff_b = CCA._build_handoff(lead, _biz_context(captured.get("dossier")))
+    cost += await _run_agent(options_b, handoff_b, f"{idx}/B")
+
+    # подстраховка: агент-2 не сохранил -> заготовка контактов
+    if not os.path.exists(c_tmp):
+        await asyncio.to_thread(DO.generate_contacts, lead, c_tmp)
     return cost
 
 
@@ -344,7 +249,7 @@ def _free_ram_gb():
 
 async def main():
     ap = argparse.ArgumentParser(
-        description="Полная цепочка: сбор (RusProfile) + ресёрч (досье/стратегия) в папки Яндекс Диска")
+        description="Полная цепочка: сбор (RusProfile) + ресёрч (карта процессов + контакты) в папки Яндекс Диска")
     ap.add_argument("leads", nargs="?", default=None,
                     help="готовый JSON лидов (если БЕЗ --industries)")
     # --- ФАЗА 1: сбор (первый агент). Задаёшь --industries -> оркестратор сам соберёт лиды и создаст папки ---
@@ -392,7 +297,7 @@ async def main():
         print("Пусто — нет лидов.")
         return
 
-    print("\n=== ФАЗА 2: ресёрч (досье + стратегия) ===")
+    print("\n=== ФАЗА 2: ресёрч (карта бизнес-процессов + контакты) ===")
     if not a.dry_run:
         print(f"[оценка] {len(sel)} компаний × ~$1–2 = ~${len(sel)}–${2 * len(sel)} ({a.model}). "
               "Число задаётся первым агентом (--count, по умолч. 200).")
@@ -418,12 +323,12 @@ async def main():
     async def process(idx, lead):
         async with sem:
             d_tmp = os.path.join(tmp, f"{idx}_d.docx")
-            s_tmp = os.path.join(tmp, f"{idx}_s.docx")
+            c_tmp = os.path.join(tmp, f"{idx}_c.docx")
             cost = 0.0
             if a.dry_run:
                 try:
                     await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
-                    await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
+                    await asyncio.to_thread(DO.generate_contacts, lead, c_tmp)
                 except Exception as e:
                     print(f"  [!] {lead.get('name')}: {e}")
                     return {"name": lead.get("name"), "ok": False, "cost": cost}
@@ -433,7 +338,7 @@ async def main():
                 err = None
                 for attempt in range(3):
                     try:
-                        cost = await _research_one(lead, idx, d_tmp, s_tmp, a.model)
+                        cost = await _research_one(lead, idx, d_tmp, c_tmp, a.model)
                         err = None
                         break
                     except Exception as e:
@@ -450,7 +355,7 @@ async def main():
                 try:
                     await asyncio.to_thread(DO._mkdir, comp_dir, a.account)  # папка обычно уже есть
                     await asyncio.to_thread(DO._upload, d_tmp, f"{comp_dir}/досье_компании_{dn}.docx", a.account, True)
-                    await asyncio.to_thread(DO._upload, s_tmp, f"{comp_dir}/стратегия_коммуникации_{dn}.docx", a.account, True)
+                    await asyncio.to_thread(DO._upload, c_tmp, f"{comp_dir}/контакты_и_точки_входа_{dn}.docx", a.account, True)
                 except Exception as e:
                     print(f"  [!] upload {lead.get('name')}: {e}")
                     return {"name": lead.get("name"), "ok": False, "cost": cost}
