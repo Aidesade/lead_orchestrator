@@ -414,7 +414,8 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
                     skipped_excl += 1
                     continue
                 lead = item_to_lead(it, cfg, ind)
-                if lead["_revenue"] and lead["_revenue"] < min_revenue:
+                # строго: выручка должна быть известна И не ниже порога (>= min_revenue)
+                if not lead["_revenue"] or lead["_revenue"] < min_revenue:
                     continue
                 by_inn[inn] = lead
                 kept += 1

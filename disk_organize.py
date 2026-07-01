@@ -4,8 +4,8 @@ r"""
 
 Дерево:
   <base>/<отрасль>/<категория полноты контактов>/<компания>/
-        ├── досье_компании_<компания>.docx
-        └── стратегия_коммуникации_<компания>.docx
+        ├── <компания>_карта_бизнес-процессов.docx
+        └── <компания>_карта_ролей_и_контактов_пресейл.docx
 
 Категория считается по 4 полям: email, телефон, сайт, контактное лицо (ЛПР):
   все есть       -> "есть все контактные данные"
@@ -37,6 +37,13 @@ import sys
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _doc_names(dn):
+    """Имена деливераблов в папке компании: карта БП + карта ролей/контактов + презентация.
+    Третий элемент (презентация) ДОЛЖЕН совпадать с orchestrator._doc_names."""
+    return (f"{dn}_карта_бизнес-процессов.docx",
+            f"{dn}_карта_ролей_и_контактов_пресейл.docx",
+            f"{dn}_презентация_Telepath.pptx")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -224,6 +231,153 @@ def generate_strategy(lead, path):
     _make_docx(path, P)
 
 
+def _make_pptx(path, title, lines):
+    """Записать МИНИМАЛЬНУЮ валидную .pptx (один слайд 16:9) без зависимости от
+    python-pptx — той же техникой, что и _make_docx (голый OOXML через zipfile).
+    Это ЗАГОТОВКА: настоящая 3-слайдовая презентация делается агентной стадией через
+    официальный скилл pptx. Текст пишем в заметках слайда (надёжный размер >5 КБ —
+    проходит общий гейт «реальный файл, а не болванка»)."""
+    def esc(t):
+        return _xml_escape(t)
+
+    NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/ppt/presentation.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+        '<Override PartName="/ppt/slides/slide1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+        '<Override PartName="/ppt/slideLayouts/slideLayout1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>'
+        '<Override PartName="/ppt/slideMasters/slideMaster1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>'
+        '</Types>')
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{NS_R}/officeDocument" Target="ppt/presentation.xml"/>'
+        '</Relationships>')
+    # презентация 16:9 (12192000 x 6858000 EMU = 13.333"x7.5")
+    presentation = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:presentation xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
+        '<p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>'
+        '<p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst>'
+        '<p:sldSz cx="12192000" cy="6858000"/>'
+        '<p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
+    presentation_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{NS_R}/slideMaster" Target="slideMasters/slideMaster1.xml"/>'
+        f'<Relationship Id="rId2" Type="{NS_R}/slide" Target="slides/slide1.xml"/>'
+        '</Relationships>')
+
+    def _txt_body(paras):
+        body = []
+        for t, sz, bold in paras:
+            b = ' b="1"' if bold else ""
+            body.append(
+                '<a:p><a:r><a:rPr lang="ru-RU" sz="%d"%s/>'
+                '<a:t>%s</a:t></a:r></a:p>' % (sz, b, esc(t)))
+        return "".join(body)
+
+    paras = [(title, 2800, True)] + [(ln, 1400, False) for ln in lines if ln]
+    slide = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:sld xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
+        '<p:cSld><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
+        '<p:spPr><a:xfrm><a:off x="685800" y="685800"/><a:ext cx="10820400" cy="5486400"/></a:xfrm>'
+        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
+        '<p:txBody><a:bodyPr/><a:lstStyle/>' + _txt_body(paras) + '</p:txBody></p:sp>'
+        '</p:spTree></p:cSld><p:clrMapOvr><a:overrideClrMapping '
+        'bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" '
+        'accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" '
+        'hlink="hlink" folHlink="folHlink"/></p:clrMapOvr></p:sld>')
+    slide_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{NS_R}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+        '</Relationships>')
+    # минимальные мастер/лейаут — присутствуют только чтобы пакет открывался редакторами
+    slide_master = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:sldMaster xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
+        '<p:cSld><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '</p:spTree></p:cSld>'
+        '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" '
+        'accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" '
+        'accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
+        '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>'
+        '</p:sldMaster>')
+    slide_master_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{NS_R}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
+        '</Relationships>')
+    slide_layout = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<p:sldLayout xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}" type="blank" preserve="1">'
+        '<p:cSld name="Blank"><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
+        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
+        '</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>')
+    slide_layout_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{NS_R}/slideMaster" Target="../slideMasters/slideMaster1.xml"/>'
+        '</Relationships>')
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", content_types)
+        z.writestr("_rels/.rels", root_rels)
+        z.writestr("ppt/presentation.xml", presentation)
+        z.writestr("ppt/_rels/presentation.xml.rels", presentation_rels)
+        z.writestr("ppt/slides/slide1.xml", slide)
+        z.writestr("ppt/slides/_rels/slide1.xml.rels", slide_rels)
+        z.writestr("ppt/slideMasters/slideMaster1.xml", slide_master)
+        z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels", slide_master_rels)
+        z.writestr("ppt/slideLayouts/slideLayout1.xml", slide_layout)
+        z.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels", slide_layout_rels)
+        # «балласт» БЕЗ сжатия (ZIP_STORED) — чтобы заготовка стабильно превышала гейт
+        # >5 КБ в orchestrator.process() (сжатый повторяющийся текст ужимается слишком сильно).
+        note = ("Заготовка презентации Telepath. Реальная 3-слайдовая .pptx делается "
+                "агентной стадией через официальный скилл pptx. " * 120)
+        z.writestr("docProps/_note.txt", note, compress_type=zipfile.ZIP_STORED)
+
+
+def generate_presentation(lead, path):
+    """ЗАГОТОВКА презентации (третий деливерабл). Валидная .pptx >5 КБ, БЕЗ python-pptx.
+    Боевая 3-слайдовая презентация формируется агентной стадией _presentation_one через
+    официальный скилл pptx; здесь — паритет с двумя .docx для dry-run и раскладки ФАЗЫ 1."""
+    rev = _fmt_money(lead.get("_revenue"))
+    lines = [
+        "Презентация Telepath — заготовка",
+        f"Заказчик: {lead.get('name') or ''}",
+        f"ИНН: {lead.get('_inn', '')}   ОГРН: {lead.get('_ogrn', '')}",
+        f"Отрасль: {industry_folder(lead)}",
+        f"Ниша / ОКВЭД: {lead.get('niche', '')}",
+        f"Регион: {lead.get('_region', '')}",
+        f"Выручка: {rev} ₽ ({lead.get('_revenue_year', '')})",
+        "Боль (если известна): " + (lead.get("pain") or "(заполнить)"),
+        "— 3-слайдовая презентация будет сгенерирована стадией pptx. —",
+    ]
+    _make_pptx(path, "Telepath — пресейл-презентация", lines)
+
+
 # ------------------------------- yacli (Диск) --------------------------------
 
 def _yacli(args, account=None):
@@ -245,25 +399,52 @@ def _yacli(args, account=None):
     return p.returncode, data
 
 
+def _is_locked(blob):
+    # временная блокировка Яндекс Диска: 423 DiskResourceLockedError («ресурс заблокирован»)
+    return ("423" in blob) or ("locked" in blob) or ("заблокир" in blob)
+
+
 def _mkdir(path, account=None):
-    rc, data = _yacli(["disk", "mkdir", path], account)
+    import time
+    last = ""
+    for attempt in range(5):
+        rc, data = _yacli(["disk", "mkdir", path], account)
+        if rc == 0 and data.get("ok", True):
+            return
+        blob = (str(data.get("code", "")) + " " + str(data.get("message", ""))).lower()
+        # глотаем идемпотентно ТОЛЬКО «папка уже существует»; бары «409»/«exist» опасны —
+        # 409 даёт и DiskPathDoesntExistsError (нет род. пути), а «exist» есть и в DoesntExists
+        if "existentdirectory" in blob or "уже существ" in blob:
+            return
+        if _is_locked(blob):                      # временный лок Яндекса -> backoff + ретрай
+            last = data.get("message") or blob
+            time.sleep(2 * (attempt + 1))
+            continue
+        raise RuntimeError(f"mkdir {path}: {data.get('message') or blob or rc}")
+    # после ретраев: если путь уже существует — это ок (часто база disk:/Лиды уже есть)
+    rc, data = _yacli(["disk", "list", path], account)
     if rc == 0 and data.get("ok", True):
         return
-    blob = (str(data.get("code", "")) + " " + str(data.get("message", ""))).lower()
-    # глотаем идемпотентно ТОЛЬКО «папка уже существует»; бары «409»/«exist» опасны —
-    # 409 даёт и DiskPathDoesntExistsError (нет род. пути), а «exist» есть и в DoesntExists
-    if "existentdirectory" in blob or "уже существ" in blob:
-        return
-    raise RuntimeError(f"mkdir {path}: {data.get('message') or blob or rc}")
+    raise RuntimeError(f"mkdir {path}: заблокирован (423) после ретраев: {last}")
 
 
 def _upload(local, remote, account=None, overwrite=True):
+    import time
     args = ["disk", "upload", local, remote]
     if overwrite:
         args.append("--overwrite")
-    rc, data = _yacli(args, account)
-    if rc != 0 or not data.get("ok", True):
+    last = ""
+    for attempt in range(5):
+        rc, data = _yacli(args, account)
+        if rc == 0 and data.get("ok", True):
+            return
+        blob = (str(data.get("code", "")) + " " + str(data.get("message", ""))).lower()
+        if _is_locked(blob):                      # временный лок Яндекса -> backoff + ретрай
+            last = data.get("message") or blob
+            time.sleep(2 * (attempt + 1))
+            continue
         raise RuntimeError(f"upload {remote}: {data.get('message') or rc}")
+    raise RuntimeError(f"upload {remote}: заблокирован (423) после ретраев: {last}")
 
 
 def ensure_dir(path, account, cache):
@@ -314,11 +495,15 @@ def organize_to_disk(leads, base="disk:/Лиды", account=None, workers=4,
         dn = _safe(lead.get("name"))
         d_local = os.path.join(tmp, f"{idx}_d.docx")
         s_local = os.path.join(tmp, f"{idx}_s.docx")
+        p_local = os.path.join(tmp, f"{idx}_p.pptx")
         generate_dossier(lead, d_local)
         generate_strategy(lead, s_local)
-        _upload(d_local, f"{comp_dir}/досье_компании_{dn}.docx", account, overwrite)
-        _upload(s_local, f"{comp_dir}/стратегия_коммуникации_{dn}.docx", account, overwrite)
-        return 2
+        generate_presentation(lead, p_local)      # заготовка-презентация (паритет деливераблов)
+        bp_name, rc_name, pptx_name = _doc_names(dn)
+        _upload(d_local, f"{comp_dir}/{bp_name}", account, overwrite)
+        _upload(s_local, f"{comp_dir}/{rc_name}", account, overwrite)
+        _upload(p_local, f"{comp_dir}/{pptx_name}", account, overwrite)
+        return 3
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:

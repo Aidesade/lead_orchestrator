@@ -19,6 +19,13 @@ _*.json
 _*.html
 *.docx
 
+# Ассеты презентации: фото человека + логотип кладутся локально (см. assets/README.md)
+assets/*.png
+
+# Образцы/данные лидов и мусорные файлы
+sample_*.json
+/Yandex
+
 # OS
 Thumbs.db
 desktop.ini

@@ -1,27 +1,35 @@
 # -*- coding: utf-8 -*-
 r"""
-Двухстадийный агент-ресёрчер компаний на Claude Agent SDK, режим РАЗБОР.
+Двухстадийный агент-ресёрчер компаний на Claude Agent SDK, режим ПРЕСЕЙЛ.
 
   STAGE 1 (triage)   : грязный текст / ИНН  ->  чистый JSON {company_name, inn, aspects}
-  STAGE 2 (report)    : handle компании  ->  разбор AS-IS → точки внедрения ИИ → TO-BE
-                        под продукты (LLM-сервисы / ИИ-агенты / RAG), .docx (многостр.)
+  STAGE 2 (report)   : handle компании  ->  ресёрч + ДВА пресейл-документа .docx:
+        (1) КАРТА БИЗНЕС-ПРОЦЕССОВ — профиль → as-is процессы → боли →
+            ИИ-решение → to-be, сводная таблица, дорожная карта, специфика 44/223-ФЗ;
+        (2) КАРТА РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ — оргструктура, ЛПР, профильные отделы
+            под внедрение ИИ, филиалы, офиц. контакты, план захода.
 
 Stage 2 — это агент, у которого есть инструменты:
-  - mcp__research__deep_research    : официальная база по ИНН (ГИР БО + Dadata + Checko)
-        revenue_enrich.girbo_revenue  (ГИР БО ФНС, выручка стр. 2110, БЕСПЛАТНО)
-        dadata_enrich                 (карточка ЕГРЮЛ/ЕГРИП: ЛПР, ОКВЭД, адрес; ключ DADATA_TOKEN)
-        checko_enrich                 (контакты: тел/email/сайт/ЛПР; ключ CHECKO_TOKEN)
-  - WebSearch / WebFetch (встроенные): профиль, численность, собственник, тендеры/суды, СМИ за 5 лет
-        КАЖДАЯ ссылка для раздела «СМИ» проверяется WebFetch'ем (анти-галлюцинация)
-  - mcp__research__save_dossier_docx : рендер отчёта в .docx (многостр.) в папку «Загрузки»
+  - mcp__research__deep_research        : НАСТОЯЩИЙ глубокий ресёрч (движок deep_research_engine)
+        официальная база (ГИР БО + Dadata + Checko, как раньше) +
+        РЕАЛЬНЫЙ краул сайта (филиалы+директора+телефоны, руководство, контакты,
+        соцсети, проектный институт) + ЕИС/госзакупки по ИНН + суды/СМИ + hh.ru;
+        supervisor с параллельными коллекторами и петля ЦЕЛЕВОГО добора под пустые
+        ячейки таблиц. Каждая строка несёт source URL. Crawl4AI PRIMARY -> HTTP-фолбэк.
+  - WebSearch / WebFetch (встроенные)   : ТОЧЕЧНАЯ доверка и закрытие остаточных пробелов
+        КАЖДАЯ спорная ссылка/контакт проверяется WebFetch'ем (анти-галлюцинация)
+  - mcp__research__save_process_map_docx   : КАРТА БИЗНЕС-ПРОЦЕССОВ -> .docx
+  - mcp__research__save_roles_contacts_docx: КАРТА РОЛЕЙ И КОНТАКТОВ -> .docx
 
 Компания, определённая на первом проходе (stage 1), ЯВНО передаётся во второй.
 
 Запуск:
-  py C:/Users/abalb/.claude/skills/lead-finder/scripts/company_research_agent.py "АО Рязаньавтодор ИНН 6234065445"
+  py C:/.../company_research_agent.py "АО Рязаньавтодор ИНН 6234065445"
   py .../company_research_agent.py            # без аргумента — интерактивный режим
   py .../company_research_agent.py --contacts "<...>"   # старый режим: краткий отчёт по контактам
 
+Опц. через env: PRESALE_VENDOR (строка «Подготовлено для», по умолчанию пусто),
+PRESALE_PLATFORM_DESC (описание платформы в предмете отчёта).
 Ключи (опционально — ГИР БО работает и без них):  setx DADATA_TOKEN <...>   setx CHECKO_TOKEN <...>
 Зависимости:  pip install claude-agent-sdk python-docx
 """
@@ -29,6 +37,10 @@ import json
 import os
 import re
 import sys
+import warnings
+
+# Глушим косметический RequestsDependencyWarning (chardet 7.x вне диапазона requests) ДО импорта requests.
+warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
 
 import anyio
 from claude_agent_sdk import (
@@ -64,10 +76,30 @@ except Exception:
     CheckoClient = None
 
 # Модели. Алиасы 'opus'/'sonnet' резолвятся в текущие дефолты аккаунта.
-MODEL = "opus"          # stage 2 — досье (ресёрч + синтез)
+MODEL = "opus"          # stage 2 — пресейл-документы (ресёрч + синтез)
 FAST_MODEL = "sonnet"   # stage 1 — дешёвый триаж
 
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+
+# --- Параметры пресейла (переопределяются переменными окружения) ------------
+VENDOR = os.environ.get("PRESALE_VENDOR", "")   # пусто -> строка «Подготовлено для» не выводится
+PLATFORM_DESC = os.environ.get(
+    "PRESALE_PLATFORM_DESC",
+    "корпоративная on-premises LLM-платформа (RAG-база знаний, автономные ИИ-агенты, "
+    "ИИ-Коуч «Наставник»)",
+)
+SOURCES_NOTE_DEFAULT = (
+    "только публично доступные данные (оф. сайт, ЕГРЮЛ/Rusprofile, zakupki.gov.ru, "
+    "реестр контрактов 44-ФЗ/223-ФЗ, судебная практика, отраслевая нормативка, вакансии)"
+)
+ETHICS_DEFAULT = (
+    "персональные и семейные данные не собирались; вход — строго через официальные "
+    "каналы и конкурентную процедуру (44-ФЗ/223-ФЗ), без обхода закупок через личные связи"
+)
+PURPOSE_DEFAULT = (
+    "оргструктура и официальные деловые контакты для последующей проработки. "
+    "Только публичные источники."
+)
 
 
 def _digits(s):
@@ -182,12 +214,20 @@ def _render_official(p: dict) -> str:
 
 
 # ===========================================================================
-# ИНСТРУМЕНТ 1 — официальная база по ИНН
+# ИНСТРУМЕНТ 1 — НАСТОЯЩИЙ deep_research (движок deep_research_engine)
+#   supervisor + параллельные коллекторы по источникам (офиц. база, сайт, ЕИС,
+#   суды/СМИ, hh) + петля целевого добора под пустые ячейки таблиц + реальный
+#   краул (Crawl4AI -> HTTP-фолбэк). Каждая строка несёт source URL. Сигнатура
+#   (company_name, inn, aspects) СОХРАНЕНА — orchestrator/писатель не ломаются.
 # ===========================================================================
 @tool(
     "deep_research",
-    "Официальная база по компании по ИНН/названию: выручка (ГИР БО), карточка ЕГРЮЛ/ЕГРИП "
-    "с ЛПР/ОКВЭД/адресом (Dadata) и контакты (Checko). Возвращает сводку со ссылками.",
+    "ГЛУБОКИЙ ресёрч компании по ИНН/названию: официальная база (ГИР БО/Dadata/Checko) "
+    "+ РЕАЛЬНЫЙ сбор с сайта компании (филиалы и их директора+телефоны, руководство, "
+    "контакты, соцсети), ЕИС/госзакупки по ИНН, суды/СМИ и hh.ru. Внутри — supervisor, "
+    "параллельные коллекторы и петля ЦЕЛЕВОГО добора под незаполненные ячейки таблиц. "
+    "Возвращает источникованный документ (markdown + структурный JSON; у каждой строки URL). "
+    "Зови ОДИН раз в начале — он приносит сайт/филиалы/контакты, дальше WebFetch только для точечной доверки.",
     {
         "type": "object",
         "properties": {
@@ -202,276 +242,459 @@ async def deep_research(args):
     company_name = args["company_name"]
     inn = args.get("inn", "")
     aspects = args.get("aspects", "")
-    # urllib-вызовы блокирующие -> в поток, чтобы не вешать event loop SDK
-    payload = await anyio.to_thread.run_sync(research_company, company_name, inn, aspects)
-    return {"content": [{"type": "text", "text": _render_official(payload)}]}
+    # Движок — async (сам уводит блокирующее в потоки и капает конкуренцию).
+    # Ленивый импорт рвёт цикл CRA<->движок; при ЛЮБОМ сбое — официальная база (пайплайн не падает).
+    try:
+        from deep_research_engine import deep_research as _engine
+        text = await _engine(company_name, inn, aspects)
+    except Exception as e:
+        payload = await anyio.to_thread.run_sync(research_company, company_name, inn, aspects)
+        text = (_render_official(payload)
+                + f"\n\n[deep_research_engine недоступен: {str(e)[:120]} — вернулась только "
+                  "официальная база; добери сайт/филиалы/контакты через WebSearch+WebFetch вручную.]")
+    return {"content": [{"type": "text", "text": text}]}
 
 
 # ===========================================================================
-# ИНСТРУМЕНТ 2 — рендер отчёта в .docx (многостраничный) в «Загрузки»
+# РЕНДЕР .docx — общие хелперы python-docx
 # ===========================================================================
 def _safe_name(s: str) -> str:
     s = re.sub(r'[\\/:*?"<>|«»]', "", s or "Компания").strip()
-    return re.sub(r"\s+", "_", s)[:80] or "Компания"
+    return re.sub(r"\s+", "_", s)[:90] or "Компания"
 
 
-def _write_dossier_docx(payload: dict) -> str:
-    """Собрать .docx-отчёт (AS-IS → точки ИИ → TO-BE) по разделам. Возвращает путь к файлу."""
+def _new_doc():
     from docx import Document
     from docx.shared import Pt, Cm, RGBColor
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    GRAY = RGBColor(0x5A, 0x5A, 0x5A)
     doc = Document()
-
-    # компактные поля и базовый шрифт -> помещаемся в одну страницу
     sec = doc.sections[0]
     for m in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
-        setattr(sec, m, Cm(1.2))
+        setattr(sec, m, Cm(1.5))
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
-    normal.font.size = Pt(9.5)
+    normal.font.size = Pt(10)
     pf = normal.paragraph_format
-    pf.space_after = Pt(2)
-    pf.line_spacing = 1.0
+    pf.space_after = Pt(3)
+    pf.line_spacing = 1.05
+    return doc, Pt, RGBColor
 
-    def heading(text):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(5)
-        p.paragraph_format.space_after = Pt(2)
-        r = p.add_run(text)
-        r.bold = True
-        r.font.size = Pt(11)
-        return p
 
-    def bullet(text):
-        # жирная лид-метка до первого ':' либо '—', остальное обычным
-        p = doc.add_paragraph(style="List Bullet")
-        p.paragraph_format.space_after = Pt(1)
-        m = re.match(r"^(.*?[:—])(\s*)(.*)$", text, re.DOTALL)
-        if m:
-            p.add_run(m.group(1)).bold = True
-            if m.group(3):
-                p.add_run(" " + m.group(3))
-        else:
-            p.add_run(text)
-        return p
-
-    def card(it):
-        """Карточка процесса: жирный заголовок + помеченные строки as-is→to-be."""
-        cp = doc.add_paragraph()
-        cp.paragraph_format.space_before = Pt(4)
-        cp.paragraph_format.space_after = Pt(1)
-        r = cp.add_run(it.get("process") or "Процесс")
-        r.bold = True
-        r.font.size = Pt(10)
-        meta = [x for x in (it.get("domain"), it.get("priority")) if x]
-        if meta:
-            mr = cp.add_run("  · " + " · ".join(meta))
-            mr.font.size = Pt(8.5)
-            mr.font.color.rgb = GRAY
-        for lbl, key in (("Боль", "pain"), ("Точка ИИ", "ai_point"),
-                         ("Наш продукт", "product"), ("TO-BE", "to_be"),
-                         ("Эффект", "effect"), ("Предпосылки", "prerequisites"),
-                         ("Риски", "risks")):
-            if it.get(key):
-                bullet(f"{lbl}: {it[key]}")
-
-    # шапка
-    title = doc.add_paragraph()
-    title.paragraph_format.space_after = Pt(1)
-    tr = title.add_run(payload.get("company") or "Разбор компании")
+def _title_block(doc, Pt, RGBColor, title, subtitles, meta):
+    """Заголовок отчёта: крупный титул + строки-подзаголовки + серый мета-блок."""
+    GRAY = RGBColor(0x5A, 0x5A, 0x5A)
+    t = doc.add_paragraph()
+    t.paragraph_format.space_after = Pt(2)
+    tr = t.add_run(title)
     tr.bold = True
-    tr.font.size = Pt(13)
-    if payload.get("subtitle"):
+    tr.font.size = Pt(15)
+    for s in subtitles:
+        if not s:
+            continue
         sp = doc.add_paragraph()
-        sp.paragraph_format.space_after = Pt(3)
-        sr = sp.add_run(payload["subtitle"])
-        sr.font.size = Pt(8.5)
-        sr.font.color.rgb = GRAY
+        sp.paragraph_format.space_after = Pt(1)
+        sr = sp.add_run(s)
+        sr.bold = True
+        sr.font.size = Pt(10.5)
+    for label, value in meta:
+        if not value:
+            continue
+        mp = doc.add_paragraph()
+        mp.paragraph_format.space_after = Pt(1)
+        if label:
+            lr = mp.add_run(f"{label}: ")
+            lr.bold = True
+            lr.font.size = Pt(8.5)
+            lr.font.color.rgb = GRAY
+        vr = mp.add_run(value)
+        vr.font.size = Pt(8.5)
+        vr.font.color.rgb = GRAY
 
-    if payload.get("summary"):
-        sm = doc.add_paragraph()
-        sm.paragraph_format.space_before = Pt(2)
-        sm.paragraph_format.space_after = Pt(4)
-        smr = sm.add_run(payload["summary"])
-        smr.italic = True
-        smr.font.size = Pt(9.5)
 
-    if payload.get("profile"):
-        heading("1. Профиль деятельности")
-        doc.add_paragraph(payload["profile"])
+def _h(doc, text, level=1):
+    return doc.add_heading(text, level=level)
 
-    if payload.get("scale"):
-        heading("2. Масштаб и показатели")
-        for b in payload["scale"]:
-            bullet(b)
 
-    if payload.get("owner_lpr"):
-        heading("3. Собственник, ЛПР и точки входа")
-        for b in payload["owner_lpr"]:
-            bullet(b)
+def _para(doc, Pt, text):
+    p = doc.add_paragraph(text or "")
+    p.paragraph_format.space_after = Pt(3)
+    return p
 
-    if payload.get("asis"):
-        heading("4. Карта процессов AS-IS")
-        for it in payload["asis"]:
-            label = (it.get("label") or "").rstrip(":")
-            bullet(f"{label}: {it.get('text', '')}")
 
-    points = payload.get("points") or []
-    if points:
-        heading("5. Точки внедрения ИИ → TO-BE")
-        for it in points:
-            card(it)
+def _bullet(doc, Pt, text):
+    """Пункт списка; жирная лид-метка до первого ':' либо '—'."""
+    p = doc.add_paragraph(style="List Bullet")
+    p.paragraph_format.space_after = Pt(2)
+    m = re.match(r"^(.*?[:—])(\s*)(.*)$", text or "", re.DOTALL)
+    if m:
+        p.add_run(m.group(1)).bold = True
+        if m.group(3):
+            p.add_run(" " + m.group(3))
+    else:
+        p.add_run(text or "")
+    return p
 
-        heading("6. Сводная таблица")
-        cols = ["Процесс", "Боль", "Точка ИИ", "Продукт", "Эффект", "Приоритет"]
-        table = doc.add_table(rows=1, cols=len(cols))
-        table.style = "Table Grid"
-        table.autofit = True
-        for i, c in enumerate(cols):
-            hp = table.rows[0].cells[i].paragraphs[0]
-            hp.paragraph_format.space_after = Pt(0)
-            hr = hp.add_run(c)
-            hr.bold = True
-            hr.font.size = Pt(8)
-        for it in points:
-            cells = table.add_row().cells
-            vals = [it.get("process", ""), it.get("pain", ""), it.get("ai_point", ""),
-                    it.get("product", ""), it.get("effect", ""), it.get("priority", "")]
-            for i, v in enumerate(vals):
-                vp = cells[i].paragraphs[0]
-                vp.paragraph_format.space_after = Pt(0)
-                vr = vp.add_run(str(v or ""))
-                vr.font.size = Pt(8)
 
-    if payload.get("roadmap"):
-        heading("7. Дорожная карта внедрения")
-        for w in payload["roadmap"]:
-            wp = doc.add_paragraph()
-            wp.paragraph_format.space_before = Pt(3)
-            wp.paragraph_format.space_after = Pt(1)
-            wr = wp.add_run(w.get("wave") or "Волна")
-            wr.bold = True
-            wr.font.size = Pt(9.5)
-            for it in (w.get("items") or []):
-                bullet(it)
+def _labeled(doc, Pt, label, text):
+    """Абзац вида «As-is: ...» — жирная метка, дальше обычный текст."""
+    if not text:
+        return
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(2)
+    p.add_run(f"{label}: ").bold = True
+    p.add_run(text)
 
-    if payload.get("economics"):
-        heading("8. Экономика и эффекты")
-        for b in payload["economics"]:
-            bullet(b)
 
-    if payload.get("risks"):
-        heading("9. Риски, ограничения, предпосылки")
-        for b in payload["risks"]:
-            bullet(b)
+def _table(doc, Pt, headers, rows):
+    if not rows:
+        return
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+    table.autofit = True
+    for i, htxt in enumerate(headers):
+        cell = table.rows[0].cells[i]
+        hp = cell.paragraphs[0]
+        hp.paragraph_format.space_after = Pt(0)
+        hr = hp.add_run(str(htxt))
+        hr.bold = True
+        hr.font.size = Pt(8.5)
+    for row in rows:
+        cells = table.add_row().cells
+        for i in range(len(headers)):
+            vp = cells[i].paragraphs[0]
+            vp.paragraph_format.space_after = Pt(0)
+            vr = vp.add_run(str(row[i] if i < len(row) else ""))
+            vr.font.size = Pt(8.5)
 
-    if payload.get("discovery"):
-        heading("10. Что уточнить на дискавери")
-        for b in payload["discovery"]:
-            bullet(b)
 
-    if payload.get("mentions"):
-        heading("11. Упоминания в СМИ и интернете")
-        for i, m in enumerate(payload["mentions"], 1):
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(1)
-            date = f" ({m['date']})" if m.get("date") else ""
-            p.add_run(f"{i}. {m.get('title', '')}{date} — ")
-            link = p.add_run(m.get("url", ""))
-            link.font.color.rgb = RGBColor(0x15, 0x4F, 0x9C)
-            link.font.size = Pt(8.5)
-
-    if payload.get("sources"):
-        sp = doc.add_paragraph()
-        sp.paragraph_format.space_before = Pt(4)
-        sr = sp.add_run(payload["sources"])
-        sr.font.size = Pt(8)
-        sr.font.color.rgb = GRAY
-
-    os.makedirs(DOWNLOADS, exist_ok=True)
-    base = payload.get("company", "") or "Компания"
-    parts = re.split(r"[—–-]", base, maxsplit=1)
-    first = (base.lower().split() or [""])[0]
-    clean = parts[1].strip() if len(parts) > 1 and first in ("досье", "разбор", "отчёт", "отчет") else base
-    fname = payload.get("filename") or f"Разбор_ИИ_{_safe_name(clean)}.docx"
-    if not fname.lower().endswith(".docx"):
-        fname += ".docx"
-    path = os.path.join(DOWNLOADS, fname)
+def _save_doc(doc, path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     doc.save(path)
     return path
 
 
-@tool(
-    "save_dossier_docx",
-    "Сохранить готовый разбор компании (AS-IS → точки внедрения ИИ → TO-BE) в .docx "
-    "(многостраничный) в папку «Загрузки». Передавай готовый текст по разделам; "
-    "ссылки в mentions/sources — только проверенные WebFetch'ем.",
-    {
-        "type": "object",
-        "properties": {
-            "company": {"type": "string", "description": "Заголовок: «Компания — краткий профиль»"},
-            "subtitle": {"type": "string", "description": "ИНН · ОГРН · ОКВЭД · город · 'AS-IS → точки ИИ → TO-BE'"},
-            "summary": {"type": "string",
-                        "description": "Резюме для руководителя (3–6 строк): кто; главный потенциал ИИ; топ-3 quick wins; эффект"},
-            "profile": {"type": "string", "description": "Раздел 1: профиль деятельности (абзац)"},
-            "scale": {"type": "array", "items": {"type": "string"},
-                      "description": "Раздел 2: пункты (Численность: ...; Выручка ... с годом/источником; Госзаказ/риски: ...). Выручку и обороты не путать"},
-            "owner_lpr": {"type": "array", "items": {"type": "string"},
-                          "description": "Раздел 3: Собственник / Гендиректор / расхождения по первому лицу / Контакты"},
-            "asis": {"type": "array", "items": {
-                "type": "object",
-                "properties": {"label": {"type": "string"}, "text": {"type": "string"}},
-                "required": ["label", "text"]},
-                "description": "Раздел 4: карта процессов AS-IS по доменам (label = домен/процесс, text = как сейчас + боль)"},
-            "points": {"type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "process": {"type": "string", "description": "Название процесса"},
-                    "domain": {"type": "string", "description": "Функциональный домен"},
-                    "pain": {"type": "string", "description": "Боль/узкое место as-is"},
-                    "ai_point": {"type": "string", "description": "Точка внедрения ИИ: технология (LLM/агент/RAG) и что делает"},
-                    "product": {"type": "string", "description": "Наш продукт: (1) LLM-сервисы / (2) ИИ-агенты / (3) RAG"},
-                    "to_be": {"type": "string", "description": "Целевое состояние процесса"},
-                    "effect": {"type": "string", "description": "Ожидаемый эффект (измеримо, где можно)"},
-                    "priority": {"type": "string", "description": "Quick win / Стратегический (или выс./сред./низ.)"},
-                    "prerequisites": {"type": "string", "description": "Данные/интеграции/доступы (опц.)"},
-                    "risks": {"type": "string", "description": "Сложность и риски внедрения (опц.)"}},
-                "required": ["process", "ai_point", "product", "to_be"]},
-                "description": "Разделы 5–6: карточки внедрения и строки сводной таблицы (одни и те же данные)"},
-            "roadmap": {"type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "wave": {"type": "string", "description": "Напр. 'Волна 1 — Quick wins (0–3 мес.)'"},
-                    "items": {"type": "array", "items": {"type": "string"}}},
-                "required": ["wave"]},
-                "description": "Раздел 7: дорожная карта внедрения волнами"},
-            "economics": {"type": "array", "items": {"type": "string"},
-                          "description": "Раздел 8: экономика и эффекты (укрупнённо, с допущениями)"},
-            "risks": {"type": "array", "items": {"type": "string"},
-                      "description": "Раздел 9: риски, ограничения, предпосылки внедрения"},
-            "discovery": {"type": "array", "items": {"type": "string"},
-                          "description": "Раздел 10: что уточнить у заказчика на дискавери"},
-            "mentions": {"type": "array", "items": {
-                "type": "object",
-                "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "date": {"type": "string"}},
-                "required": ["title", "url"]},
-                "description": "Раздел 11: упоминания в СМИ — ТОЛЬКО проверенные WebFetch'ем ссылки"},
-            "sources": {"type": "string", "description": "Строка 'Источники: ...' (только проверенные ссылки)"},
-            "filename": {"type": "string", "description": "Имя файла (опц.)"},
-        },
-        "required": ["company", "profile"],
+# ===========================================================================
+# ДОКУМЕНТ 1 — КАРТА БИЗНЕС-ПРОЦЕССОВ
+# ===========================================================================
+PROCESS_MAP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "org_name": {"type": "string", "description": "Полное наименование, напр. «АО «Рязаньавтодор»»"},
+        "subject": {"type": "string",
+                    "description": "Предмет: стратегия внедрения " + PLATFORM_DESC + " (можно уточнить под компанию)"},
+        "sources_note": {"type": "string", "description": "Чем подтверждены данные (по умолчанию — публичные источники)"},
+        "date": {"type": "string", "description": "Дата, напр. «июнь 2026 г.»"},
+        "tldr": {"type": "array", "items": {"type": "string"},
+                 "description": "Краткое резюме (TL;DR): 2–4 пункта — кто компания, где сильнее всего эффект ИИ, как продавать"},
+        "key_findings": {"type": "array", "items": {"type": "string"},
+                         "description": "Ключевые выводы: 3–6 пунктов с фактами и источниками"},
+        "profile_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"param": {"type": "string"}, "value": {"type": "string"}, "source": {"type": "string"}},
+            "required": ["param", "value"]},
+            "description": "Раздел «1. Профиль компании»: строки таблицы Параметр|Значение|Источник"},
+        "financials": {"type": "array", "items": {"type": "string"},
+                       "description": "Финансовые показатели (выручка/прибыль/госконтракты) с годом и источником"},
+        "structure_qc": {"type": "array", "items": {"type": "string"},
+                         "description": "Филиалы, структура, контроль качества (абзацы)"},
+        "contracts_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"year": {"type": "string"}, "subject": {"type": "string"},
+                           "amount": {"type": "string"}, "source": {"type": "string"}},
+            "required": ["subject"]},
+            "description": "Ключевые госконтракты: строки Год|Предмет|Сумма|Источник"},
+        "processes": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Напр. «2.1. Тендерная работа по 44-ФЗ»"},
+                "as_is": {"type": "string", "description": "Как процесс устроен сейчас"},
+                "pains": {"type": "string", "description": "Боли/узкие места (с цифрами/фактами, где есть)"},
+                "ai_solution": {"type": "string",
+                                "description": "ИИ-решение: RAG / автономный ИИ-агент / ИИ-Коуч «Наставник» — что делает"},
+                "to_be": {"type": "string", "description": "To-be эффект (измеримо, где можно)"}},
+            "required": ["title", "as_is", "ai_solution", "to_be"]},
+            "description": "Раздел «2. Карта бизнес-процессов»: 6–9 процессов компании"},
+        "summary_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"process": {"type": "string"}, "pain": {"type": "string"},
+                           "product": {"type": "string"}, "effect": {"type": "string"}},
+            "required": ["process", "product", "effect"]},
+            "description": "Раздел «3. Сводная таблица»: Процесс|Ключевая боль|Продукт/решение|Ожидаемый эффект"},
+        "roadmap": {"type": "array", "items": {"type": "string"},
+                    "description": "Раздел «4. Приоритизация и дорожная карта»: этапы 0→3 (демо→пилот→масштаб→зрелость)"},
+        "gov_sale": {"type": "array", "items": {"type": "string"},
+                     "description": "Раздел «5. Специфика продажи (44-ФЗ/223-ФЗ)»: путь продажи, ЛПР, on-prem УТП, НМЦК, триггеры"},
+        "recommendations": {"type": "array", "items": {"type": "string"},
+                            "description": "Рекомендации: с чего начать, на кого выходить, на чём делать акцент, метрики пилота"},
+        "disclaimers": {"type": "array", "items": {"type": "string"},
+                        "description": "Оговорки по достоверности данных (что не подтверждено, что оценочно)"},
+        "filename": {"type": "string", "description": "Имя файла (опц.)"},
     },
+    "required": ["org_name", "tldr", "processes"],
+}
+
+
+def _write_process_map_docx(payload: dict, path: str = None) -> str:
+    """КАРТА БИЗНЕС-ПРОЦЕССОВ -> .docx. Возвращает путь к файлу."""
+    doc, Pt, RGBColor = _new_doc()
+    org = payload.get("org_name") or payload.get("company") or "Компания"
+
+    _title_block(
+        doc, Pt, RGBColor,
+        "АНАЛИТИЧЕСКИЙ ОТЧЁТ",
+        [f"Карта бизнес-процессов {org}",
+         "as-is процессы → точки внедрения ИИ → to-be"],
+        [("Подготовлено для", VENDOR),
+         ("Предмет", payload.get("subject") or ("стратегия внедрения " + PLATFORM_DESC)),
+         ("Источники", payload.get("sources_note") or SOURCES_NOTE_DEFAULT),
+         ("Дата", payload.get("date") or "")],
+    )
+
+    if payload.get("tldr"):
+        _h(doc, "Краткое резюме (TL;DR)", 1)
+        for b in payload["tldr"]:
+            _bullet(doc, Pt, b)
+
+    if payload.get("key_findings"):
+        _h(doc, "Ключевые выводы", 1)
+        for b in payload["key_findings"]:
+            _bullet(doc, Pt, b)
+
+    _h(doc, "1. Профиль компании", 1)
+    _table(doc, Pt, ["Параметр", "Значение", "Источник"],
+           [[r.get("param", ""), r.get("value", ""), r.get("source", "")]
+            for r in (payload.get("profile_table") or [])])
+    if payload.get("financials"):
+        _h(doc, "Финансовые показатели", 2)
+        for b in payload["financials"]:
+            _bullet(doc, Pt, b)
+    if payload.get("structure_qc"):
+        _h(doc, "Филиалы, структура и контроль качества", 2)
+        for b in payload["structure_qc"]:
+            _para(doc, Pt, b)
+    if payload.get("contracts_table"):
+        _h(doc, "Ключевые госконтракты", 2)
+        _table(doc, Pt, ["Год", "Предмет", "Сумма", "Источник"],
+               [[r.get("year", ""), r.get("subject", ""), r.get("amount", ""), r.get("source", "")]
+                for r in payload["contracts_table"]])
+
+    _h(doc, "2. Карта бизнес-процессов (as-is) → боли → ИИ-решение → to-be", 1)
+    for pr in (payload.get("processes") or []):
+        _h(doc, pr.get("title") or "Процесс", 3)
+        _labeled(doc, Pt, "As-is", pr.get("as_is"))
+        _labeled(doc, Pt, "Боли", pr.get("pains"))
+        _labeled(doc, Pt, "ИИ-решение", pr.get("ai_solution"))
+        _labeled(doc, Pt, "To-be эффект", pr.get("to_be"))
+
+    if payload.get("summary_table"):
+        _h(doc, "3. Сводная таблица: процесс → боль → продукт → эффект", 1)
+        _table(doc, Pt, ["Процесс", "Ключевая боль", "Продукт / решение", "Ожидаемый эффект"],
+               [[r.get("process", ""), r.get("pain", ""), r.get("product", ""), r.get("effect", "")]
+                for r in payload["summary_table"]])
+
+    if payload.get("roadmap"):
+        _h(doc, "4. Приоритизация и дорожная карта внедрения", 1)
+        for b in payload["roadmap"]:
+            _para(doc, Pt, b)
+
+    if payload.get("gov_sale"):
+        _h(doc, "5. Специфика продажи госкомпании (44-ФЗ/223-ФЗ)", 1)
+        for b in payload["gov_sale"]:
+            _bullet(doc, Pt, b)
+
+    if payload.get("recommendations"):
+        _h(doc, "Рекомендации", 1)
+        for b in payload["recommendations"]:
+            _bullet(doc, Pt, b)
+
+    if payload.get("disclaimers"):
+        _h(doc, "Оговорки по достоверности данных", 1)
+        for b in payload["disclaimers"]:
+            _bullet(doc, Pt, b)
+
+    if not path:
+        os.makedirs(DOWNLOADS, exist_ok=True)
+        path = os.path.join(DOWNLOADS,
+                            payload.get("filename") or f"{_safe_name(org)}_карта_бизнес-процессов.docx")
+    return _save_doc(doc, path)
+
+
+# ===========================================================================
+# ДОКУМЕНТ 2 — КАРТА РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ
+# ===========================================================================
+ROLES_CONTACTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "org_name": {"type": "string", "description": "Полное наименование, напр. «АО «Рязаньавтодор»»"},
+        "object_line": {"type": "string",
+                        "description": "Объект: «<Компания>, ИНН ..., город (учредитель/собственник ...)»"},
+        "date": {"type": "string", "description": "Дата, напр. «июнь 2026 г. (данные проверены ДД.ММ.ГГГГ)»"},
+        "tldr": {"type": "array", "items": {"type": "string"},
+                 "description": "TL;DR: подтверждённый ЛПР и официальный канал захода; приоритетные отделы под внедрение ИИ"},
+        "org_basics": {"type": "array", "items": {"type": "string"},
+                       "description": "Базовые данные: ИНН/ОГРН/КПП, адрес, учредитель, УК, численность, ОКВЭД, заказчики, финансы"},
+        "leadership_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"position": {"type": "string"}, "fio": {"type": "string"},
+                           "responsibility": {"type": "string"}, "status": {"type": "string"}},
+            "required": ["position"]},
+            "description": "«1. Руководство центрального аппарата»: Должность|ФИО|Зона ответственности|Статус/источник"},
+        "leadership_note": {"type": "string",
+                            "description": "Примечание о неподтверждённых публично ролях (уточнять через приёмную)"},
+        "departments_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"block": {"type": "string"}, "contact": {"type": "string"},
+                           "relevance": {"type": "string"}},
+            "required": ["block", "relevance"]},
+            "description": "«2. Профильные отделы — приоритет под внедрение ИИ»: Блок|Контакт|Почему релевантен и через какую боль заходить"},
+        "project_institute": {"type": "string", "description": "Проектный институт / профильное подразделение (абзац, опц.)"},
+        "branches_intro": {"type": "string", "description": "Вступление к таблице филиалов (опц.)"},
+        "branches_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"branch": {"type": "string"}, "director": {"type": "string"},
+                           "phone": {"type": "string"}},
+            "required": ["branch"]},
+            "description": "«3. Руководители филиалов»: Филиал|Директор|Телефон (если у компании есть филиалы)"},
+        "branches_note": {"type": "string", "description": "Примечание о расхождениях по числу/руководителям филиалов (опц.)"},
+        "official_contacts": {"type": "array", "items": {"type": "string"},
+                              "description": "«4. Официальные контакты»: приёмная/общий тел., e-mail, закупки, соцсети, график"},
+        "lpr_profile_title": {"type": "string", "description": "Заголовок профиля ЛПР, напр. «Руденко С.А. — публичный деловой профиль»"},
+        "lpr_profile": {"type": "string", "description": "Публичный деловой профиль ЛПР (только офиц. источники; без личных/семейных данных)"},
+        "why_candidate": {"type": "array", "items": {"type": "string"},
+                          "description": "Почему компания — сильный кандидат на on-premises LLM-платформу"},
+        "risk_compliance": {"type": "string", "description": "Риск-факторы и комплаенс (44-ФЗ/223-ФЗ, суды, аккуратность коммуникации)"},
+        "approach_plan": {"type": "array", "items": {"type": "string"},
+                          "description": "«План захода»: этапы 1→4 (офиц. контакт → внутр. чемпион → тех. проработка → пилот)"},
+        "threshold_signals": {"type": "array", "items": {"type": "string"},
+                              "description": "Пороговые сигналы для смены тактики"},
+        "disclaimers": {"type": "array", "items": {"type": "string"},
+                        "description": "Оговорки по достоверности данных (что не подтверждено публично)"},
+        "filename": {"type": "string", "description": "Имя файла (опц.)"},
+    },
+    "required": ["org_name", "tldr", "departments_table", "official_contacts"],
+}
+
+
+def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
+    """КАРТА РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ -> .docx. Возвращает путь к файлу."""
+    doc, Pt, RGBColor = _new_doc()
+    org = payload.get("org_name") or payload.get("company") or "Компания"
+
+    _title_block(
+        doc, Pt, RGBColor,
+        "КАРТА РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ",
+        [org,
+         "Карта ролей и деловых контактов для легитимного B2B-захода"],
+        [("Подготовлено для", VENDOR),
+         ("Объект", payload.get("object_line") or org),
+         ("Назначение", PURPOSE_DEFAULT),
+         ("Этические границы", ETHICS_DEFAULT),
+         ("Дата", payload.get("date") or "")],
+    )
+
+    if payload.get("tldr"):
+        _h(doc, "Краткое резюме (TL;DR)", 1)
+        for b in payload["tldr"]:
+            _bullet(doc, Pt, b)
+
+    if payload.get("org_basics"):
+        _h(doc, "Базовые данные организации", 1)
+        for b in payload["org_basics"]:
+            _bullet(doc, Pt, b)
+
+    _h(doc, "1. Руководство центрального аппарата", 1)
+    _table(doc, Pt, ["Должность", "ФИО", "Зона ответственности", "Статус / источник"],
+           [[r.get("position", ""), r.get("fio", ""), r.get("responsibility", ""), r.get("status", "")]
+            for r in (payload.get("leadership_table") or [])])
+    if payload.get("leadership_note"):
+        _para(doc, Pt, payload["leadership_note"])
+
+    _h(doc, "2. Профильные отделы — приоритет под внедрение ИИ", 1)
+    _table(doc, Pt, ["Блок", "Контактное лицо / контакт", "Почему релевантен и через какую боль заходить"],
+           [[r.get("block", ""), r.get("contact", ""), r.get("relevance", "")]
+            for r in (payload.get("departments_table") or [])])
+    if payload.get("project_institute"):
+        _h(doc, "Профильное подразделение / проектный институт", 2)
+        _para(doc, Pt, payload["project_institute"])
+
+    if payload.get("branches_table"):
+        _h(doc, "3. Руководители филиалов", 1)
+        if payload.get("branches_intro"):
+            _para(doc, Pt, payload["branches_intro"])
+        _table(doc, Pt, ["Филиал", "Директор", "Телефон"],
+               [[r.get("branch", ""), r.get("director", ""), r.get("phone", "")]
+                for r in payload["branches_table"]])
+        if payload.get("branches_note"):
+            _para(doc, Pt, payload["branches_note"])
+
+    _h(doc, "4. Официальные контакты компании", 1)
+    for b in (payload.get("official_contacts") or []):
+        _bullet(doc, Pt, b)
+
+    if payload.get("lpr_profile") or payload.get("why_candidate") or payload.get("risk_compliance"):
+        _h(doc, "Дополнительный контекст", 1)
+        if payload.get("lpr_profile"):
+            _h(doc, payload.get("lpr_profile_title") or "Публичный деловой профиль ЛПР", 2)
+            _para(doc, Pt, payload["lpr_profile"])
+        if payload.get("why_candidate"):
+            _h(doc, "Почему компания — сильный кандидат на on-premises LLM-платформу", 2)
+            for b in payload["why_candidate"]:
+                _bullet(doc, Pt, b)
+        if payload.get("risk_compliance"):
+            _h(doc, "Риск-факторы и комплаенс", 2)
+            _para(doc, Pt, payload["risk_compliance"])
+
+    if payload.get("approach_plan"):
+        _h(doc, "План захода (рекомендации)", 1)
+        for b in payload["approach_plan"]:
+            _para(doc, Pt, b)
+    if payload.get("threshold_signals"):
+        _h(doc, "Пороговые сигналы для смены тактики", 2)
+        for b in payload["threshold_signals"]:
+            _bullet(doc, Pt, b)
+
+    if payload.get("disclaimers"):
+        _h(doc, "Оговорки по достоверности данных", 1)
+        for b in payload["disclaimers"]:
+            _bullet(doc, Pt, b)
+
+    if not path:
+        os.makedirs(DOWNLOADS, exist_ok=True)
+        path = os.path.join(DOWNLOADS,
+                            payload.get("filename") or f"{_safe_name(org)}_карта_ролей_и_контактов_пресейл.docx")
+    return _save_doc(doc, path)
+
+
+# ===========================================================================
+# ИНСТРУМЕНТЫ 2–3 — сохранение двух пресейл-документов в .docx
+# ===========================================================================
+@tool(
+    "save_process_map_docx",
+    "Сохранить КАРТУ БИЗНЕС-ПРОЦЕССОВ в .docx: профиль → as-is процессы → боли → "
+    "ИИ-решение → to-be, сводная таблица, дорожная карта, специфика 44/223-ФЗ, "
+    "оговорки. Ссылки/контакты — только проверенные.",
+    PROCESS_MAP_SCHEMA,
 )
-async def save_dossier_docx(args):
-    path = await anyio.to_thread.run_sync(_write_dossier_docx, args)
-    return {"content": [{"type": "text", "text": f"Досье сохранено: {path}"}]}
+async def save_process_map_docx(args):
+    path = await anyio.to_thread.run_sync(_write_process_map_docx, args)
+    return {"content": [{"type": "text", "text": f"Карта бизнес-процессов сохранена: {path}"}]}
+
+
+@tool(
+    "save_roles_contacts_docx",
+    "Сохранить КАРТУ РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ в .docx: ЛПР и руководство, профильные "
+    "отделы под внедрение ИИ, филиалы, официальные контакты, план захода, оговорки. Только "
+    "официальные публичные контакты; персональные/семейные данные не включать.",
+    ROLES_CONTACTS_SCHEMA,
+)
+async def save_roles_contacts_docx(args):
+    path = await anyio.to_thread.run_sync(_write_roles_contacts_docx, args)
+    return {"content": [{"type": "text", "text": f"Карта ролей и контактов сохранена: {path}"}]}
 
 
 research_server = create_sdk_mcp_server(
-    name="research", version="2.0.0",
-    tools=[deep_research, save_dossier_docx],
+    name="research", version="3.0.0",
+    tools=[deep_research, save_process_map_docx, save_roles_contacts_docx],
 )
 
 
@@ -481,7 +704,7 @@ research_server = create_sdk_mcp_server(
 STAGE1_SYSTEM = (
     "Ты — агент идентификации компаний для российского B2B-ресёрч-инструмента.\n"
     "На входе грязный текст (описание / название / ИНН). Определи ОДНУ целевую\n"
-    "компанию и аспекты для досье. ИНН РФ = 10 цифр (юрлицо) или 12 (ИП).\n"
+    "компанию и аспекты для пресейла. ИНН РФ = 10 цифр (юрлицо) или 12 (ИП).\n"
     "Верни ТОЛЬКО JSON без прозы и без ```-ограждений, ровно с ключами:\n"
     '  {"company_name": str, "inn": str|null, "aspects": [str,...], '
     '"confidence": float, "notes": str}\n'
@@ -533,106 +756,161 @@ async def run_stage1_triage(raw_request: str) -> dict:
 
 
 # ===========================================================================
-# STAGE 2 (ОСНОВНОЙ РЕЖИМ) — РАЗБОР AS-IS → точки внедрения ИИ → TO-BE -> .docx
+# STAGE 2 (ОСНОВНОЙ РЕЖИМ) — РЕСЁРЧ -> ДВА пресейл-документа .docx
 # ===========================================================================
-DOSSIER_SYSTEM = """\
-Ты — старший консультант по ИИ-трансформации и бизнес-аналитик с навыками OSINT.
-Готовишь для вендора развёрнутый разбор компании в формате
-«AS-IS процессы → точки внедрения ИИ → TO-BE» с привязкой к нашим продуктам.
+PRESALE_SYSTEM = """\
+Ты — старший пресейл-аналитик и бизнес-аналитик с навыками OSINT. Готовишь ДВА
+пресейл-документа по ОДНОЙ компании под продажу корпоративной on-premises
+LLM-платформы. Платформа: RAG-база знаний (семантический поиск по нормативке/
+документации со ссылкой на источник), автономные ИИ-агенты (многошаговые задачи:
+мониторинг, проверка, генерация документов), ИИ-Коуч «Наставник» (онбординг и
+тиражирование практик). Ключевое УТП — on-premises: данные не уходят в облако
+(152-ФЗ, импортозамещение, ИБ).
 
-НАШИ ПРОДУКТЫ (каждую точку внедрения привязывай к одному из них):
-  (1) Корпоративные LLM-сервисы — приватный LLM в контуре клиента (on-prem):
-      данные НЕ уходят в облако, снимает риски 152-ФЗ. Ассистент сотрудника,
-      генерация/редактирование документов (письма, КП, договоры, регламенты),
-      суммаризация, перевод, анализ и классификация текста.
-  (2) Автономные ИИ-агенты — многошаговое исполнение задач без человека: обработка
-      входящих (почта, заявки, чаты), оркестрация процессов, операторы (чат/голос),
-      агенты-аналитики, интеграции с CRM/ERP/1С; связка RPA + LLM.
-  (3) RAG-системы — корпоративная база знаний с семантическим поиском по документам
-      (регламенты, договоры, техдокументация, нормативка): ответы со ссылкой на
-      источник, ассистенты поддержки/онбординга, экспертные справочные системы.
-
-ПОРЯДОК РАБОТЫ (используй инструменты):
-1) Вызови deep_research(company_name, inn, aspects) — официальная база: выручка
-   (ГИР БО), карточка ЕГРЮЛ/ЕГРИП (ЛПР/ОКВЭД/адрес/статус), контакты.
-2) Через WebSearch + WebFetch добери из ОТКРЫТЫХ источников и RusProfile: профиль и
-   состав услуг (сайт), ЧИСЛЕННОСТЬ персонала, собственник/бенефициар, актуальное
-   руководство, масштаб (госзакупки/тендеры/суды/ФАС), упоминания в СМИ за 5 лет.
-   OSINT-логика вывода процессов: вакансии (hh.ru) → реальный стек (1С/CRM/системы)
-   и оргструктура; госзакупки → ИТ-системы и подрядчики; сайт → услуги;
-   отзывы сотрудников/клиентов → боли; новости/интервью → стратегия.
-3) КАЖДУЮ ссылку для разделов «СМИ»/«Источники» ОБЯЗАТЕЛЬНО открой через WebFetch и
-   убедись, что страница реальна (не 404) и именно про эту компанию. Битые,
-   непроверенные и выдуманные ссылки НЕ включай.
-4) Построй разбор:
-   - Отрасль → типовая цепочка создания стоимости → специфика этой компании.
-   - Декомпозируй на бизнес-процессы по доменам (продажи/тендеры, закупки, основная
-     деятельность/производство, логистика, финансы/бухгалтерия, HR, юр/договоры,
-     клиентский сервис, документооборот, ИТ, управление/аналитика; адаптируй под
-     отрасль — покрой все релевантные).
-   - По каждому значимому процессу: AS-IS (как сейчас + боль) → точка внедрения ИИ
-     (технология LLM/агент/RAG и что делает) → наш продукт (1/2/3) → TO-BE
-     (целевое состояние) → ожидаемый эффект (измеримо, где можно) → предпосылки/
-     данные → приоритет (Quick win / Стратегический).
-   - Приоритизируй по «влияние × реализуемость», собери дорожную карту волнами.
-5) Заполни и вызови save_dossier_docx со ВСЕМИ полями:
-   company   — «Компания — краткий профиль» (заголовок);
-   subtitle  — ИНН · ОГРН · ОКВЭД · город · «AS-IS → точки ИИ → TO-BE»;
-   summary   — резюме для руководителя (кто; где главный потенциал ИИ; топ-3
-               quick wins; верхнеуровневый эффект);
-   profile   — профиль деятельности (абзац);
-   scale     — масштаб и показатели (численность; выручка с годом и источником;
-               госзаказ/риски);
-   owner_lpr — собственник; гендиректор; расхождения по первому лицу; контакты;
-   asis      — карта процессов AS-IS по доменам (label = домен, text = как сейчас + боль);
-   points    — карточки внедрения: process, domain, pain, ai_point, product, to_be,
-               effect, priority, prerequisites, risks (из них же строится сводная таблица);
-   roadmap   — дорожная карта волнами (wave + items): волна 1 quick wins → 2 → 3;
-   economics — экономика и эффекты (укрупнённо, с допущениями);
-   risks     — риски, ограничения, предпосылки внедрения;
-   discovery — что уточнить у заказчика на дискавери (закрыть пробелы данных);
-   mentions  — упоминания в СМИ (заголовок+ссылка+дата), только проверенные;
-   sources   — строка «Источники: ...» (только проверенные ссылки).
+ПОРЯДОК РАБОТЫ (ресёрч делаешь ОДИН раз, оба документа — из одних находок):
+1) deep_research(company_name, inn) — ЗОВИ ПЕРВЫМ и ОДИН раз. Это уже НЕ только
+   официальная база: движок сам открывает САЙТ компании (филиалы и их директора+
+   телефоны, руководство, контакты, СОЦСЕТИ, проектный институт), ЕИС/госзакупки по
+   ИНН, суды/СМИ и hh.ru, гоняет петлю ЦЕЛЕВОГО добора под пустые ячейки таблиц и
+   возвращает источникованный документ: markdown + структурный JSON (у КАЖДОЙ строки
+   source URL), список РЕАЛЬНО ОТКРЫТЫХ страниц и блок «Полнота целевых таблиц».
+   ОПИРАЙСЯ на эти находки как на основу обоих документов — особенно таблицу филиалов,
+   контакты закупок и соцсети (раньше их теряли).
+2) WebSearch + WebFetch — ТОЛЬКО для точечной ДОВЕРКИ и закрытия остаточных пробелов
+   из блока «Полнота целевых таблиц» (напр. контакт ИТ/цифровизации, ФИО замов,
+   контактное лицо закупок). Не дублируй то, что deep_research уже принёс. Проверяй
+   спорные ссылки WebFetch'ем; битые/выдуманные НЕ включай. Контакты бери ТОЛЬКО
+   официальные (сайт, извещения о закупках, ЕГРЮЛ). Персональные/семейные данные НЕ собирай.
+3) Вызови save_process_map_docx — КАРТА БИЗНЕС-ПРОЦЕССОВ:
+   org_name; tldr; key_findings; profile_table (Параметр|Значение|Источник);
+   financials; structure_qc; contracts_table; processes — 6–9 процессов компании,
+   по каждому as_is → pains → ai_solution (RAG/ИИ-агент/ИИ-Коуч и что делает) →
+   to_be (измеримо); summary_table (Процесс|Боль|Продукт/решение|Эффект);
+   roadmap (этап 0 демо → 1 пилот «быстрые победы» → 2 масштаб → 3 зрелость);
+   gov_sale (путь продажи через конкурентную процедуру, ЛПР и функц. заказчики,
+   on-prem УТП, обоснование НМЦК, триггерные события); recommendations; disclaimers.
+4) Вызови save_roles_contacts_docx — КАРТА РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ:
+   org_name; object_line; tldr; org_basics; leadership_table (Должность|ФИО|Зона
+   ответственности|Статус/источник — неподтверждённое помечай); leadership_note;
+   departments_table (Блок|Контакт|Почему релевантен и через какую боль заходить —
+   расставь приоритет под внедрение ИИ, явно отметь недостающий контакт ИТ/
+   цифровизации); project_institute; branches_table (если есть филиалы);
+   official_contacts (приёмная, e-mail, закупки, соцсети, график); lpr_profile
+   (только офиц. источники); why_candidate; risk_compliance; approach_plan
+   (этапы 1→4); threshold_signals; disclaimers.
 
 ПРИНЦИПЫ:
-- Опирайся ТОЛЬКО на открытые данные и RusProfile. Каждый существенный факт — с
-  источником. Разделяй ФАКТ / ОЦЕНКУ / ГИПОТЕЗУ, помечай уверенность.
-- Конкретика под реальный стек компании (системы из вакансий и закупок), а не
-  абстракции. Каждая точка внедрения привязана к продукту (1/2/3) и к эффекту.
-- Выручку (бухгалтерскую, стр. 2110) и обороты по счёту/контрактам НЕ путать —
-  указывай метрику, источник, год. Если первое лицо в базах различается — отметь
-  это и порекомендуй подтвердить свежей выпиской ЕГРЮЛ.
-- Никаких выдуманных цифр и ссылок. Нет данных — пиши «не найдено в открытых
-  источниках».
-После сохранения дай краткое резюме: куда сохранён файл и топ-3 точки внедрения."""
+- Только открытые данные. Каждый существенный факт — с источником; разделяй
+  ФАКТ / ОЦЕНКУ / ГИПОТЕЗУ. Эффекты ИИ помечай как отраслевые оценки, не измерения.
+- Бухгалтерскую выручку (стр. 2110) и обороты/объём контрактов НЕ путать —
+  указывай метрику, год, источник. Расхождения по первому лицу/числу филиалов
+  фиксируй в оговорках.
+- Заход — строго легитимный: официальные каналы и конкурентная процедура, без
+  обхода закупок через личные связи. Никаких выдуманных цифр, ФИО и ссылок.
+- ДИСЦИПЛИНА ДОЗАБОРА (обязательно):
+  (A1) Ячейку (директор филиала, контакт отдела, ФИО руководителя и т.п.) можно
+       оставить «не подтверждено» ТОЛЬКО если соответствующий источник РЕАЛЬНО открыт
+       (он есть в списке «Реально открытые источники» из deep_research или ты сам
+       открыл его WebFetch'ем) и факта там нет. ЛЮБОЕ отрицание — со ссылкой на
+       открытую страницу/выдачу ЕИС. Если deep_research уже принёс ФИО+телефон
+       филиала — переноси их, НЕ пиши «не подтверждено». Запрещено и выдумывать, и
+       уверенно отрицать без открытой страницы.
+  (A2) ПЕРЕД сохранением — самопроверка полноты: пройди по структурному JSON находок
+       и блоку «Полнота целевых таблиц». Все принесённые филиалы (директор+телефон),
+       соцсети и контакты закупок ДОЛЖНЫ попасть в документы. Если в JSON строка есть,
+       а в таблице её нет — добавь её. Пустые ячейки в leadership/branches/departments
+       оставляй только по правилу A1, с источником-ссылкой.
+Оба документа ОБЯЗАТЕЛЬНО сохрани (вызови ОБА инструмента). В конце — краткое
+резюме: что сохранено и топ-3 точки внедрения."""
+
+
+# ===========================================================================
+# СИСТЕМНЫЙ ПРОМПТ ТРЕТЬЕГО ДЕЛИВЕРАБЛА — 3-слайдовая презентация .pptx
+#   Здесь форматы документов проекта живут в CRA, поэтому промпт презентации —
+#   тоже тут, рядом с PRESALE_SYSTEM. В отличие от двух .docx (детерминированные
+#   рендереры), презентацию делает АГЕНТНАЯ сессия через официальный скилл pptx
+#   (code-execution/Bash), а НЕ python-рендерер. Текст промпта — VERBATIM.
+# ===========================================================================
+PRESENTATION_SYSTEM = """\
+КОНТЕКСТ И РОЛЬ
+Ты — дизайнер презентаций и бизнес-аналитик. Я отвечаю за коммерцию и продукт платформы Telepath в АО «ЦИТ РТ» (Центр информационных технологий Республики Татарстан). Telepath — корпоративная LLM-платформа (ИИ в защищённом on-premises контуре): RAG-базы знаний, автономные ИИ-агенты, ИИ-Коуч. Я готовлю клиентскую презентацию для потенциального заказчика.
+
+ВХОДНЫЕ ДАННЫЕ (заполняю под каждого клиента)
+- НАЗВАНИЕ КОМПАНИИ-ЗАКАЗЧИКА:
+- ЧЕМ ЗАНИМАЕТСЯ / ОТРАСЛЬ:
+- ГЛАВНАЯ БОЛЬ (если знаю):
+
+ЗАДАЧА
+Сделай готовую к отправке презентацию .pptx (16:9, widescreen), РОВНО 3 слайда, в фирменном стиле сайта https://citrt.ru/. Её читает сам заказчик и в финале должен захотеть записаться на демо. Выполни за один проход: сгенерируй файл, отрендери каждый слайд в картинку, проверь отсутствие переполнений и налезаний, исправь и только потом отдай .pptx.
+Слайды 1 и 2 неизменны (о нас и о нашем эксперте). Слайд 3 — оффер — адаптируй под компанию-заказчика из «ВХОДНЫХ ДАННЫХ».
+
+ВЛОЖЕНИЯ (в этом же запросе)
+1) Логотип ЦИТ РТ (PNG). 2) Фото Булата Замалиева (PNG) — кадрируй в портрет, убери посторонний фон/цветовые пятна по краям, скругли углы.
+
+ФИРМЕННЫЙ СТИЛЬ (палитра из логотипа/сайта)
+- Голубой #0090C0 (основной), лаймовый #8CC63F (акцент, как «С» в логотипе), тёмно-бирюзовый #0B2B3C (тёмные секции), белый (контент). Доп.: тёмный голубой #0A6E96, серо-стальной #55687A.
+- Чистый современный дизайн: карточки со скруглением и мягкой тенью; иконки в кружках как единый мотив; БЕЗ полосок-акцентов и подчёркиваний под заголовками; шрифт без засечек (Arial).
+- Логотип: на тёмных слайдах — на белой скруглённой подложке с тонкой голубой обводкой; на белом слайде — в углу без подложки.
+
+СЛАЙД 1 — «О компании АО ЦИТ РТ» (тёмно-бирюзовый фон) — НЕИЗМЕНЕН
+- Надзаголовок «РАЗРАБОТЧИК ПЛАТФОРМЫ TELEPATH»; заголовок «АО «ЦИТ РТ»»; подзаголовок: государственный Центр информационных технологий Республики Татарстан, разработчик Telepath.
+- Слева — 4 карточки-преимущества (кружок-иконка + заголовок + короткое описание) одной колонкой: Суверенность данных (on-premises, 152-ФЗ); Импортозамещение (российская разработка, автономный контур); Модель «гос-к-гос» (госкомпания РТ — доверенный партнёр для предприятий с госучастием); Отраслевой опыт (энергетика, нефтегаз, ритейл, госсектор).
+- Справа — крупный логотип на белой панели.
+- В подвале мелким: ИНН 1655505808, ОГРН 1241600056829, обслуживание в ПАО «АК БАРС» Банк.
+
+СЛАЙД 2 — «Булат Замалиев», руководитель направления ИИ (тёмно-бирюзовый фон) — НЕИЗМЕНЕН
+- Слева — его фото в голубой рамке. Справа: надзаголовок «КОМАНДА TELEPATH»; имя «Булат Замалиев»; должность «Руководитель направления ИИ, АО «ЦИТ РТ»».
+- Блок «КЛЮЧЕВЫЕ ДОСТИЖЕНИЯ» — только проверенные факты (ничего не выдумывай; при сомнении проверь по авторитетным источникам: Forbes, «Российская газета», «Коммерсантъ», сайты вузов). Используй именно эти формулировки:
+  • Уполномоченный по технологиям ИИ в Республике Татарстан — первый в России (с 2019).
+  • Номинант рейтинга Forbes «30 до 30» (2020), категория «Управление». (Именно НОМИНАНТ/лонг-лист, НЕ «победитель».)
+  • Победитель всероссийского хакатона «Цифровой прорыв» (2019), грант 3 млн ₽.
+  • Идеолог ИИ-сервиса «Госпромпт» для госслужащих и проекта «Цифровая деревня».
+- Внизу зелёная плашка-связка: «→ Проведёт демонстрацию Telepath для вашей команды».
+- ДОСТОВЕРНОСТЬ: публичные источники подтверждают его как «Уполномоченного по технологиям ИИ при Минцифры РТ»; связь с ЦИТ РТ как руководителя направления публично не подтверждена. Поставь должность как указано, но отдельным замечанием предупреди меня об этом расхождении и предложи проверяемую альтернативу.
+
+СЛАЙД 3 — Оффер «Серьёзная проблема — простое решение» (белый фон) — АДАПТИРУЙ ПОД ЗАКАЗЧИКА
+- Надзаголовок «ПЕРСОНАЛЬНО ДЛЯ [НАЗВАНИЕ КОМПАНИИ]»; заголовок «Серьёзная проблема — простое решение»; логотип в углу.
+- Сформулируй главную боль заказчика исходя из исследований прошлых агентов.
+- Две колонки:
+  • Слева (нейтральная серая карточка, серый кружок-иконка) — ГЛАВНАЯ ПРОБЛЕМА: [ёмкий заголовок боли]. 3–4 коротких пункта, конкретных под отрасль заказчика (где уходит время специалистов, что делается вручную, почему ошибки дороги, где разрозненность).
+  • Справа (светло-голубая карточка, зелёный кружок-иконка робота) — РЕШЕНИЕ: платформа Telepath. ИИ-агенты берут рутину на себя; RAG-база даёт мгновенный ответ по нормативке/регламентам; ускорение профильной операции с часов до минут; on-premises — данные не покидают предприятие.
+- Полоса метрик (4 плитки, 3 голубые + 1 зелёная), подпиши под отрасль заказчика: «≈8×» (быстрее профильная операция); «Минуты» (вместо часов на типовую задачу); «Секунды» (ответ по нормативке/регламентам через базу знаний); «On-prem» (данные в вашем контуре). НЕ используй «24/7».
+- Внизу тёмно-бирюзовая плашка-призыв: «Назначьте бесплатное демо Telepath» + «Покажем на примере ваших реальных задач — без обязательств и доступа к вашим данным» + контакты зелёным: [телефон], [email], сайт citrt.ru.
+
+ТРЕБОВАНИЯ К КАЧЕСТВУ
+- Ничего не вылезает за границы плашек/слайдов — проверь рендер всех 3 слайдов и поправь до выдачи.
+- Контакты, которых у тебя нет, оставляй явными полями-заполнителями (например, [телефон]).
+- Факты о людях/компании — только подтверждённые; сомнительное помечай отдельным замечанием.
+- Отдай один готовый файл .pptx."""
 
 
 async def run_dossier(handle: dict) -> str:
     options = ClaudeAgentOptions(
         model=MODEL,
-        system_prompt=DOSSIER_SYSTEM,
+        system_prompt=PRESALE_SYSTEM,
         mcp_servers={"research": research_server},
         allowed_tools=[
             "mcp__research__deep_research",
-            "mcp__research__save_dossier_docx",
+            "mcp__research__save_process_map_docx",
+            "mcp__research__save_roles_contacts_docx",
             "WebSearch", "WebFetch",
         ],
-        # запрещаем побочные эффекты ФС; данные пишет только save_dossier_docx
+        # запрещаем побочные эффекты ФС; данные пишут только save_*_docx
         disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
         permission_mode="bypassPermissions",   # headless: без зависаний на аппруве инструментов
         setting_sources=[],
-        max_turns=60,                          # глубокий ресёрч + проверка ссылок WebFetch'ем
+        max_turns=80,                          # глубокий ресёрч + проверка ссылок + ДВА документа
     )
 
     aspects_csv = ", ".join(handle.get("aspects") or
-                            ["профиль, процессы as-is, точки внедрения ИИ, численность, ЛПР, СМИ за 5 лет"])
+                            ["профиль, процессы as-is, точки внедрения ИИ, оргструктура, ЛПР, контакты, СМИ за 5 лет"])
     handoff = (
-        "Подготовь разбор AS-IS → точки внедрения ИИ → TO-BE и сохрани его в .docx. "
-        "Значения для инструментов:\n"
+        "Подготовь ДВА пресейл-документа (карта бизнес-процессов + карта ролей "
+        "и контактов пресейл) и сохрани ОБА в .docx. Значения для инструментов:\n"
         f"  company_name = {handle['company_name']!r}\n"
         f"  inn          = {handle['inn'] or ''!r}\n"
         f"  aspects      = {aspects_csv!r}\n"
-        "Следуй порядку работы из системного промпта. Разделы СМИ/Источники — только проверенные ссылки."
+        "Следуй порядку работы из системного промпта. Ссылки/контакты — только проверенные."
     )
 
     summary = ""
@@ -649,7 +927,7 @@ async def run_dossier(handle: dict) -> str:
             elif isinstance(message, ResultMessage):
                 if message.result:
                     summary = message.result
-                print(f"  [dossier] cost=${message.total_cost_usd} {message.subtype}")
+                print(f"  [пресейл] cost=${message.total_cost_usd} {message.subtype}")
     return summary
 
 
@@ -668,7 +946,7 @@ async def run_pipeline(raw_request: str, mode: str = "dossier") -> str:
     if mode == "contacts":
         print("=== STAGE 2: контакты/официалка ===")
         return await run_contacts(handle)
-    print("=== STAGE 2: разбор AS-IS→ИИ→TO-BE (ресёрч + .docx) ===")
+    print("=== STAGE 2: ресёрч -> карта бизнес-процессов + карта ролей и контактов (.docx) ===")
     return await run_dossier(handle)
 
 
@@ -682,7 +960,7 @@ async def main():
         if cli:                                   # одноразовый режим
             print("\n" + await run_pipeline(cli, mode))
             return
-        print("Агент-досье по компаниям. Пустая строка или 'exit' — выход.")
+        print("Пресейл-агент по компаниям. Пустая строка или 'exit' — выход.")
         while True:                               # интерактивный режим
             try:
                 req = input("\n> ").strip()

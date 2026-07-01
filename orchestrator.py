@@ -1,22 +1,25 @@
 # -*- coding: utf-8 -*-
 r"""
 Оркестратор второй фазы: по каждой собранной компании — глубокий ресёрч и
-ДВА документа (досье + стратегия коммуникации), которые ПЕРЕЗАПИСЫВАЮТ заготовки
-в папке компании на Яндекс Диске (папки уже создал первый агент / disk_organize).
+ДВА пресейл-документа, которые ПЕРЕЗАПИСЫВАЮТ заготовки в папке компании на
+Яндекс Диске (папки уже создал первый агент / disk_organize):
+  - <компания>_карта_бизнес-процессов.docx
+  - <компания>_карта_ролей_и_контактов_пресейл.docx
+Формат документов и логика ресёрча описаны в company_research_agent.py (CRA);
+оркестратор переиспользует его рендереры, схемы и системный промпт.
 
 Архитектура (детерминированный Python-оркестратор, НЕ LLM-оркестратор):
   leads.json (тот же, что у агента 1)
     └─ по каждой компании, пул из --workers параллельно:
          1 ресёрч-сессия (opus + WebSearch, ОДИН раз) рендерит ОБА .docx во temp
-         → upload во ВЖЕ существующую папку disk:/Лиды/<отрасль>/<полнота>/<компания>/
-           перезаписывая досье_компании_<имя>.docx и стратегия_коммуникации_<имя>.docx
+         → upload во УЖЕ существующую папку disk:/Лиды/<отрасль>/<полнота>/<компания>/
 
 Путь на Диске считается ровно теми же функциями disk_organize, что и у агента 1,
 поэтому файлы ложатся в его папки (mkdir идемпотентный — папка уже есть).
 
 ПОЛНАЯ ЦЕПОЧКА одной командой (сам запускает оба этапа; число компаний = предписание
 первого агента, по умолчанию 200 в отрасли — если не задано другое):
-  py orchestrator.py --industries mining               # собрать 200 mining и по ВСЕМ сделать досье+стратегию
+  py orchestrator.py --industries mining               # собрать 200 mining и по ВСЕМ сделать оба документа
   py orchestrator.py --industries mining --count 10    # явно 10
 Только ресёрч по уже готовому JSON (число = размер JSON):
   py orchestrator.py "D:\лиды\<leads>.json"
@@ -31,11 +34,17 @@ Chrome при сборе по умолчанию СКРЫТ (окно не от�
 import argparse
 import asyncio
 import collections
+import glob
 import json
 import os
 import shutil
 import sys
 import tempfile
+import warnings
+
+# Косметический RequestsDependencyWarning (chardet 7.x вне диапазона requests; ставится Crawl4AI,
+# на работу не влияет) — глушим ДО первого импорта requests. Фильтр по тексту, без импорта requests.
+warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
@@ -48,221 +57,136 @@ except Exception:
     pass
 
 
-# ----------------------------- рендер .docx -----------------------------
-
-def _strategy_doc(payload, path):
-    """Стратегия коммуникации -> компактный .docx (≤1 стр.). python-docx."""
-    from docx import Document
-    from docx.shared import Pt, Cm, RGBColor
-
-    GRAY = RGBColor(0x5A, 0x5A, 0x5A)
-    doc = Document()
-    sec = doc.sections[0]
-    for m in ("top_margin", "bottom_margin", "left_margin", "right_margin"):
-        setattr(sec, m, Cm(1.2))
-    normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = Pt(9.5)
-    normal.paragraph_format.space_after = Pt(2)
-    normal.paragraph_format.line_spacing = 1.0
-
-    def heading(text):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(5)
-        p.paragraph_format.space_after = Pt(2)
-        r = p.add_run(text)
-        r.bold = True
-        r.font.size = Pt(11)
-
-    def bullet(lead, rest=""):
-        p = doc.add_paragraph(style="List Bullet")
-        p.paragraph_format.space_after = Pt(1)
-        p.add_run(lead).bold = True
-        if rest:
-            p.add_run(" — " + rest)
-
-    title = doc.add_paragraph()
-    title.paragraph_format.space_after = Pt(1)
-    tr = title.add_run(payload.get("company") or "Стратегия коммуникации")
-    tr.bold = True
-    tr.font.size = Pt(13)
-    if payload.get("subtitle"):
-        sp = doc.add_paragraph()
-        sp.paragraph_format.space_after = Pt(3)
-        sr = sp.add_run(payload["subtitle"])
-        sr.font.size = Pt(8.5)
-        sr.font.color.rgb = GRAY
-
-    if payload.get("summary"):
-        heading("Сводка")
-        doc.add_paragraph(payload["summary"])
-    if payload.get("channel"):
-        heading("Канал захода и ЛПР")
-        doc.add_paragraph(payload["channel"])
-    if payload.get("first_touch"):
-        heading("Первое касание")
-        doc.add_paragraph(payload["first_touch"])
-    if payload.get("script"):
-        heading("Сценарий разговора")
-        for b in payload["script"]:
-            doc.add_paragraph(b, style="List Bullet").paragraph_format.space_after = Pt(1)
-    if payload.get("offer_fit"):
-        heading("Оффер под боли (on-prem LLM + RAG)")
-        for f in payload["offer_fit"]:
-            bullet((f.get("pain") or "").rstrip(":"), f.get("solution", ""))
-    if payload.get("objections"):
-        heading("Возражения и ответы")
-        for o in payload["objections"]:
-            bullet((o.get("q") or "").rstrip(":"), o.get("a", ""))
-    if payload.get("next_step"):
-        heading("Следующий шаг")
-        doc.add_paragraph(payload["next_step"])
-    if payload.get("sources"):
-        sp = doc.add_paragraph()
-        sp.paragraph_format.space_before = Pt(4)
-        sr = sp.add_run(payload["sources"])
-        sr.font.size = Pt(8)
-        sr.font.color.rgb = GRAY
-    doc.save(path)
+# Имена выходных файлов в папке компании на Диске.
+def _doc_names(dn):
+    return (f"{dn}_карта_бизнес-процессов.docx",
+            f"{dn}_карта_ролей_и_контактов_пресейл.docx",
+            f"{dn}_презентация_Telepath.pptx")
 
 
-# --------------------- схемы инструментов для агента ---------------------
-
-DOSSIER_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "company": {"type": "string", "description": "Заголовок: «Досье компании — ...»"},
-        "subtitle": {"type": "string", "description": "ИНН · ОГРН · ОКВЭД · город · 'для on-premise LLM + RAG'"},
-        "profile": {"type": "string", "description": "Раздел 1: профиль деятельности (абзац)"},
-        "scale": {"type": "array", "items": {"type": "string"},
-                  "description": "Раздел 2: Численность: ...; Выручка: ...; Госзаказ/риски: ..."},
-        "owner_lpr": {"type": "array", "items": {"type": "string"},
-                      "description": "Раздел 3: Собственник / Гендиректор / расхождения / Контакты"},
-        "pains": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"label": {"type": "string"}, "text": {"type": "string"}},
-            "required": ["label", "text"]},
-            "description": "Раздел 4: боль -> решение через LLM/RAG (акцент 152-ФЗ/on-prem)"},
-        "mentions": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "date": {"type": "string"}},
-            "required": ["title", "url"]},
-            "description": "Раздел 5: СМИ — ТОЛЬКО проверенные WebFetch'ем ссылки"},
-        "sources": {"type": "string", "description": "Строка 'Источники: ...'"},
-    },
-    "required": ["company", "profile"],
-}
-
-STRATEGY_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "company": {"type": "string", "description": "Заголовок"},
-        "subtitle": {"type": "string", "description": "ИНН · отрасль · ЛПР"},
-        "summary": {"type": "string", "description": "1–2 предложения: кто это и почему интересен под оффер"},
-        "channel": {"type": "string", "description": "Через кого и как заходить к ЛПР (канал: email/звонок/тендерная площадка)"},
-        "first_touch": {"type": "string", "description": "Текст первого касания (короткое сообщение)"},
-        "script": {"type": "array", "items": {"type": "string"}, "description": "Тезисы сценария разговора"},
-        "offer_fit": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"pain": {"type": "string"}, "solution": {"type": "string"}},
-            "required": ["pain", "solution"]},
-            "description": "Связка: боль компании -> что закрывает on-prem LLM / RAG"},
-        "objections": {"type": "array", "items": {
-            "type": "object",
-            "properties": {"q": {"type": "string"}, "a": {"type": "string"}},
-            "required": ["q", "a"]},
-            "description": "Возможные возражения и ответы"},
-        "next_step": {"type": "string", "description": "Следующий шаг и срок"},
-        "sources": {"type": "string", "description": "Источники (опц.)"},
-    },
-    "required": ["company", "offer_fit"],
-}
-
-COMBINED_SYSTEM = (
-    "Ты — аналитик B2B-продаж для вендора, который продаёт: (1) LLM на ЛОКАЛЬНЫХ "
-    "серверах клиента — данные не уходят в облако, снимает риски 152-ФЗ; "
-    "(2) RAG-вопрос-ответ по внутренней документации/нормативке. Тебе дают ОДНУ компанию.\n"
-    "ПОРЯДОК (ресёрч делаешь ОДИН раз, оба документа — из одних и тех же находок):\n"
-    "1) deep_research(company_name, inn) — официальная база: выручка (ГИР БО), карточка "
-    "ЕГРЮЛ/ЛПР/ОКВЭД/адрес (Dadata), контакты (Checko).\n"
-    "2) WebSearch + WebFetch: профиль, ЧИСЛЕННОСТЬ, собственник/бенефициар, актуальное "
-    "руководство, госзакупки/тендеры/суды/ФАС, упоминания в СМИ за 5 лет. КАЖДУЮ ссылку "
-    "раздела «СМИ» открой WebFetch'ем и убедись, что страница реальна и про эту компанию; "
-    "выдуманные/битые НЕ включай.\n"
-    "3) Вызови save_dossier_docx: 5 разделов (профиль; масштаб и показатели; собственник/ЛПР/"
-    "контакты; боли отрасли -> что закрываем LLM/RAG с акцентом 152-ФЗ/on-prem; СМИ + Источники).\n"
-    "4) На ТЕХ ЖЕ данных вызови save_strategy_docx: план коммуникации (summary; channel — через "
-    "кого и как заходить к ЛПР; first_touch — текст первого касания; script — тезисы разговора; "
-    "offer_fit — связки боль->решение on-prem LLM/RAG; objections — возражения и ответы; next_step).\n"
-    "ТРЕБОВАНИЯ: каждый документ — СТРОГО ≤1 страница, по делу, цифры со ссылкой/источником. "
-    "Бухгалтерскую выручку и оборот по счёту НЕ путать. Заверши кратким резюме."
-)
-
+# Инструменты ресёрч-агента: оба документа (формат/схемы/промпт — из CRA).
 ALLOWED = [
     "mcp__research__deep_research",
-    "mcp__research__save_dossier_docx",
-    "mcp__research__save_strategy_docx",
+    "mcp__research__save_process_map_docx",
+    "mcp__research__save_roles_contacts_docx",
     "WebSearch", "WebFetch",
 ]
 
+# --- Стадия презентации (третий деливерабл, .pptx через официальный скилл pptx) ---
+ASSETS_DIR = os.path.join(SCRIPTS, "assets")
+LOGO_PNG = os.path.join(ASSETS_DIR, "citrt_logo.png")        # логотип АО «ЦИТ РТ»
+PHOTO_PNG = os.path.join(ASSETS_DIR, "bulat_zamaliev.png")   # фото Булата Замалиева
+
+# Портативные инструменты скилла pptx на D: (LibreOffice/Poppler поставлены туда — C: переполнен).
+# Гейт и агентная сессия находят soffice/pdftoppm и здесь, а не только в системном PATH.
+_LO_DIRS = [r"D:\Apps\LibreOffice\program"]
+_POPPLER_DIRS = glob.glob(r"D:\Apps\poppler\poppler-*\Library\bin") or [r"D:\Apps\poppler"]
+
+
+def _which_tool(name, extra_dirs):
+    """Найти CLI-инструмент (soffice/pdftoppm): сначала в PATH, потом в портативных папках на D:."""
+    p = shutil.which(name) or shutil.which(name + ".exe")
+    if p:
+        return p
+    for d in extra_dirs:
+        cand = os.path.join(d, name + ".exe")
+        if os.path.exists(cand):
+            return cand
+    return None
+
 
 def _handle(lead):
+    aspects = "профиль, процессы as-is, точки внедрения ИИ, оргструктура, ЛПР, контакты, СМИ за 5 лет"
+    # website из ФАЗЫ 1 -> подсказка-домен движку deep_research (сайт-коллектор без зависимости от поиска)
+    site = (lead.get("website") or "").strip()
+    if site:
+        aspects += f"; сайт: {site}"
     return {
         "company_name": lead.get("name") or "",
         "inn": str(lead.get("_inn") or "").strip(),
-        "aspects": "профиль, численность, ЛПР, боли под on-prem LLM/RAG, СМИ за 5 лет",
+        "aspects": aspects,
     }
 
 
 async def _research_one(lead, idx, d_tmp, s_tmp, model):
-    """Один ресёрч-проход: рендерит оба .docx во временные пути. Возвращает $-стоимость."""
+    """Один ресёрч-проход. ПРЕД-ЗАПУСК движка deep_research ДО сессии писателя (без
+    вложенных SDK-сессий внутри тула — именно вложенность сбивала писателя), затем
+    писатель форматирует находки и СОХРАНЯЕТ оба .docx. Возвращает (стоимость, находки):
+    находки нужны стадии презентации для формулировки боли заказчика (слайд 3).
+    d_tmp = карта бизнес-процессов, s_tmp = карта ролей и контактов."""
     import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
     import company_research_agent as CRA
+    import deep_research_engine as DRE
     from claude_agent_sdk import (
         tool, create_sdk_mcp_server, ClaudeAgentOptions, ClaudeSDKClient,
         ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
     )
 
     # Инструменты сохранения — замыкания на временные пути ЭТОЙ компании (потокобезопасно).
-    @tool("save_dossier_docx", "Сохранить готовое досье (≤1 стр.). Ссылки в mentions — только проверенные.", DOSSIER_SCHEMA)
-    async def _save_dossier(args):
-        a = dict(args)
-        a["filename"] = f"_orq_d_{idx}.docx"          # уникальное имя -> кладём в «Загрузки», затем переносим
-        dl = await asyncio.to_thread(CRA._write_dossier_docx, a)
-        await asyncio.to_thread(shutil.move, dl, d_tmp)
-        return {"content": [{"type": "text", "text": "досье сохранено"}]}
+    @tool("save_process_map_docx",
+          "Сохранить КАРТУ БИЗНЕС-ПРОЦЕССОВ. Ссылки/контакты — только проверенные.",
+          CRA.PROCESS_MAP_SCHEMA)
+    async def _save_process_map(args):
+        await asyncio.to_thread(CRA._write_process_map_docx, dict(args), d_tmp)
+        return {"content": [{"type": "text", "text": "карта бизнес-процессов сохранена"}]}
 
-    @tool("save_strategy_docx", "Сохранить план коммуникации (≤1 стр.) на основе тех же находок.", STRATEGY_SCHEMA)
-    async def _save_strategy(args):
-        await asyncio.to_thread(_strategy_doc, dict(args), s_tmp)
-        return {"content": [{"type": "text", "text": "стратегия сохранена"}]}
+    @tool("save_roles_contacts_docx",
+          "Сохранить КАРТУ РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ. Только официальные публичные контакты.",
+          CRA.ROLES_CONTACTS_SCHEMA)
+    async def _save_roles_contacts(args):
+        await asyncio.to_thread(CRA._write_roles_contacts_docx, dict(args), s_tmp)
+        return {"content": [{"type": "text", "text": "карта ролей и контактов сохранена"}]}
 
     server = create_sdk_mcp_server(
-        name="research", version="3.0.0",
-        tools=[CRA.deep_research, _save_dossier, _save_strategy],
+        name="research", version="5.0.0",
+        tools=[_save_process_map, _save_roles_contacts],   # БЕЗ deep_research — он выполнен заранее
     )
+    h = _handle(lead)
+
+    # ПРЕД-ЗАПУСК движка: на верхнем уровне, НЕ внутри сессии писателя -> без вложенных
+    # SDK-вызовов. Движок отдаёт готовые находки (филиалы+телефоны, соцсети, контакты,
+    # официалка), у строк — source URL.
+    print(f"    [{idx}] deep_research (движок) ...")
+    try:
+        findings = await DRE.deep_research(h["company_name"], h["inn"], h["aspects"])
+    except Exception as e:
+        print(f"    [{idx}] deep_research engine error: {str(e)[:90]}")
+        findings = ""
+
     options = ClaudeAgentOptions(
         model=model,
-        system_prompt=COMBINED_SYSTEM,
+        system_prompt=CRA.PRESALE_SYSTEM,
         mcp_servers={"research": server},
-        allowed_tools=ALLOWED,
+        allowed_tools=[
+            "mcp__research__save_process_map_docx",
+            "mcp__research__save_roles_contacts_docx",
+            "WebSearch", "WebFetch",
+        ],
         disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
         permission_mode="bypassPermissions",
         setting_sources=[],
-        max_turns=60,
+        max_turns=80,
     )
-    h = _handle(lead)
     handoff = (
-        "Подготовь ДОСЬЕ и СТРАТЕГИЮ коммуникации, сохрани оба .docx. Значения для инструментов:\n"
+        "deep_research УЖЕ ВЫПОЛНЕН отдельным движком — НЕ запускай его заново. Вот "
+        "собранные находки (у строк есть source URL):\n\n"
+        f"{findings}\n\n"
+        "ЗАДАЧА: на основе ЭТИХ находок (плюс при необходимости точечная доверка через "
+        "WebFetch/WebSearch по оставшимся пробелам — ИТ/тендерный контакт) заполни схемы и "
+        "СОХРАНИ ОБА документа: вызови save_process_map_docx И save_roles_contacts_docx. "
+        "В карту ролей ОБЯЗАТЕЛЬНО перенеси таблицу филиалов (директор+телефон), соцсети и "
+        "официальные контакты ИЗ находок — не пиши «не подтверждено» там, где данные есть.\n"
         f"  company_name = {h['company_name']!r}\n"
         f"  inn          = {h['inn']!r}\n"
-        f"  aspects      = {h['aspects']!r}\n"
-        "Сначала deep_research, потом веб-ресёрч (СМИ — только проверенные ссылки), "
-        "затем save_dossier_docx и save_strategy_docx на одних и тех же данных."
+        "ВАЖНО: работа НЕ выполнена, пока ты не вызвал ОБА инструмента save_*_docx. "
+        "Текстовый ответ результатом НЕ является."
     )
+
     cost = 0.0
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(handoff)
+
+    async def _drive(msg):
+        nonlocal cost
+        await client.query(msg)
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
@@ -270,14 +194,159 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model):
                         print(f"    [{idx}] → {getattr(block, 'name', '')}")
             elif isinstance(message, ResultMessage):
                 if getattr(message, "total_cost_usd", None):
-                    cost = message.total_cost_usd
+                    cost += message.total_cost_usd
 
-    # подстраховка: если агент не сохранил — кладём заготовку, чтобы upload не упал
-    if not os.path.exists(d_tmp):
-        await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
-    if not os.path.exists(s_tmp):
-        await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
-    return cost
+    async with ClaudeSDKClient(options=options) as client:
+        await _drive(handoff)
+        # нудж-ретрай: если какой-то документ не сохранён — потребовать сохранить
+        for _ in range(2):
+            missing = []
+            if not os.path.exists(d_tmp):
+                missing.append("save_process_map_docx (карта бизнес-процессов)")
+            if not os.path.exists(s_tmp):
+                missing.append("save_roles_contacts_docx (карта ролей и контактов)")
+            if not missing:
+                break
+            await _drive("Ты НЕ сохранил: " + "; ".join(missing) + ". Немедленно вызови "
+                         "недостающий инструмент save_*_docx с заполненными данными из "
+                         "находок. Больше ничего не делай.")
+    return cost, findings
+
+
+def _presentation_prereqs():
+    """Готовность стадии презентации. Возвращает (ok: bool, reason: str).
+    reason — человекочитаемая русская причина пропуска (пусто при ok=True).
+    Деградируем мягко: НИКОГДА не валим компанию — просто пропускаем стадию.
+      - оба ассета-PNG (логотип + фото) на месте;
+      - на PATH есть soffice (LibreOffice) — скилл pptx им рендерит слайды для самопроверки;
+      - на PATH есть node — скилл pptx генерит .pptx через pptxgenjs;
+      - скилл pptx реально установлен (~/.claude/skills/pptx/SKILL.md или проектный .claude/skills)."""
+    if not os.path.exists(LOGO_PNG):
+        return False, "нет assets/citrt_logo.png"
+    if not os.path.exists(PHOTO_PNG):
+        return False, "нет assets/bulat_zamaliev.png"
+    if not _which_tool("soffice", _LO_DIRS):
+        return False, "не найден soffice/LibreOffice (поставь LibreOffice или положи в D:\\Apps\\LibreOffice)"
+    if not _which_tool("pdftoppm", _POPPLER_DIRS):
+        return False, "не найден pdftoppm/Poppler (поставь Poppler или положи в D:\\Apps\\poppler)"
+    if not (shutil.which("node") or shutil.which("node.exe")):
+        return False, "не найден node на PATH (нужен Node.js + npm-пакет pptxgenjs для скилла pptx)"
+    # скилл pptx должен быть обнаружим: пользовательский каталог или проектный .claude/skills
+    user_skill = os.path.join(os.path.expanduser("~"), ".claude", "skills", "pptx", "SKILL.md")
+    proj_skill = os.path.join(SCRIPTS, ".claude", "skills", "pptx", "SKILL.md")
+    if not (os.path.exists(user_skill) or os.path.exists(proj_skill)):
+        return False, ("не установлен официальный скилл pptx "
+                       "(положи его в ~/.claude/skills/pptx или в .claude/skills/pptx проекта; "
+                       "источник: github.com/anthropics/skills/tree/main/skills/pptx)")
+    return True, ""
+
+
+def _main_pain(findings):
+    """Грубо вытащить «главную боль» из находок движка для слайда 3 (оффер
+    адаптируется под заказчика). Берём первые непустые строки с маркерами боли;
+    если не нашли — отдаём пусто, агент сформулирует боль сам по отрасли."""
+    if not findings:
+        return ""
+    import re
+    hits = []
+    for line in str(findings).splitlines():
+        s = line.strip(" -•*#\t")
+        if not s:
+            continue
+        if re.search(r"бол[ьи]|узк|вручную|разрозн|дорог|рутин|задержк|ошибк|неэффект", s, re.I):
+            hits.append(s)
+        if len(hits) >= 4:
+            break
+    return "\n".join(hits)[:1200]
+
+
+async def _presentation_one(lead, idx, p_tmp, model, findings=""):
+    """Третий деливерабл: 3-слайдовая брендированная .pptx через ОФИЦИАЛЬНЫЙ скилл pptx.
+    Это ОТДЕЛЬНАЯ агентная сессия (code-execution/Bash + скилл pptx), НЕ python-рендерер.
+    Слайды 1–2 фиксированы, слайд 3 (оффер) адаптируется под боль заказчика из находок.
+    Пишет итог в p_tmp. Возвращает (cost, remark): remark — фактическое «замечание»
+    про Булата/ЦИТ РТ, которое требует промпт (его НЕ глушим — печатаем в лог)."""
+    import company_research_agent as CRA
+    from claude_agent_sdk import (
+        ClaudeAgentOptions, ClaudeSDKClient,
+        ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
+    )
+
+    h = _handle(lead)
+    industry = DO.industry_folder(lead) if hasattr(DO, "industry_folder") else (lead.get("niche") or "")
+    pain = _main_pain(findings)
+
+    # Скилл pptx зовёт python/soffice/pdftoppm по имени из своих скриптов. На этой машине:
+    #   - soffice/pdftoppm лежат на D: (вне системного PATH);
+    #   - `python` в PATH — это Store-заглушка WindowsApps, а не настоящий интерпретатор.
+    # Прокидываем КАТАЛОГ НАСТОЯЩЕГО python (sys.executable) + папки D: в начало PATH процесса;
+    # дочерняя claude-сессия наследует это окружение, поэтому скилл найдёт рабочие бинарники.
+    _pydir = os.path.dirname(sys.executable)
+    _extra = [d for d in ([_pydir] + _LO_DIRS + _POPPLER_DIRS) if d and os.path.isdir(d)]
+    if _extra:
+        os.environ["PATH"] = os.pathsep.join(_extra) + os.pathsep + os.environ.get("PATH", "")
+
+    # Опции сессии. setting_sources/skills/cwd/add_dirs — поля современного SDK; строим
+    # защитно: если установлен старый SDK без какого-то kwargs — стадию мягко пропустим
+    # (не валим компанию). allowed_tools включает Bash + ФС-инструменты, нужные скиллу
+    # pptx (python/node/soffice, чтение ассетов, запись .pptx, рендер для самопроверки).
+    opt_kwargs = dict(
+        model=model,
+        system_prompt=CRA.PRESENTATION_SYSTEM,
+        allowed_tools=["Bash", "Read", "Write", "Edit", "Glob"],
+        permission_mode="bypassPermissions",   # headless: без зависаний на аппруве
+        setting_sources=["user", "project"],   # ОПТ-ИН в обнаружение скиллов (.claude/skills)
+        skills=["pptx"],                        # включить именно официальный скилл pptx
+        cwd=os.path.dirname(p_tmp) or SCRIPTS,  # рабочая папка = temp компании (туда же пишет вывод)
+        add_dirs=[ASSETS_DIR, os.path.dirname(p_tmp) or SCRIPTS],  # доступ к ассетам и temp
+        max_turns=80,
+    )
+    try:
+        options = ClaudeAgentOptions(**opt_kwargs)
+    except TypeError as e:
+        # старый claude-agent-sdk без skills/setting_sources/add_dirs -> пропустить стадию
+        print(f"    [{idx}] [presentation] пропущено: SDK не поддерживает опции скиллов ({str(e)[:80]})")
+        return 0.0, ""
+
+    user_msg = (
+        "Сделай 3-слайдовую презентацию .pptx строго по системному промпту. "
+        "ВХОДНЫЕ ДАННЫЕ:\n"
+        f"- НАЗВАНИЕ КОМПАНИИ-ЗАКАЗЧИКА: {h['company_name']}\n"
+        f"- ЧЕМ ЗАНИМАЕТСЯ / ОТРАСЛЬ: {industry or '(уточни по названию)'}\n"
+        f"- ГЛАВНАЯ БОЛЬ (если знаю): {pain or '(сформулируй сам по отрасли заказчика)'}\n\n"
+        "ВЛОЖЕНИЯ (используй ИМЕННО эти файлы, абсолютные пути):\n"
+        f"- Логотип ЦИТ РТ (PNG): {LOGO_PNG}\n"
+        f"- Фото Булата Замалиева (PNG): {PHOTO_PNG}\n\n"
+        f"Итоговый файл .pptx сохрани СТРОГО по пути: {p_tmp}\n"
+        "Слайды 1–2 — фиксированы; слайд 3 (оффер) — адаптируй под заказчика и его боль. "
+        "В конце ОБЯЗАТЕЛЬНО приведи отдельным блоком «ЗАМЕЧАНИЕ:» — расхождение по должности "
+        "Булата Замалиева (ЦИТ РТ vs Минцифры РТ) и проверяемую альтернативу."
+    )
+
+    cost = 0.0
+    remark = ""
+    summary = ""
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(user_msg)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        summary += block.text
+                    elif isinstance(block, ToolUseBlock):
+                        print(f"    [{idx}] → {getattr(block, 'name', '')}")
+            elif isinstance(message, ResultMessage):
+                if message.result:
+                    summary = message.result
+                if getattr(message, "total_cost_usd", None):
+                    cost += message.total_cost_usd
+
+    # вытащить фактическое «замечание» (его НЕ подавляем — это требование промпта)
+    if summary:
+        import re
+        m = re.search(r"замечани[ея][:\s].*", summary, re.I | re.DOTALL)
+        remark = (m.group(0) if m else summary).strip()[:1500]
+    return cost, remark
 
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, out_xlsx):
@@ -344,7 +413,7 @@ def _free_ram_gb():
 
 async def main():
     ap = argparse.ArgumentParser(
-        description="Полная цепочка: сбор (RusProfile) + ресёрч (досье/стратегия) в папки Яндекс Диска")
+        description="Полная цепочка: сбор (RusProfile) + ресёрч (2 пресейл-документа) в папки Яндекс Диска")
     ap.add_argument("leads", nargs="?", default=None,
                     help="готовый JSON лидов (если БЕЗ --industries)")
     # --- ФАЗА 1: сбор (первый агент). Задаёшь --industries -> оркестратор сам соберёт лиды и создаст папки ---
@@ -366,7 +435,25 @@ async def main():
     ap.add_argument("--model", default="opus", help="opus (качество) | sonnet (дешевле)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
+    # 3-я стадия (one-page .pptx через скилл pptx) ВКЛючена ПО УМОЛЧАНИЮ. Отключить:
+    # --no-presentation или GEN_PRESENTATION=0. Если предусловия (assets/*.png + soffice +
+    # node + установленный скилл pptx) не выполнены — стадия мягко пропускается, два .docx
+    # при этом делаются как обычно.
+    _pp_default = (os.environ.get("GEN_PRESENTATION", "1").strip().lower()
+                   not in ("0", "false", "no", "off", "нет"))
+    ap.add_argument("--presentation", dest="presentation", action="store_true",
+                    default=_pp_default,
+                    help="3-я стадия .pptx через скилл pptx — ВКЛючена по умолчанию")
+    ap.add_argument("--no-presentation", dest="presentation", action="store_false",
+                    help="ОТКЛЮЧИТЬ 3-ю стадию (.pptx-презентацию)")
     a = ap.parse_args()
+    # Удобство: ОТРАСЛЬ можно указать позиционно (py orchestrator.py mining) — приравниваем
+    # к --industries, если позиционный аргумент — не существующий путь, а ключ(и) отрасли.
+    if not a.industries and a.leads and not os.path.exists(a.leads):
+        import source_rusprofile as RP
+        _keys = [s.strip() for s in a.leads.split(",") if s.strip()]
+        if _keys and all(k in RP.INDUSTRY for k in _keys):
+            a.industries, a.leads = ",".join(_keys), None
     # режим окна сбора: по умолчанию headed, но ЗА ЭКРАНОМ (антибот RusProfile проходит,
     # окна не видно). --show-browser => видимое окно; --headless => без окна (может НЕ пройти антибот).
     headless = bool(a.headless)
@@ -392,17 +479,37 @@ async def main():
         print("Пусто — нет лидов.")
         return
 
-    print("\n=== ФАЗА 2: ресёрч (досье + стратегия) ===")
+    print("\n=== ФАЗА 2: ресёрч (карта бизнес-процессов + карта ролей и контактов) ===")
     if not a.dry_run:
-        print(f"[оценка] {len(sel)} компаний × ~$1–2 = ~${len(sel)}–${2 * len(sel)} ({a.model}). "
-              "Число задаётся первым агентом (--count, по умолч. 200).")
+        _lo, _hi, _what = ((3 * len(sel), int(4.5 * len(sel)), "2 .docx + .pptx")
+                           if a.presentation else (len(sel), 2 * len(sel), "2 .docx"))
+        print(f"[оценка] {len(sel)} компаний = ~${_lo}–${_hi} ({a.model}, {_what} на компанию). "
+              "Число = --count (по умолч. 200).")
         free = _free_ram_gb()                         # каждый ресёрч = свой claude CLI (Node, сотни МБ)
         if free is not None and free < 3.0 and a.workers > 1:
             print(f"[ОЗУ] свободно ~{free:.1f} ГБ — снижаю параллелизм ресёрча до 1 "
                   "(несколько claude CLI при нехватке памяти падают 0xC0000409). "
                   "Освободи RAM или задай --workers вручную.")
             a.workers = 1
-    tmp = tempfile.mkdtemp(prefix="orq_")
+
+    # Стадия презентации опциональна и включается флагом --presentation / GEN_PRESENTATION.
+    # Готовность проверяем ОДИН раз заранее — иначе один и тот же скип спамил бы по компаниям.
+    gen_pptx = bool(a.presentation)
+    if gen_pptx:
+        ok_pp, why_pp = _presentation_prereqs()
+        if not ok_pp:
+            print(f"[presentation] стадия отключена: {why_pp}. Два .docx делаются как обычно.")
+            gen_pptx = False
+        else:
+            print("[presentation] стадия включена: по каждой компании будет 3-слайдовая .pptx.")
+    # Транзитная рабочая папка. Файлы здесь ВРЕМЕННЫЕ: после заливки на Я.Диск папка удаляется
+    # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места, а стадия
+    # .pptx пишет сюда же pdf+jpg на каждую компанию); если D: нет — системный %TEMP%.
+    _tmp_dir = None
+    if os.path.isdir("D:\\"):
+        _tmp_dir = os.path.join("D:\\", "orq_tmp")
+        os.makedirs(_tmp_dir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="orq_", dir=_tmp_dir)
 
     # верхние уровни (отрасль/категория) у первого агента уже есть; mkdir идемпотентный.
     if not a.no_upload:
@@ -417,55 +524,120 @@ async def main():
 
     async def process(idx, lead):
         async with sem:
-            d_tmp = os.path.join(tmp, f"{idx}_d.docx")
-            s_tmp = os.path.join(tmp, f"{idx}_s.docx")
+            comp_tmp = os.path.join(tmp, str(idx))       # СВОЯ папка на компанию: изоляция .pptx-рендера
+            os.makedirs(comp_tmp, exist_ok=True)         # (slide-*.jpg/pdf не пересекаются между воркерами)
+            d_tmp = os.path.join(comp_tmp, "d.docx")
+            s_tmp = os.path.join(comp_tmp, "s.docx")
+            p_tmp = os.path.join(comp_tmp, "p.pptx")     # презентация (третий деливерабл)
             cost = 0.0
-            if a.dry_run:
-                try:
-                    await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
-                    await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
-                except Exception as e:
-                    print(f"  [!] {lead.get('name')}: {e}")
-                    return {"name": lead.get("name"), "ok": False, "cost": cost}
-            else:
-                # ресёрч-агент изредка падает аварийно (0xC0000409 = OOM Node при нехватке
-                # RAM / конкуренции claude CLI) — ретраим до 3 раз с паузой
-                err = None
-                for attempt in range(3):
+            findings = ""
+            have_pptx = False           # готова ли реальная .pptx у этой компании
+            try:
+                if a.dry_run:
                     try:
-                        cost = await _research_one(lead, idx, d_tmp, s_tmp, a.model)
-                        err = None
-                        break
+                        await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
+                        await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
+                        if gen_pptx:        # паритет с .docx: в dry-run кладём валидную болванку .pptx
+                            await asyncio.to_thread(DO.generate_presentation, lead, p_tmp)
+                            have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
                     except Exception as e:
-                        err = e
-                        print(f"  [retry {attempt + 1}/3] {lead.get('name')}: {str(e)[:70]}")
-                        await asyncio.sleep(4)
-                if err is not None:
-                    print(f"  [!] {lead.get('name')}: {err}")
-                    return {"name": lead.get("name"), "ok": False, "cost": cost}
+                        print(f"  [!] {lead.get('name')}: {e}")
+                        return {"name": lead.get("name"), "ok": False, "cost": cost}
+                else:
+                    # ресёрч+писатель: ретраим до 3 раз ПО ФАКТУ отсутствия двух .docx — ловим И
+                    # исключения (0xC0000409 OOM / сеть), И «тихие» сбои, когда сессия вернулась БЕЗ
+                    # исключения, но писатель ничего не сохранил (idle-timeout стрима / "error result").
+                    # Новая попытка = свежая сессия; частичные файлы чистим, чтобы стартовать начисто.
+                    ok_docx = False
+                    for attempt in range(3):
+                        try:
+                            cost, findings = await _research_one(lead, idx, d_tmp, s_tmp, a.model)
+                        except Exception as e:
+                            print(f"  [retry {attempt + 1}/3] {lead.get('name')}: {str(e)[:70]}")
+                        if (os.path.exists(d_tmp) and os.path.getsize(d_tmp) > 5000
+                                and os.path.exists(s_tmp) and os.path.getsize(s_tmp) > 5000):
+                            ok_docx = True
+                            break
+                        if attempt < 2:
+                            bp = os.path.getsize(d_tmp) if os.path.exists(d_tmp) else 0
+                            rc = os.path.getsize(s_tmp) if os.path.exists(s_tmp) else 0
+                            print(f"  [retry {attempt + 1}/3] {lead.get('name')}: писатель не сохранил "
+                                  f"оба .docx (bp={bp}б, rc={rc}б) — повтор")
+                            for _f in (d_tmp, s_tmp):
+                                if os.path.exists(_f):
+                                    try:
+                                        os.remove(_f)
+                                    except OSError:
+                                        pass
+                            await asyncio.sleep(4)
+                    if not ok_docx:
+                        print(f"  [!] {lead.get('name')}: писатель не сохранил оба документа за 3 попытки — пропуск")
+                        return {"name": lead.get("name"), "ok": False, "cost": cost}
 
-            comp_dir = _company_dir(lead, a.base, dup_names)
-            dn = DO._safe(lead.get("name"))
-            if not a.no_upload:
-                try:
-                    await asyncio.to_thread(DO._mkdir, comp_dir, a.account)  # папка обычно уже есть
-                    await asyncio.to_thread(DO._upload, d_tmp, f"{comp_dir}/досье_компании_{dn}.docx", a.account, True)
-                    await asyncio.to_thread(DO._upload, s_tmp, f"{comp_dir}/стратегия_коммуникации_{dn}.docx", a.account, True)
-                except Exception as e:
-                    print(f"  [!] upload {lead.get('name')}: {e}")
-                    return {"name": lead.get("name"), "ok": False, "cost": cost}
-            print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}"
-                  + (f"  (${cost:.2f})" if cost else ""))
-            return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": comp_dir}
+                    # Третья стадия (опц.). Сбой НЕ валит компанию — два .docx уже готовы.
+                    # Ретраим ПО ФАКТУ отсутствия .pptx (>5КБ): ловим и исключения (0xC0000409),
+                    # и «тихие» сбои — idle-timeout стрима / "error result" приходят ТЕКСТОМ, а не
+                    # исключением. Есть валидная .pptx после попытки — берём, не перегенерируем.
+                    if gen_pptx:
+                        remark = ""
+                        for attempt in range(3):
+                            try:
+                                p_cost, remark = await _presentation_one(lead, idx, p_tmp, a.model, findings)
+                                cost += p_cost
+                            except Exception as e:
+                                print(f"    [{idx}] [presentation retry {attempt + 1}/3]: {str(e)[:70]}")
+                            if os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000:
+                                break                       # дек готов
+                            if attempt < 2:
+                                print(f"    [{idx}] [presentation retry {attempt + 1}/3]: .pptx не получена — повтор")
+                                if os.path.exists(p_tmp):   # убрать недописанный перед повтором
+                                    try:
+                                        os.remove(p_tmp)
+                                    except OSError:
+                                        pass
+                                await asyncio.sleep(4)
+                        have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
+                        # «замечание» по Булату печатаем ТОЛЬКО при реальном деке (иначе это текст ошибки API)
+                        if have_pptx and remark and "API Error" not in remark and "error result" not in remark:
+                            print(f"    [{idx}] [presentation] замечание: {remark[:300]}")
+                        if not have_pptx:
+                            print(f"    [{idx}] [presentation] .pptx не получена (>5КБ) за 3 попытки — зальём только два .docx")
+
+                comp_dir = _company_dir(lead, a.base, dup_names)
+                dn = DO._safe(lead.get("name"))
+                bp_name, rc_name, pptx_name = _doc_names(dn)
+                if not a.no_upload:
+                    try:
+                        await asyncio.to_thread(DO._mkdir, comp_dir, a.account)  # папка обычно уже есть
+                        await asyncio.to_thread(DO._upload, d_tmp, f"{comp_dir}/{bp_name}", a.account, True)
+                        await asyncio.to_thread(DO._upload, s_tmp, f"{comp_dir}/{rc_name}", a.account, True)
+                        if have_pptx:       # презентацию грузим в ту же папку компании (если получилась)
+                            await asyncio.to_thread(DO._upload, p_tmp, f"{comp_dir}/{pptx_name}", a.account, True)
+                    except Exception as e:
+                        print(f"  [!] upload {lead.get('name')}: {e}")
+                        return {"name": lead.get("name"), "ok": False, "cost": cost}
+                print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}"
+                      + ("  +pptx" if have_pptx else "")
+                      + (f"  (${cost:.2f})" if cost else ""))
+                return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": comp_dir,
+                        "pptx": have_pptx}
+            finally:
+                # транзит компании чистим СРАЗУ после заливки (не копим все 200 до конца —
+                # минимальный локальный след). При --no-upload оставляем: файлы смотрят локально.
+                if not a.no_upload:
+                    shutil.rmtree(comp_tmp, ignore_errors=True)
 
     results = await asyncio.gather(*(process(i, l) for i, l in enumerate(sel)))
     ok = [r for r in results if r and r.get("ok")]
     total = sum(r.get("cost") or 0 for r in results if r)
-    print(f"\n[ГОТОВО] компаний: {len(ok)}/{len(sel)} | файлов: {2 * len(ok)} "
+    n_pptx = sum(1 for r in ok if r.get("pptx"))
+    n_files = 2 * len(ok) + n_pptx           # два .docx на компанию + презентация там, где получилась
+    print(f"\n[ГОТОВО] компаний: {len(ok)}/{len(sel)} | файлов: {n_files}"
+          + (f" (в т.ч. {n_pptx} презентаций)" if n_pptx else "") + " "
           + ("(локально, без Диска) " if a.no_upload else f"в {a.base} ")
           + (f"| стоимость ~${total:.2f}" if total else "| dry-run, $0"))
     if a.no_upload:
-        print(f"[локально] .docx во временной папке: {tmp}")
+        print(f"[локально] .docx/.pptx во временной папке: {tmp}")
     else:
         shutil.rmtree(tmp, ignore_errors=True)
 
