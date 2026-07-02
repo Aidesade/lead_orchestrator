@@ -384,21 +384,69 @@ def region_excluded(region, patterns):
     return any(p in r for p in patterns)
 
 
+# Маркеры отрицания в свободном тексте региона: "НЕ Москва" -> искать всё, кроме Москвы.
+REGION_NEG_PREFIXES = ("не ", "!", "кроме ", "исключить ", "except ", "not ")
+
+
+def parse_region_query(query):
+    """Свободный текст региона -> (include, exclude) списки подстрок для матча по выдаче.
+
+    Поддерживает ОТРИЦАНИЕ — регион с приставкой исключается, а не включается:
+        'НЕ Москва'       -> exclude=['москва']            (вся РФ, кроме Москвы)
+        '!Москва' / '-Москва' -> exclude=['москва']
+        'кроме СПб'       -> exclude=['санкт-петербург']
+    Можно перечислять через запятую и смешивать включение/исключение:
+        'Урал, НЕ Москва' -> include=['урал'], exclude=['москва']
+
+    Аббревиатуры (ХМАО/ЯНАО/СПб/МСК) разворачиваются через region_patterns().
+    Возвращает (inc|None, exc|None); None означает «этой части фильтра нет».
+    NB: города фед. значения в исключении не задевают одноимённую ОБЛАСТЬ —
+    'НЕ Москва' убирает Москву, но оставляет «Московскую область»
+    (см. region_excluded())."""
+    q = (query or "").strip()
+    if not q:
+        return None, None
+    inc, exc = [], []
+    for raw in q.split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        neg = False
+        low = tok.lower()
+        for pref in REGION_NEG_PREFIXES:
+            if low.startswith(pref):
+                neg = True
+                tok = tok[len(pref):].strip()
+                break
+        if not neg and tok.startswith("-"):   # форма '-Москва'
+            neg = True
+            tok = tok[1:].strip()
+        pats = region_patterns(tok)
+        if not pats:
+            continue
+        (exc if neg else inc).extend(pats)
+    return (inc or None), (exc or None)
+
+
 def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
             headless=False, out_path=None, exclude_regions=None, offscreen=False):
-    inc = region_patterns(region)  # None, если регион не задан
+    inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
+    if exclude_regions:                    # явные исключения (обратная совместимость)
+        exc = (exc or []) + list(exclude_regions)
+    exclude_regions = exc
+    has_filter = bool(inc or exclude_regions)
     by_inn = {}
     skipped_excl = 0
     with RusProfileSession(headless=headless, offscreen=offscreen) as s:
         for ind in industries:
             cfg = INDUSTRY[ind]
             pages = max(1, -(-per_industry // 50))  # ceil(per_industry/50)
-            if exclude_regions or inc:
+            if has_filter:
                 # регион фильтруется КЛИЕНТСКИ -> листаем по максимуму: нужная
                 # выдача рассыпана по всем страницам (по региону не сортируется).
                 pages = 20
             log(f"\n=== {ind}: {cfg['label']}"
-                + (f" | регион: {region}" if inc else "") + " ===")
+                + (f" | регион: {region}" if has_filter else "") + " ===")
             items = s.search(cfg["okved"], min_revenue, max_pages=min(20, pages))
             kept = 0
             for it in items:
@@ -422,7 +470,7 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
                 if kept >= per_industry:
                     break
             log(f"  -> отобрано {kept} (порог >{min_revenue/1e9:g} млрд"
-                + (f", регион «{region}»" if inc else "") + ")")
+                + (f", регион «{region}»" if has_filter else "") + ")")
             if out_path:
                 _save(list(by_inn.values()), out_path)
     res = list(by_inn.values())
@@ -447,7 +495,9 @@ def main():
     ap.add_argument("--per-industry", type=int, default=40)
     ap.add_argument("--region", default=None,
                     help="регион: название/аббревиатура, КЛИЕНТСКИЙ фильтр "
-                         "(напр. ХМАО, Татарстан, 'Свердловская область')")
+                         "(напр. ХМАО, Татарстан, 'Свердловская область'). "
+                         "Приставка отрицания = исключение: 'НЕ Москва' -> вся РФ кроме Москвы; "
+                         "через запятую можно смешивать: 'Урал, НЕ Москва'")
     ap.add_argument("--max-pages", type=int, default=20)
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--out", default="D:/лиды/_rusprofile.json")
@@ -458,14 +508,17 @@ def main():
         max_pages = 20 if a.region else a.max_pages  # регион -> листаем по максимуму
         with RusProfileSession(headless=a.headless) as s:
             items = s.search(codes, a.min_revenue, max_pages=max_pages)
-        inc = region_patterns(a.region)
+        inc, exc = parse_region_query(a.region)  # 'НЕ Москва' -> exc=['москва']
         cfg = {"label": "ОКВЭД " + ",".join(codes), "pain": "", "offer": ""}
         leads, seen = [], set()
         for it in items:
             inn = (it.get("inn") or "").strip()
             if not inn or inn in seen or it.get("inactive"):
                 continue
-            if inc and not region_included(it.get("region") or "", inc):
+            reg = it.get("region") or ""
+            if inc and not region_included(reg, inc):
+                continue
+            if region_excluded(reg, exc):
                 continue
             seen.add(inn); leads.append(item_to_lead(it, cfg, "custom"))
         _save(leads, a.out)

@@ -29,7 +29,8 @@ r"""
 Chrome при сборе по умолчанию СКРЫТ (окно не открывается); показать — --show-browser.
 
 Зависимости боевого режима: claude-agent-sdk, python-docx, ANTHROPIC_API_KEY,
-рабочий disk-логин yacli (как у первого агента). dry-run не требует ничего сверх stdlib.
+доступ к Диску — env YANDEX_DISK_TOKEN (python-коннектор connectors/yadisk_client).
+dry-run не требует ничего сверх stdlib.
 """
 import argparse
 import asyncio
@@ -108,7 +109,7 @@ def _handle(lead):
     }
 
 
-async def _research_one(lead, idx, d_tmp, s_tmp, model):
+async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     """Один ресёрч-проход. ПРЕД-ЗАПУСК движка deep_research ДО сессии писателя (без
     вложенных SDK-сессий внутри тула — именно вложенность сбивала писателя), затем
     писатель форматирует находки и СОХРАНЯЕТ оба .docx. Возвращает (стоимость, находки):
@@ -153,6 +154,26 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model):
         print(f"    [{idx}] deep_research engine error: {str(e)[:90]}")
         findings = ""
 
+    # Обогащение ЛПР прямыми контактами — детерминированно, БЕЗ вложенной SDK-сессии
+    # (как пред-запуск движка). Легитимные источники (Dadata/Checko/сайт/MX/SMTP);
+    # «пробив»/утечки исключены в самом person_enrich (DENY_SOURCES). SMTP-проверка email
+    # и соц-поиск — под env (PERSON_VERIFY_EMAIL / PERSON_SOCIAL), по умолчанию выключены,
+    # чтобы 200-прогон был быстрым и не долбил чужие серверы.
+    if person_enrich and lead.get("contact_person") and lead.get("_inn"):
+        try:
+            import person_enrich as PEN
+            _pv = os.environ.get("PERSON_VERIFY_EMAIL", "").strip().lower() in ("1", "true", "yes", "on", "да")
+            _ps = os.environ.get("PERSON_SOCIAL", "").strip().lower() in ("1", "true", "yes", "on", "да")
+            pe = await asyncio.to_thread(
+                PEN.enrich_person, lead["contact_person"], lead["_inn"],
+                domain=lead.get("website"), verify_email=_pv, social=_ps)
+            findings = (findings or "") + "\n\n" + PEN.format_findings_block(pe)
+            print(f"    [{idx}] person_enrich: email {len(pe['contacts']['work_emails'])}, "
+                  f"тел {len(pe['contacts']['work_phones'])}"
+                  + ("" if pe.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
+        except Exception as e:
+            print(f"    [{idx}] person_enrich пропущен: {str(e)[:80]}")
+
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=CRA.PRESALE_SYSTEM,
@@ -175,7 +196,9 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model):
         "WebFetch/WebSearch по оставшимся пробелам — ИТ/тендерный контакт) заполни схемы и "
         "СОХРАНИ ОБА документа: вызови save_process_map_docx И save_roles_contacts_docx. "
         "В карту ролей ОБЯЗАТЕЛЬНО перенеси таблицу филиалов (директор+телефон), соцсети и "
-        "официальные контакты ИЗ находок — не пиши «не подтверждено» там, где данные есть.\n"
+        "официальные контакты ИЗ находок — не пиши «не подтверждено» там, где данные есть. "
+        "Если в находках есть блок «ПРЯМЫЕ КОНТАКТЫ ЛПР» — перенеси прямой email/телефон ЛПР "
+        "в карту ролей с указанием источника и уровня доверия.\n"
         f"  company_name = {h['company_name']!r}\n"
         f"  inn          = {h['inn']!r}\n"
         "ВАЖНО: работа НЕ выполнена, пока ты не вызвал ОБА инструмента save_*_docx. "
@@ -446,6 +469,13 @@ async def main():
                     help="3-я стадия .pptx через скилл pptx — ВКЛючена по умолчанию")
     ap.add_argument("--no-presentation", dest="presentation", action="store_false",
                     help="ОТКЛЮЧИТЬ 3-ю стадию (.pptx-презентацию)")
+    _pe_default = (os.environ.get("PERSON_ENRICH", "1").strip().lower()
+                   not in ("0", "false", "no", "off", "нет"))
+    ap.add_argument("--person-enrich", dest="person_enrich", action="store_true", default=_pe_default,
+                    help="обогащать ЛПР прямыми контактами (Dadata/Checko/сайт) — ВКЛ по умолчанию; "
+                         "SMTP-проверка email — env PERSON_VERIFY_EMAIL=1, соцсети — PERSON_SOCIAL=1")
+    ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
+                    help="не обогащать ЛПР прямыми контактами")
     a = ap.parse_args()
     # Удобство: ОТРАСЛЬ можно указать позиционно (py orchestrator.py mining) — приравниваем
     # к --industries, если позиционный аргумент — не существующий путь, а ключ(и) отрасли.
@@ -551,7 +581,7 @@ async def main():
                     ok_docx = False
                     for attempt in range(3):
                         try:
-                            cost, findings = await _research_one(lead, idx, d_tmp, s_tmp, a.model)
+                            cost, findings = await _research_one(lead, idx, d_tmp, s_tmp, a.model, a.person_enrich)
                         except Exception as e:
                             print(f"  [retry {attempt + 1}/3] {lead.get('name')}: {str(e)[:70]}")
                         if (os.path.exists(d_tmp) and os.path.getsize(d_tmp) > 5000
