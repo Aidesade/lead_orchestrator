@@ -672,5 +672,23 @@ async def main():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _no_sleep(on=True):
+    """Не давать Windows уснуть, пока идёт прогон (SetThreadExecutionState).
+    Блокируется только сон/гибернация СИСТЕМЫ — дисплей гаснуть может. Флаг
+    ES_CONTINUOUS действует до снятия или до выхода процесса, так что даже
+    аварийное завершение ничего не «залочит». Не Windows / нет прав — no-op."""
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _no_sleep(True)      # ночной прогон не должен обрываться уходом машины в сон
+    try:
+        asyncio.run(main())
+    finally:
+        _no_sleep(False)
