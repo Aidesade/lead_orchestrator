@@ -235,6 +235,12 @@ def _trash_list(path="trash:/", limit=200, offset=0):
     return _listing(f"{API}/trash/resources", "trash", path, limit, offset)
 
 
+def _exists_dir(p):
+    """Существует ли на Диске папка p (для фолбэка mkdir при 423)."""
+    st, d = _req("GET", f"{API}/resources?path={_q(p)}&fields=type")
+    return st == 200 and (d or {}).get("type") == "dir"
+
+
 def _mkdir(path, parents=False):
     p = _norm(path)
     chain = _parents_chain(p) if parents else [p]
@@ -248,6 +254,9 @@ def _mkdir(path, parents=False):
             existed.append(step)
         elif st == 409 and err == "DiskPathDoesntExistsError":
             return f"Нет родительской папки для {step} — вызовите с parents=True."
+        elif st == 423 and _exists_dir(step):
+            # папка залочена десктоп-синком Я.Диска, но УЖЕ существует — для mkdir это успех
+            existed.append(step)
         else:
             return _fail(st, data, step)
     if made:
