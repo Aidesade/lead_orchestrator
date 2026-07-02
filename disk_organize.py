@@ -17,11 +17,9 @@ r"""
 Когда будет готов генератор контента, подмени тела generate_dossier()/
 generate_strategy() — сигнатуры и остальной конвейер не трогаются.
 
-Диск дёргается через CLI `yacli` (та же OAuth-сессия, что в скилле yacli-disk):
-  yacli disk mkdir  <disk:/путь>
-  yacli disk upload <локальный файл> <disk:/путь> --overwrite
-
-Один раз нужно: `yacli login disk`.
+Диск дёргается python-коннектором connectors/yadisk_client.py (официальный
+REST API, stdlib). Нужен env YANDEX_DISK_TOKEN — OAuth-токен со scope
+cloud_api:disk.write (как получить — см. докстринг yadisk_client.py).
 
 Самостоятельный запуск на готовом JSON (без повторного скрейпа):
   py C:/Users/abalb/.claude/skills/lead-finder/scripts/disk_organize.py ^
@@ -32,7 +30,6 @@ import collections
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import zipfile
@@ -49,23 +46,6 @@ try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
-
-def _find_yacli():
-    """Найти бинарь yacli: env YACLI_BIN -> PATH -> стандартная установка Windows."""
-    env = os.environ.get("YACLI_BIN")
-    if env:
-        return env
-    found = shutil.which("yacli")
-    if found:
-        return found
-    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
-    cand = os.path.join(local, "Programs", "yacli", "bin", "yacli.exe")
-    if os.path.exists(cand):
-        return cand
-    return "yacli"   # последний шанс — вдруг есть в PATH среды запуска
-
-
-YACLI = _find_yacli()
 
 # короткие имена папок-отраслей (ключ _industry -> папка)
 SHORT_INDUSTRY = {
@@ -378,25 +358,39 @@ def generate_presentation(lead, path):
     _make_pptx(path, "Telepath — пресейл-презентация", lines)
 
 
-# ------------------------------- yacli (Диск) --------------------------------
+# --------------------------- коннектор Диска (python) ------------------------
 
-def _yacli(args, account=None):
-    cmd = [YACLI] + args + ["--format", "json"]
-    if account:
-        cmd += ["--account", account]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
-    except FileNotFoundError:
-        raise RuntimeError(
-            "Не найден CLI `yacli`. Добавь в PATH или задай переменную YACLI_BIN.")
-    out = (p.stdout or "").strip()
-    err = (p.stderr or "").strip()
-    blob = out or err                       # на ошибке yacli печатает JSON в stderr (stdout пуст)
-    try:
-        data = json.loads(blob) if blob else {}
-    except json.JSONDecodeError:
-        data = {"ok": p.returncode == 0, "message": blob}
-    return p.returncode, data
+_YD = None   # лениво импортированный python-коннектор (connectors/yadisk_client)
+
+
+def _disk_client():
+    """Python-REST коннектор Диска (connectors/yadisk_client) — единственный путь
+    на Диск. Нужен env YANDEX_DISK_TOKEN (как получить — докстринг yadisk_client.py);
+    без токена первая же операция даст понятный RuntimeError."""
+    global _YD
+    if _YD is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from connectors import yadisk_client
+        _YD = yadisk_client
+    return _YD
+
+
+def _retrying(fn, what):
+    """Общий цикл ретраев python-коннектора: лок Яндекса / сетевой сбой -> backoff."""
+    import time
+    last = ""
+    for attempt in range(5):
+        try:
+            fn()
+            return
+        except RuntimeError as e:
+            blob = str(e).lower()
+            if _is_locked(blob) or _is_transient(blob):
+                last = str(e)
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"{what}: {e}")
+    raise RuntimeError(f"{what}: не удалось после ретраев (лок/сеть): {last}")
 
 
 def _is_locked(blob):
@@ -404,47 +398,22 @@ def _is_locked(blob):
     return ("423" in blob) or ("locked" in blob) or ("заблокир" in blob)
 
 
+def _is_transient(blob):
+    # транзиентные сетевые сбои (обрыв соединения, таймаут, 5xx шлюза) — стоит повторить
+    keys = ("network", "error sending request", "timed out", "timeout",
+            "connection", "reset", "temporarily", "temporary failure",
+            "handshake", "dns", "eof", " 502", " 503", " 504")
+    return any(k in blob for k in keys)
+
+
 def _mkdir(path, account=None):
-    import time
-    last = ""
-    for attempt in range(5):
-        rc, data = _yacli(["disk", "mkdir", path], account)
-        if rc == 0 and data.get("ok", True):
-            return
-        blob = (str(data.get("code", "")) + " " + str(data.get("message", ""))).lower()
-        # глотаем идемпотентно ТОЛЬКО «папка уже существует»; бары «409»/«exist» опасны —
-        # 409 даёт и DiskPathDoesntExistsError (нет род. пути), а «exist» есть и в DoesntExists
-        if "existentdirectory" in blob or "уже существ" in blob:
-            return
-        if _is_locked(blob):                      # временный лок Яндекса -> backoff + ретрай
-            last = data.get("message") or blob
-            time.sleep(2 * (attempt + 1))
-            continue
-        raise RuntimeError(f"mkdir {path}: {data.get('message') or blob or rc}")
-    # после ретраев: если путь уже существует — это ок (часто база disk:/Лиды уже есть)
-    rc, data = _yacli(["disk", "list", path], account)
-    if rc == 0 and data.get("ok", True):
-        return
-    raise RuntimeError(f"mkdir {path}: заблокирован (423) после ретраев: {last}")
+    """Идемпотентно создать один уровень папки. account оставлен в сигнатуре
+    для совместимости старых вызовов (у REST-коннектора аккаунт один — по токену)."""
+    _retrying(lambda: _disk_client().ensure_dir(path), f"mkdir {path}")
 
 
 def _upload(local, remote, account=None, overwrite=True):
-    import time
-    args = ["disk", "upload", local, remote]
-    if overwrite:
-        args.append("--overwrite")
-    last = ""
-    for attempt in range(5):
-        rc, data = _yacli(args, account)
-        if rc == 0 and data.get("ok", True):
-            return
-        blob = (str(data.get("code", "")) + " " + str(data.get("message", ""))).lower()
-        if _is_locked(blob):                      # временный лок Яндекса -> backoff + ретрай
-            last = data.get("message") or blob
-            time.sleep(2 * (attempt + 1))
-            continue
-        raise RuntimeError(f"upload {remote}: {data.get('message') or rc}")
-    raise RuntimeError(f"upload {remote}: заблокирован (423) после ретраев: {last}")
+    _retrying(lambda: _disk_client().upload_file(local, remote, overwrite), f"upload {remote}")
 
 
 def ensure_dir(path, account, cache):
