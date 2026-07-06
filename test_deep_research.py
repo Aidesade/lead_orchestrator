@@ -80,11 +80,19 @@ def test_completeness_critic(findings):
     check("сгенерирован follow-up на тендерный контакт", "tender" in goals, goals)
     check("сгенерирован follow-up на ИТ/цифровизацию", "it" in goals, goals)
     check("follow-up на руководство (замы/гл.инженер)", "leadership" in goals, goals)
+    check("follow-up на экосистему/вертикаль (учредитель/ведомство)", "ecosystem" in goals, goals)
     check("соцсети НЕ помечены пробелом (они есть)",
           crit["counts"]["has_social"] is True, crit["counts"])
     check("счётчики полноты присутствуют",
           "branches_filled" in crit["counts"] and "branches_total" in crit["counts"],
           crit["counts"])
+    # находка экосистемы ЗАКРЫВАЕТ пробел (и merge её не теряет)
+    f2 = E.merge_findings([findings, {"ecosystem": [
+        {"entity": "Минцифры РТ", "relation": "курирующее ведомство", "source": "https://x"}]}])
+    crit2 = E.completeness_critic(f2, name="X", inn="1", domain="d")
+    check("экосистема из находок закрывает пробел вертикали",
+          crit2["counts"]["has_ecosystem"] is True and
+          not any(f["goal"] == "ecosystem" for f in crit2["followups"]), crit2["counts"])
     return crit
 
 
@@ -147,6 +155,33 @@ def test_consolidate_renders():
     check("документ содержит дисциплину отрицаний", "ДИСЦИПЛИНА" in doc)
     check("документ содержит ФИО директора с источником",
           "Фадеев" in doc and "avtodor-rzn.ru" in doc)
+    check("в блоке полноты есть строка про экосистему/вертикаль", "Экосистема/вертикаль" in doc)
+    # consolidate принимает и СПИСОК доменов (мульти-домен), и рендерит секцию экосистемы
+    f_eco = E.merge_findings([f, {"ecosystem": [
+        {"entity": "Минцифры РТ", "relation": "курирующее ведомство",
+         "person": "Начвин И.С.", "source": "https://digital.tatarstan.ru"}]}])
+    crit_eco = E.completeness_critic(f_eco, name="X", inn="1", domain="d")
+    doc2 = E.consolidate("X", "1", ["https://a.ru", "https://b.tatarstan.ru"], "",
+                         f_eco, crit_eco, [], [], [], rounds=0)
+    check("мульти-домен: оба сайта в шапке документа", "a.ru" in doc2 and "b.tatarstan.ru" in doc2)
+    check("секция экосистемы отрендерена с ключевым лицом",
+          "Экосистема и вертикаль" in doc2 and "Начвин" in doc2)
+
+
+def test_domain_validation():
+    print("\n[6] _text_belongs: «родовое» название не матчится по одному слову (кейс cbr.ru)")
+    name = "АО Центр Информационных Технологий РТ"
+    check("страница Центробанка НЕ признаётся сайтом «ЦИТ» (слово «центр» — не доказательство)",
+          not E._text_belongs("Центральный банк Российской Федерации. Пресс-центр. "
+                              "Информационные сообщения.", name, "1655505808"))
+    check("страница с ПОЛНОЙ фразой названия — признаётся",
+          E._text_belongs("АО «Центр информационных технологий РТ» — оператор инфраструктуры",
+                          name, ""))
+    check("ИНН на странице — признаётся без фразы",
+          E._text_belongs("Реквизиты: ИНН 1655505808, ОГРН ...", name, "1655505808"))
+    check("отличительный токен матчится по границе слова",
+          E._text_belongs("О компании Рязаньавтодор: дороги region", "АО Рязаньавтодор", "")
+          and not E._text_belongs("газета «Автодорожник»", "АО Рязаньавтодор", ""))
 
 
 def main():
@@ -156,6 +191,7 @@ def main():
     test_refill_closes_gap()
     test_placeholder_detection()
     test_consolidate_renders()
+    test_domain_validation()
     print("\n" + ("=" * 60))
     if _fails:
         print(f"ПРОВАЛЕНО проверок: {len(_fails)} -> {_fails}")

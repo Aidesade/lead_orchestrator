@@ -30,8 +30,14 @@ deep_research_engine — НАСТОЯЩИЙ глубокий ресёрч-дви
 
 Бюджет/конкуренция (env-переопределяемо):
   DR_BREADTH=4  DR_DEPTH=2  DR_MAXPAGES=25  DR_LLM_CONCURRENCY=2  DR_CRAWL_CONCURRENCY=4
-  DR_EXTRACT_MODEL=sonnet   DR_USE_LLM=1   DR_PAGE_CHARS=9000
+  DR_EXTRACT_MODEL=sonnet   DR_USE_LLM=1   DR_PAGE_CHARS=9000   DR_MAX_DOMAINS=3
   FIRECRAWL_API_KEY=...     (опц.) — парсинг карточек ЕИС за ключом
+
+Мульти-домен: у компании (особенно госструктуры) часто 2-3 сайта — свой + страница на
+ведомственном портале. discover_domains подтверждает до DR_MAX_DOMAINS доменов (доп. —
+строго по ИНН на странице), сайт-коллектор краулит все (основной — полный кап страниц,
+дополнительные — половинный). Критик полноты также следит за «экосистемой» — вертикалью
+принятия решений (учредитель, курирующее ведомство, сестринские структуры, комиссии).
 
 Зависимости: stdlib + (опц.) crawl4ai + claude-agent-sdk (для LLM-экстракта sonnet).
 Чистая логика (regex_findings, completeness_critic, merge_findings, consolidate)
@@ -73,6 +79,7 @@ DR_CRAWL_CONCURRENCY = int(os.environ.get("DR_CRAWL_CONCURRENCY", "4"))  # па�
 EXTRACT_MODEL = os.environ.get("DR_EXTRACT_MODEL", "sonnet")  # дешёвая модель для экстракта/критика
 DR_USE_LLM = os.environ.get("DR_USE_LLM", "1") not in ("0", "false", "no", "")
 DR_PAGE_CHARS = int(os.environ.get("DR_PAGE_CHARS", "9000"))  # кап текста страницы для LLM
+DR_MAX_DOMAINS = int(os.environ.get("DR_MAX_DOMAINS", "3"))   # подтверждённых сайтов на компанию
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -93,7 +100,10 @@ AGGREGATORS = ("checko.ru", "list-org", "rusprofile", "audit-it", "zachestnyibiz
                "spark-interfax", "b2b.house", "tbank.ru", "tinkoff", "sbis.ru",
                "testfirm", "rbc.ru", "sudact", "kad.arbitr", "zakupki.gov",
                "clearspending", "hh.ru", "find-org", "ruscatalog", "czn-",
-               "bigorg", "ogrn", "vbankcenter", "synapsenet", "cmm.")
+               "bigorg", "ogrn", "vbankcenter", "synapsenet", "cmm.",
+               # реальные нарушители из логов прогонов (карточки-каталоги за анти-ботом)
+               "focus.kontur", "kontragent", "vbr.ru", "cataloxy", "tilbagevise",
+               "e-disclosure", "cbr.ru", "saby.ru")
 
 
 def _digits(s):
@@ -430,6 +440,7 @@ def regex_findings(pages):
         "leadership": [],
         "branches": branches,
         "departments": [],
+        "ecosystem": [],
         "contacts": {"phones": phones, "emails": emails, "social": social,
                      "address": "", "schedule": ""},
         "procurement": {"summary": "", "contacts": [], "source": ""},
@@ -461,7 +472,7 @@ def _merge_list(dst, src, key):
 
 def merge_findings(parts):
     """Слить список частичных находок в один документ (dedup по ключам, союз контактов)."""
-    out = {"leadership": [], "branches": [], "departments": [],
+    out = {"leadership": [], "branches": [], "departments": [], "ecosystem": [],
            "contacts": {"phones": [], "emails": [], "social": [], "address": "", "schedule": ""},
            "procurement": {"summary": "", "contacts": [], "source": ""},
            "project_institute": {}, "courts": [], "media": []}
@@ -474,6 +485,8 @@ def merge_findings(parts):
                     lambda x: re.sub(r"[^а-яёa-z]", "", str(x.get("branch", "")).lower()))
         _merge_list(out["departments"], p.get("departments"),
                     lambda x: re.sub(r"[^а-яёa-z]", "", str(x.get("block", "")).lower())[:40])
+        _merge_list(out["ecosystem"], p.get("ecosystem"),
+                    lambda x: re.sub(r"[^а-яёa-z0-9]", "", str(x.get("entity", "")).lower())[:50])
         c = p.get("contacts") or {}
         _merge_list(out["contacts"]["phones"], c.get("phones"), lambda x: _digits(x.get("phone")))
         _merge_list(out["contacts"]["emails"], c.get("emails"), lambda x: (x.get("email") or "").lower())
@@ -570,9 +583,21 @@ def completeness_critic(findings, name="", inn="", domain=""):
         followups.append({"goal": "leadership",
                           "query": f"{name} заместитель генерального директора главный инженер руководство"})
 
+    # 6) экосистема/вертикаль принятия решений: учредитель/собственник, курирующее
+    #    ведомство, сестринские структуры, комиссии/советы, холдинг (критично для гос)
+    ecosystem = findings.get("ecosystem") or []
+    has_ecosystem = bool(ecosystem)
+    if not has_ecosystem:
+        gaps.append("вертикаль/экосистема (учредитель, курирующее ведомство, сестринские структуры) не выявлена")
+        followups.append({"goal": "ecosystem",
+                          "query": f"{name} учредитель кому принадлежит подведомственность"})
+        followups.append({"goal": "ecosystem",
+                          "query": f"{name} курирующее министерство ведомство холдинг группа компаний"})
+
     counts = {"branches_total": b_total, "branches_filled": b_filled,
               "leadership": len(leadership), "departments": len(departments),
               "has_tender": has_tender, "has_it": has_it, "has_social": has_social,
+              "has_ecosystem": has_ecosystem, "ecosystem": len(ecosystem),
               "emails": len(contacts.get("emails") or []),
               "social": len(contacts.get("social") or []), "gaps": len(gaps)}
     return {"gaps": gaps, "counts": counts, "followups": followups}
@@ -586,13 +611,18 @@ _EXTRACT_SYSTEM = (
     "для B2B-пресейла. На входе — текст реально загруженных страниц, КАЖДАЯ помечена "
     "строкой [URL: ...]. Извлекай ТОЛЬКО то, что дословно присутствует в тексте: ФИО, "
     "должности, телефоны, e-mail, адреса, соцсети, филиалы и их директоров, контактных "
-    "лиц закупок, проектный институт, суды/СМИ. НИЧЕГО не выдумывай и не достраивай по "
+    "лиц закупок, проектный институт, суды/СМИ, а также ЭКОСИСТЕМУ — связи вертикали "
+    "принятия решений: учредитель/собственник, курирующее ведомство/министерство, "
+    "головные/материнские и сестринские организации, комиссии/советы, членство в "
+    "группах/холдингах (relation — тип связи, person — ключевое лицо, если названо). "
+    "НИЧЕГО не выдумывай и не достраивай по "
     "догадке. У КАЖДОЙ строки поле source — URL страницы, откуда факт взят. Если факта "
     "нет в тексте — НЕ создавай строку. Верни СТРОГО JSON без прозы и без ```-ограждений, "
     "по схеме:\n"
     '{"leadership":[{"position":str,"fio":str,"source":str}],'
     '"branches":[{"branch":str,"director":str,"phone":str,"source":str}],'
     '"departments":[{"block":str,"contact":str,"relevance":str,"source":str}],'
+    '"ecosystem":[{"entity":str,"relation":str,"person":str,"note":str,"source":str}],'
     '"contacts":{"phones":[{"phone":str,"source":str}],'
     '"emails":[{"email":str,"role":"tender|general|personal","source":str}],'
     '"social":[{"kind":str,"url":str,"source":str}],"address":str,"schedule":str},'
@@ -677,7 +707,8 @@ async def llm_extract(pages, focus="", model=EXTRACT_MODEL):
         return {}
     prompt = (f"Источник: {focus}. Извлеки факты из загруженных страниц ниже в JSON по схеме "
               f"из системного промпта. Особое внимание: филиалы+их директора+телефоны, "
-              f"контактные лица закупок, соцсети, ИТ/цифровизация, проектный институт.\n\n{blob}")
+              f"контактные лица закупок, соцсети, ИТ/цифровизация, проектный институт, "
+              f"вертикаль/экосистема (учредитель, ведомство, сестринские структуры, комиссии).\n\n{blob}")
     try:
         from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage,
                                       TextBlock, ResultMessage)
@@ -737,15 +768,42 @@ def _root_url(u):
 _OPF_WORDS = ("акционерное", "общество", "компания", "группа", "завод", "комбинат",
               "предприятие", "ооо", "оао", "зао", "пао", "нао", "гуп", "муп", "фгуп")
 
+# «Родовые» слова названий: сами по себе НЕ доказывают принадлежность страницы компании
+# («центр» — подстрока «Центрального банка», на этом движок однажды принял cbr.ru за сайт
+# «Центра информационных технологий»). Матчатся только в составе ПОЛНОЙ фразы названия.
+_GENERIC_NAME_WORDS = frozenset((
+    "центр", "информационных", "информационные", "технологий", "технологии",
+    "технологический", "республики", "республика", "российской", "россии",
+    "российское", "государственное", "государственный", "национальный", "научно",
+    "производственное", "производственный", "объединение", "управление", "служба",
+    "агентство", "институт", "корпорация", "холдинг", "строительство", "развития"))
+
+
+def _name_tokens(name):
+    """Значимые токены названия: слова ≥5 букв без организационно-правовых форм."""
+    return [t for t in re.split(r"[^а-яёa-z0-9]+", name.lower())
+            if len(t) >= 5 and t not in _OPF_WORDS]
+
+
+def _phrase_in(toks, text):
+    """Полная фраза названия (токены подряд, по границе слова) присутствует в тексте."""
+    return re.search(r"\b" + r"\s+".join(re.escape(t) for t in toks), text) is not None
+
 
 def _text_belongs(txt, name, inn):
-    """Текст страницы принадлежит ИМЕННО этой компании? Сигнал: ИНН на странице ИЛИ токен названия."""
-    txt = (txt or "").lower()
+    """Текст страницы принадлежит ИМЕННО этой компании? Сигналы (по убыванию силы):
+    ИНН на странице; ОТЛИЧИТЕЛЬНЫЙ токен названия по границе слова; для названий
+    целиком из родовых слов — только ПОЛНАЯ фраза названия."""
+    txt_l = (txt or "").lower()
     if inn and len(_digits(inn)) >= 10 and _digits(inn) in _digits(txt):
         return True
-    toks = [t for t in re.split(r"[^а-яёa-z0-9]+", name.lower())
-            if len(t) >= 5 and t not in _OPF_WORDS]
-    return any(t in txt for t in toks)
+    toks = _name_tokens(name)
+    distinctive = [t for t in toks if t not in _GENERIC_NAME_WORDS]
+    if distinctive:
+        return any(re.search(r"\b" + re.escape(t), txt_l) for t in distinctive)
+    if toks:  # имя целиком «родовое» («Центр информационных технологий») — нужна вся фраза
+        return _phrase_in(toks, txt_l)
+    return False
 
 
 async def _domain_matches(domain, name, inn):
@@ -757,13 +815,60 @@ async def _domain_matches(domain, name, inn):
     return _text_belongs(page.get("markdown") or "", name, inn)
 
 
-async def discover_domain(name, inn, card, contacts, hint=""):
-    """Сайт компании: hint (ФАЗА 1) -> Checko/Dadata website -> ВАЛИДИРОВАННЫЙ WebSearch. '' если нет."""
-    # 1) известный сайт (лид ФАЗЫ 1 / Checko / Dadata) — теперь С ВАЛИДАЦИЕЙ ПРИНАДЛЕЖНОСТИ.
-    #    Раньше брался без проверки, и чужой сайт в поле website (напр. hoteldvina.ru у ПКП
-    #    «Титан») уводил весь ресёрч не на ту компанию. Логика: сайт недоступен СЕЙЧАС — берём
-    #    как есть (чужой недоступный и так даст 0 страниц, свой временно лежащий не теряем);
-    #    доступен, но нет ни ИНН, ни названия — ОТКЛОНЯЕМ и идём в валидированный поиск (шаг 2).
+def _host_key(url):
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+async def _domain_matches_strict(root, name, inn):
+    """Строгая проверка ДОПОЛНИТЕЛЬНОГО домена: токена названия мало (им «болеют» и СМИ,
+    и каталоги) — требуем ИНН на главной либо на типовой странице контактов/реквизитов."""
+    if not _digits(inn):
+        return False
+    for path in ("", "/contacts", "/kontakty", "/rekvizity", "/about"):
+        page = await fetch_page(root + path)
+        if page and _digits(inn) in _digits(page.get("markdown") or ""):
+            return True
+    return False
+
+
+async def _serp_phrase_fallback(root, name, serp_hit):
+    """Кандидат не отдаётся обычному HTTP (портал за анти-ботом, напр. *.tatarstan.ru) —
+    принять по СНИППЕТУ выдачи, если в нём ПОЛНАЯ фраза названия из ≥2 слов (одиночный
+    токен матчит и новостные сайты — не доказательство). Краул потом сделает Crawl4AI,
+    которому анти-бот не мешает.
+    Защита от каталогов не из блок-листа: карточка-агрегатор живёт на ГЛУБОКОМ пути
+    с query (`/entity?query=...`), настоящий сайт/портал — на корне или /page.htm;
+    глубокие URL и URL с параметрами не принимаем."""
+    hit_url = urlparse(serp_hit.get("url", ""))
+    if hit_url.query or len([s for s in hit_url.path.split("/") if s]) > 1:
+        return False
+    toks = _name_tokens(name)
+    if len(toks) < 2:
+        return False
+    blob = f"{serp_hit.get('title', '')} {serp_hit.get('snippet', '')}".lower()
+    if not _phrase_in(toks, blob):
+        return False
+    return await fetch_page(root) is None
+
+
+async def discover_domains(name, inn, card, contacts, hint="", limit=None):
+    """До DR_MAX_DOMAINS ПОДТВЕРЖДЁННЫХ сайтов компании (у госструктур их часто 2-3:
+    свой сайт + страница на ведомственном портале — на них живут РАЗНЫЕ данные).
+    Первый домен — по прежним правилам (hint ФАЗЫ 1 -> Checko/Dadata -> валидированный
+    поиск: недоступный берём как есть, доступный без ИНН/названия отклоняем);
+    ДОПОЛНИТЕЛЬНЫЕ — строго: ИНН на странице либо полная фраза названия в SERP-сниппете
+    (порталы за анти-ботом), чтобы не притащить СМИ/каталог."""
+    limit = limit or DR_MAX_DOMAINS
+    domains = []
+
+    def _seen(root):
+        return _host_key(root) in {_host_key(d) for d in domains}
+
+    def _accept(root, why):
+        _note(why)
+        domains.append(root)
+
+    # 1) известные сайты (лид ФАЗЫ 1 / Checko / Dadata) — с валидацией принадлежности
     for src, cand in (("ФАЗА 1", hint),
                       ("contacts", (contacts or {}).get("website")),
                       ("card", (card or {}).get("website"))):
@@ -771,28 +876,51 @@ async def discover_domain(name, inn, card, contacts, hint=""):
         if not (cand and is_own_site(cand) and _not_search_engine(cand)):
             continue
         root = _root_url(cand)
+        if _seen(root):
+            continue
         page = await fetch_page(root)
         if not page:
-            _note(f"известный домен {root} ({src}) недоступен для проверки — беру как есть")
-            return root
-        if _text_belongs(page.get("markdown") or "", name, inn):
-            _note(f"домен из известных данных подтверждён ({src}): {root}")
-            return root
-        _note(f"известный домен {root} ({src}) ОТКЛОНЁН — на сайте нет ни ИНН, ни названия «{name}»; ищу правильный")
-    # 2) поиск (best-effort) С ВАЛИДАЦИЕЙ — чтобы зарейтлимиченный SERP не подсунул чужой сайт
+            _accept(root, f"известный домен {root} ({src}) недоступен для проверки — беру как есть")
+        elif _text_belongs(page.get("markdown") or "", name, inn):
+            _accept(root, f"домен из известных данных подтверждён ({src}): {root}")
+        else:
+            _note(f"известный домен {root} ({src}) ОТКЛОНЁН — на сайте нет ни ИНН, ни названия «{name}»; ищу правильный")
+        if len(domains) >= limit:
+            return domains
+    # 2) поиск (best-effort) с валидацией — чтобы зарейтлимиченный SERP не подсунул чужой
+    #    сайт; дополнительные (сверх первого) домены — строго ИНН либо SERP-фраза (анти-бот)
     for q in (f"{name} ИНН {inn} официальный сайт".strip(), f"{name} официальный сайт"):
         for r in await web_search(q, 6):
             u = r["url"]
             host = urlparse(u).netloc.lower()
-            if (is_own_site(u) and _not_search_engine(u)
+            if not (is_own_site(u) and _not_search_engine(u)
                     and not any(a in host for a in AGGREGATORS)):
-                root = _root_url(u)
+                continue
+            root = _root_url(u)
+            if _seen(root):
+                continue
+            if not domains:
                 if await _domain_matches(root, name, inn):
-                    _note(f"домен найден и подтверждён поиском: {root}")
-                    return root
-                _note(f"кандидат {root} отклонён (не подтвердил принадлежность компании)")
-    _note(f"официальный сайт «{name}» не определён — сайт-коллектор ограничен")
-    return ""
+                    _accept(root, f"домен найден и подтверждён поиском: {root}")
+                elif await _serp_phrase_fallback(root, name, r):
+                    _accept(root, f"домен принят по фразе названия в SERP (страница не отдаётся HTTP): {root}")
+                else:
+                    _note(f"кандидат {root} отклонён (не подтвердил принадлежность компании)")
+            elif await _domain_matches_strict(root, name, inn):
+                _accept(root, f"дополнительный домен подтверждён по ИНН: {root}")
+            elif await _serp_phrase_fallback(root, name, r):
+                _accept(root, f"дополнительный домен принят по фразе названия в SERP (анти-бот): {root}")
+            if len(domains) >= limit:
+                return domains
+    if not domains:
+        _note(f"официальный сайт «{name}» не определён — сайт-коллектор ограничен")
+    return domains
+
+
+async def discover_domain(name, inn, card, contacts, hint=""):
+    """Совместимость: первый (основной) подтверждённый домен либо ''."""
+    ds = await discover_domains(name, inn, card, contacts, hint=hint, limit=1)
+    return ds[0] if ds else ""
 
 
 class SiteCrawler:
@@ -894,10 +1022,16 @@ class SiteCrawler:
         return pages
 
 
-async def collect_site(domain):
-    pages = await SiteCrawler().crawl_sections(domain)
-    notes = [] if domain else ["сайт компании не определён"]
-    return {"source": "site", "pages": pages, "notes": notes, "links": [domain] if domain else []}
+async def collect_site(domains):
+    """Краул ВСЕХ подтверждённых доменов: основной — полный кап страниц,
+    дополнительные (ведомственный портал и т.п.) — половинный."""
+    domains = [d for d in (domains or []) if d]
+    pages = []
+    for i, d in enumerate(domains):
+        cap = DR_MAX_PAGES if i == 0 else max(6, DR_MAX_PAGES // 2)
+        pages += await SiteCrawler(max_pages=cap).crawl_sections(d)
+    notes = [] if domains else ["сайт компании не определён"]
+    return {"source": "site", "pages": pages, "notes": notes, "links": list(domains)}
 
 
 async def eis_by_inn(inn):
@@ -1002,20 +1136,24 @@ async def collect_hh(name, inn):
 # ============================================================================
 # ДОБОР ПОД ПРОБЕЛЫ (петля dzhng/deep-research, адаптированная на целевой добор)
 # ============================================================================
-async def run_followups(followups, name, inn, domain):
-    """Под каждый follow-up: таргетированный поиск + фетч топ-страниц. -> pages[]"""
+async def run_followups(followups, name, inn, domains):
+    """Под каждый follow-up: таргетированный поиск + фетч топ-страниц. -> pages[]
+    domains — список подтверждённых сайтов (или строка): их страницы дочитываются приоритетно."""
     pages = []
     sem = _sem("crawl", DR_CRAWL_CONCURRENCY)
+    if isinstance(domains, str):
+        domains = [domains] if domains else []
+    hosts = [_host_key(d) for d in (domains or []) if d]
 
     async def _search_and_fetch(fu):
         local = []
         results = await web_search(fu["query"], 5)
-        host = urlparse(domain).netloc.lower() if domain else ""
         for r in results:
             local.append({"url": r["url"], "markdown": f"{r['title']}\n{r['snippet']}",
                           "source": f"followup:{fu['goal']}"})
-        # приоритетно дочитываем страницу собственного сайта, если она всплыла
-        own = [r["url"] for r in results if host and host in urlparse(r["url"]).netloc]
+        # приоритетно дочитываем страницы собственных сайтов, если они всплыли
+        own = [r["url"] for r in results
+               if hosts and any(h in urlparse(r["url"]).netloc.lower() for h in hosts)]
         for u in own[:2]:
             async with sem:
                 g = await fetch_page(u)
@@ -1043,12 +1181,13 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
     contacts0 = payload.get("contacts") or {}
     inn = inn or payload.get("inn") or ""
 
-    # 1) домен (hint из ФАЗЫ 1 -> Checko/Dadata -> поиск)
-    domain = await discover_domain(name, inn, card, contacts0, hint=domain_hint)
+    # 1) домены (hint из ФАЗЫ 1 -> Checko/Dadata -> поиск; до DR_MAX_DOMAINS сайтов)
+    domains = await discover_domains(name, inn, card, contacts0, hint=domain_hint)
+    domain = domains[0] if domains else ""
 
     # 2) параллельные коллекторы (по ИСТОЧНИКАМ)
     raws = await asyncio.gather(
-        collect_site(domain), eis_by_inn(inn),
+        collect_site(domains), eis_by_inn(inn),
         collect_courts_media(name, inn), collect_hh(name, inn),
         return_exceptions=True)
     raws = [r for r in raws if isinstance(r, dict)]
@@ -1077,7 +1216,7 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
         fu = crit["followups"][:breadth]
         _note(f"добор раунд {rounds + 1}: пробелов {len(crit['gaps'])}, "
               f"follow-up {len(fu)} ({', '.join(sorted({f['goal'] for f in fu}))})")
-        new_pages = await run_followups(fu, name, inn, domain)
+        new_pages = await run_followups(fu, name, inn, domains)
         new_pages = [p for p in new_pages if p.get("url") not in opened_urls or p.get("source", "").endswith("page")]
         if not new_pages:
             break
@@ -1087,7 +1226,7 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
         rounds += 1
 
     crit = completeness_critic(findings, name, inn, domain)
-    return consolidate(name, inn, domain, official_md, findings, crit,
+    return consolidate(name, inn, domains, official_md, findings, crit,
                        sorted(opened_urls), src_links, collector_notes, rounds)
 
 
@@ -1103,13 +1242,15 @@ def _fmt_branches(branches):
 
 def consolidate(name, inn, domain, official_md, findings, crit,
                 opened_urls, src_links, collector_notes, rounds):
-    """Богатый ИСТОЧНИКОВАННЫЙ findings-документ: markdown + структурный JSON."""
+    """Богатый ИСТОЧНИКОВАННЫЙ findings-документ: markdown + структурный JSON.
+    domain — строка ИЛИ список подтверждённых доменов (мульти-домен)."""
+    domains = list(domain) if isinstance(domain, (list, tuple)) else ([domain] if domain else [])
     c = findings.get("contacts") or {}
     counts = crit["counts"]
     L = []
     L.append(f"# Находки deep_research: {name}" + (f" (ИНН {inn})" if inn else ""))
     L.append(f"Движок: deep_research_engine (supervisor + целевой добор + краул). "
-             f"Раундов добора: {rounds}. Сайт: {domain or 'не определён'}.")
+             f"Раундов добора: {rounds}. Сайт(ы): {', '.join(domains) or 'не определён'}.")
     L.append("")
     L.append("## Реально открытые источники (страницы/выдача загружены движком)")
     if opened_urls:
@@ -1161,6 +1302,17 @@ def consolidate(name, inn, domain, official_md, findings, crit,
                  f"[источник: {pi.get('source', '')}]")
         L.append("")
 
+    eco = findings.get("ecosystem") or []
+    if eco:
+        L.append("## Экосистема и вертикаль принятия решений "
+                 "(учредитель / ведомство / сестринские структуры / комиссии)")
+        for x in eco[:12]:
+            L.append(f"- {x.get('entity', '')} — {x.get('relation', '')}"
+                     + (f" (ключевое лицо: {x.get('person', '')})" if x.get("person") else "")
+                     + (f": {x.get('note', '')}" if x.get("note") else "")
+                     + f" [источник: {x.get('source', '')}]")
+        L.append("")
+
     L.append("## Официальные контакты")
     if c.get("phones"):
         L.append("- Телефоны: " + "; ".join(f"{p['phone']} [{p['source']}]" for p in c["phones"][:8]))
@@ -1202,6 +1354,8 @@ def consolidate(name, inn, domain, official_md, findings, crit,
     L.append(f"- ИТ/цифровизация: {'ЕСТЬ' if counts['has_it'] else 'НЕ выявлен (критичный пробел)'}.")
     L.append(f"- Соцсети: {'ЕСТЬ' if counts['has_social'] else 'НЕ найдены'}.")
     L.append(f"- Руководство сверх первого лица: строк {counts['leadership']}.")
+    L.append(f"- Экосистема/вертикаль (учредитель/ведомство/сёстры-структуры): "
+             f"{'ЕСТЬ, строк ' + str(counts.get('ecosystem', 0)) if counts.get('has_ecosystem') else 'НЕ выявлена'}.")
     if crit["gaps"]:
         L.append("- ОСТАВШИЕСЯ ПРОБЕЛЫ (после исчерпания бюджета добора):")
         for g in crit["gaps"]:
