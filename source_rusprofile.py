@@ -238,7 +238,19 @@ class RusProfileSession:
                 pass
         self._d.set_page_load_timeout(45)
         self._d.get(ADV_URL)
-        time.sleep(6)  # дать Cloudflare-challenge пройти и выставить CSRF-cookie
+        # ждать прохождения Cloudflare-challenge ПО ФАКТУ появления CSRF-cookie (до 30с),
+        # а не слепые 6 секунд: на медленной машине challenge не успевал — и весь сбор
+        # молча возвращал 0 компаний.
+        end = time.time() + 30
+        while True:
+            time.sleep(3)
+            try:
+                if any(c.get("name") == "__Host-csrf-token" for c in (self._d.get_cookies() or [])):
+                    break
+            except Exception:
+                pass
+            if time.time() >= end:
+                break
         return self
 
     def __exit__(self, *exc):
@@ -252,6 +264,28 @@ class RusProfileSession:
     def _post(self, body):
         txt = self._d.execute_script(_XHR, body)
         return json.loads(txt)
+
+    def _post_retry(self, body, log=log):
+        """_post с одним повтором: при сбое/success=false перезагрузить страницу поиска
+        (новый Cloudflare-проход и свежий CSRF) и попробовать ещё раз. None = не удалось."""
+        last = ""
+        for i in range(2):
+            try:
+                r = self._post(body)
+                if r.get("success"):
+                    return r
+                last = "success=false"
+            except Exception as e:
+                last = str(e).splitlines()[0][:70]
+            if i == 0:
+                log(f"  [warn] стр.{body.get('page')}: {last} — обновляю страницу и повторяю")
+                try:
+                    self._d.get(ADV_URL)
+                    time.sleep(6)
+                except Exception:
+                    pass
+        log(f"  [warn] стр.{body.get('page')}: {last} — стоп")
+        return None
 
     def search(self, okved, revenue_from, max_pages=20, pause=1.0, log=log):
         """okved: список кодов ОКВЭД-2. revenue_from: ₽. Возвращает items[].
@@ -271,13 +305,8 @@ class RusProfileSession:
         out, total = [], None
         for page in range(1, max_pages + 1):
             body = dict(base, page=page)
-            try:
-                r = self._post(body)
-            except Exception as e:
-                log(f"  [warn] стр.{page}: {str(e).splitlines()[0][:70]}")
-                break
-            if not r.get("success"):
-                log(f"  [warn] стр.{page}: success=false — стоп")
+            r = self._post_retry(body, log)
+            if r is None:
                 break
             data = r.get("data") or {}
             items = data.get("items") or []

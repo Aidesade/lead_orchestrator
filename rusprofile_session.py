@@ -208,16 +208,19 @@ class RusProfileAuth:
             "website": site,
         }
 
-    def enrich_leads(self, leads, only_missing=True, log=log):
+    def enrich_leads(self, leads, only_missing=True, log=log, checkpoint=None):
         """Заполнить лидам website/phone/email из карточки RusProfile (по _rusprofile_url).
-        Контакты RusProfile бесплатны под твоим аккаунтом и БЕЗ суточного лимита."""
+        Контакты RusProfile бесплатны под твоим аккаунтом и БЕЗ суточного лимита.
+        checkpoint — колбэк без аргументов, зовётся каждые 20 карточек: инкрементальное
+        сохранение прогресса, чтобы обрыв Chrome не терял уже собранные контакты.
+        В ответе locked=True — платная сессия протухла (контакты закрыты, нужен --login)."""
         try:
             from checko_enrich import _best_email
         except Exception:
             _best_email = lambda ems: (ems[0] if ems else None, "общая", False)
         if not self.contacts_unlocked():
             log("[RusProfile] контакты закрыты (сессия истекла?) — нужен повторный --login")
-            return {"used": 0, "site": 0, "phone": 0, "email": 0}
+            return {"used": 0, "site": 0, "phone": 0, "email": 0, "locked": True}
 
         def need(l):
             url = l.get("_rusprofile_url") or (
@@ -227,6 +230,13 @@ class RusProfileAuth:
             if only_missing and (l.get("website") or l.get("phone") or l.get("email")):
                 return None
             return url
+
+        def _ckpt():                         # чекпойнт опционален и НИКОГДА не должен ронять сбор
+            if checkpoint:
+                try:
+                    checkpoint()
+                except Exception:
+                    pass
         site = phone = mail = used = 0
         todo = [(l, need(l)) for l in leads]
         todo = [(l, u) for l, u in todo if u]
@@ -250,6 +260,8 @@ class RusProfileAuth:
                     l["_email_is_target"] = is_t; l["_email_src"] = "RusProfile"; mail += 1
             if used % 20 == 0:
                 log(f"  RusProfile: {used} | сайт {site} тел {phone} email {mail}")
+                _ckpt()
+        _ckpt()                              # финальный чекпойнт — контакты хвоста
         log(f"[RusProfile] контакты: {used} карточек | сайт {site} | тел {phone} | email {mail}")
         return {"used": used, "site": site, "phone": phone, "email": mail}
 

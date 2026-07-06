@@ -2,8 +2,8 @@
 r"""
 Python-клиент Яндекс Диска на официальном REST API — ЯДРО коннектора, без MCP.
 Без сторонних зависимостей (urllib из stdlib). Поверх него:
-  * пайплайн (disk_organize.py) — mkdir/upload ПО УМОЛЧАНИЮ через этот клиент
-    (yacli остаётся фолбэком, см. там же);
+  * пайплайн (disk_organize.py) — mkdir/upload ТОЛЬКО через этот клиент
+    (единственный путь на Диск; yacli в пайплайне больше не используется);
   * MCP-сервер connectors/yadisk_mcp.py — интерактивные тулзы yadisk_*.
 
 Токен: переменная окружения YANDEX_DISK_TOKEN — OAuth-токен Яндекс Диска со scope
@@ -419,3 +419,25 @@ def upload_file(source, path, overwrite=True):
     if not res.startswith("✓"):
         raise RuntimeError(res)
     return res
+
+
+def list_file_sizes(path):
+    """Служебное для пайплайна (резюм оркестратора): {имя: размер_в_байтах} файлов
+    НЕПОСРЕДСТВЕННО в папке path. Папки нет -> {}; прочие ошибки API/сети -> RuntimeError."""
+    p = _norm(path)
+    sizes, offset = {}, 0
+    while True:
+        st, data = _req("GET", _list_url(f"{API}/resources", p, 200, offset))
+        if st == 404:
+            return {}
+        if st != 200:
+            raise RuntimeError(_fail(st, data, p))
+        emb = (data or {}).get("_embedded") or {}
+        items = emb.get("items") or []
+        for it in items:
+            if it.get("type") == "file":
+                sizes[it.get("name") or ""] = int(it.get("size") or 0)
+        offset += len(items)
+        if not items or offset >= int(emb.get("total") or 0):
+            break
+    return sizes

@@ -41,6 +41,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import warnings
 
 # Косметический RequestsDependencyWarning (chardet 7.x вне диапазона requests; ставится Crawl4AI,
@@ -146,13 +147,26 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
 
     # ПРЕД-ЗАПУСК движка: на верхнем уровне, НЕ внутри сессии писателя -> без вложенных
     # SDK-вызовов. Движок отдаёт готовые находки (филиалы+телефоны, соцсети, контакты,
-    # официалка), у строк — source URL.
-    print(f"    [{idx}] deep_research (движок) ...")
-    try:
-        findings = await DRE.deep_research(h["company_name"], h["inn"], h["aspects"])
-    except Exception as e:
-        print(f"    [{idx}] deep_research engine error: {str(e)[:90]}")
-        findings = ""
+    # официалка), у строк — source URL. Результат кэшируется на диске: ретрай писателя
+    # и повторный прогон не гоняют (и не оплачивают) deep-research заново.
+    ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
+    findings = _cached_findings(h["company_name"], h["inn"], ttl_h=ttl_h)
+    if findings:
+        print(f"    [{idx}] deep_research: находки из кэша (моложе {ttl_h:g} ч) — движок пропущен")
+    else:
+        print(f"    [{idx}] deep_research (движок) ...")
+        try:
+            findings = await DRE.deep_research(h["company_name"], h["inn"], h["aspects"])
+        except Exception as e:
+            print(f"    [{idx}] deep_research engine error: {str(e)[:90]}")
+            findings = ""
+        cp = _findings_cache_path(h["company_name"], h["inn"])
+        if cp and findings and len(findings) > 200:
+            try:
+                os.makedirs(os.path.dirname(cp), exist_ok=True)
+                open(cp, "w", encoding="utf-8").write(findings)
+            except OSError:
+                pass
 
     # Обогащение ЛПР прямыми контактами — детерминированно, БЕЗ вложенной SDK-сессии
     # (как пред-запуск движка). Легитимные источники (Dadata/Checko/сайт/MX/SMTP);
@@ -391,12 +405,37 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
 
     print(f"[1/2] RusProfile: {inds} | порог >{min_revenue / 1e9:g} млрд"
           + (f" | регион {region}" if region else ""))
-    leads = RP.harvest(inds, min_revenue=min_revenue, per_industry=per_ind,
-                       region=region, headless=headless, out_path=json_out, offscreen=offscreen)
+    leads = []
+    for attempt in (1, 2):     # антибот/Chrome сбоят — вторая попытка с чистой сессией
+        try:
+            leads = RP.harvest(inds, min_revenue=min_revenue, per_industry=per_ind,
+                               region=region, headless=headless, out_path=json_out,
+                               offscreen=offscreen)
+        except Exception as e:
+            print(f"[1/2] сбор упал: {str(e)[:120]}")
+            leads = []
+        if leads:
+            break
+        if attempt == 1:
+            print("[1/2] пусто/сбой — повтор через 15с (новая Chrome-сессия)")
+            time.sleep(15)
     if not leads:
-        raise SystemExit("RusProfile ничего не вернул — проверь коды ОКВЭД/доступ.")
-    with RPS.RusProfileAuth(headless=headless, offscreen=offscreen) as rs:  # контакты с платного аккаунта
-        rs.enrich_leads(leads, only_missing=True, log=print)
+        raise SystemExit("RusProfile ничего не вернул (2 попытки) — проверь коды ОКВЭД/доступ/антибот.")
+    res = {}
+    for attempt in (1, 2):     # контакты с платного аккаунта; прогресс — в JSON каждые 20 карточек
+        try:
+            with RPS.RusProfileAuth(headless=headless, offscreen=offscreen) as rs:
+                res = rs.enrich_leads(leads, only_missing=True, log=print,
+                                      checkpoint=lambda: RP._save(leads, json_out))
+            break
+        except Exception as e:
+            print(f"[1/2] сессия контактов упала: {str(e)[:120]}"
+                  + (" — повтор через 10с" if attempt == 1 else " — продолжаю БЕЗ контактов RusProfile"))
+            if attempt == 1:
+                time.sleep(10)
+    if res.get("locked"):
+        raise SystemExit("Контакты RusProfile закрыты — платная сессия протухла. Один раз: "
+                         f"py rusprofile_session.py --login (сырой список уже сохранён: {json_out})")
     picked = pipeline._select(leads, count, inds)
     build(picked, ("Лиды: " + ", ".join(inds))[:90], out_xlsx)
     pipeline._save(picked, json_out)
@@ -434,6 +473,202 @@ def _free_ram_gb():
     return None
 
 
+def _rm(*paths):
+    """Удалить файлы, молча игнорируя отсутствие/ошибку ОС — чистка частичных
+    результатов перед повторной попыткой."""
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _fatal_exc(e):
+    """«Смертельные» исключения, которые надо пробрасывать, а не ретраить: Ctrl+C/выход/
+    отмена — в том числе ВНУТРИ BaseExceptionGroup (краху CLI-подпроцесса SDK anyio
+    оборачивает исключения в группу, и голый `except Exception` её пропускал бы наверх,
+    убивая весь прогон)."""
+    fatal = (KeyboardInterrupt, SystemExit, asyncio.CancelledError)
+    if isinstance(e, fatal):
+        return True
+    if isinstance(e, BaseExceptionGroup):
+        return e.subgroup(fatal) is not None
+    return False
+
+
+async def _attempt(coro, timeout, tag):
+    """Одна попытка тяжёлой SDK-стадии под таймаутом. Успех -> результат корутины
+    (кортеж (стоимость, ...)); НЕсмертельный сбой/таймаут -> печатает причину и отдаёт
+    None; смертельное (Ctrl+C/выход, в т.ч. в BaseExceptionGroup от anyio при крахе
+    CLI) — пробрасывает."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except BaseException as e:
+        if _fatal_exc(e):
+            raise
+        why = f"таймаут {int(timeout)}с" if isinstance(e, asyncio.TimeoutError) else str(e)[:70]
+        print(f"{tag}: {why}")
+        return None
+
+
+async def _wait_ram(min_gb, tag, max_wait=300):
+    """Бэк-прешер по памяти вместо 0xC0000409: перед тяжёлой стадией подождать, пока
+    свободная RAM не поднимется до min_gb (но не дольше max_wait сек — затем едем
+    дальше с предупреждением)."""
+    waited = 0
+    while True:
+        free = _free_ram_gb()
+        if free is None or free >= min_gb:
+            return
+        if waited == 0:
+            print(f"    {tag} [ОЗУ] свободно {free:.1f} ГБ < {min_gb:g} — жду высвобождения (до {max_wait}с)")
+        if waited >= max_wait:
+            print(f"    {tag} [ОЗУ] так и не освободилось ({free:.1f} ГБ) — продолжаю осторожно")
+            return
+        await asyncio.sleep(20)
+        waited += 20
+
+
+def _tmp_root():
+    """Базовая папка временных файлов/логов прогона: D:\\orq_tmp (C: тесный), иначе %TEMP%."""
+    if os.path.isdir("D:\\"):
+        d = os.path.join("D:\\", "orq_tmp")
+        os.makedirs(d, exist_ok=True)
+        return d
+    return tempfile.gettempdir()
+
+
+def _work_base(subdir):
+    """Путь к постоянной папке данных прогона рядом с temp: D:\\<subdir> (на C: мало
+    места) или %TEMP%\\<subdir>. Саму папку НЕ создаёт."""
+    return os.path.join("D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir(), subdir)
+
+
+class _Tee:
+    """Дублирование потока в файл: лог прогона переживает закрытую консоль и жёсткий крах."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+        self.flush()
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _findings_cache_path(name, inn):
+    """Файл кэша находок движка (переживает прогоны). Ключ — ИНН, фолбэк — имя."""
+    key = str(inn or "").strip() or DO._safe(name)[:60].replace(" ", "_")
+    if not key:
+        return ""
+    return os.path.join(_work_base("orq_cache"), f"findings_{key}.md")
+
+
+def _cached_findings(name, inn, ttl_h=None):
+    """Прочитать кэш находок, если он есть, содержателен (>200 симв.) и свеж.
+    ttl_h=None — возраст не проверять (например, боль для слайда 3 не протухает)."""
+    p = _findings_cache_path(name, inn)
+    try:
+        if p and os.path.isfile(p) and os.path.getsize(p) > 200:
+            if ttl_h is None or time.time() - os.path.getmtime(p) < ttl_h * 3600:
+                return open(p, encoding="utf-8", errors="replace").read()
+    except OSError:
+        pass
+    return ""
+
+
+REAL_PPTX_MIN = 60000   # заготовка _make_pptx ≈ 28 КБ; реальный дек с картинками — сотни КБ
+
+
+def _remote_state(comp_dir, names):
+    """Резюм: какие деливераблы уже лежат на Диске. Возвращает (docx_ok, pptx_ok).
+    Любая ошибка (нет папки/сеть/токен) -> (False, False): резюм просто не срабатывает,
+    компания честно переделывается."""
+    try:
+        sizes = DO._disk_client().list_file_sizes(comp_dir)
+    except Exception:
+        return False, False
+    bp, rc, pp = names
+    docx_ok = sizes.get(bp, 0) > 5000 and sizes.get(rc, 0) > 5000
+    pptx_ok = sizes.get(pp, 0) > REAL_PPTX_MIN
+    return docx_ok, pptx_ok
+
+
+def _outbox_dir():
+    """Папка отложенной заливки (переживает прогоны): сюда падают ГОТОВЫЕ файлы,
+    которые не удалось загрузить на Диск, — следующий прогон их доливает."""
+    base = _work_base("orq_outbox")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _outbox_defer(name, comp_dir, pairs):
+    """Сбой заливки: спрятать готовые файлы в outbox вместо удаления (деньги уже
+    потрачены). pairs=[(локальный путь, имя на Диске)]. Возвращает путь записи или ''."""
+    try:
+        entry = os.path.join(_outbox_dir(), f"{DO._safe(name)[:60]}_{int(time.time())}")
+        os.makedirs(entry, exist_ok=True)
+        files = []
+        for lp, rname in pairs:
+            if os.path.isfile(lp) and os.path.getsize(lp) > 5000:
+                shutil.move(lp, os.path.join(entry, rname))
+                files.append(rname)
+        if not files:
+            shutil.rmtree(entry, ignore_errors=True)
+            return ""
+        json.dump({"comp_dir": comp_dir, "files": files, "name": name},
+                  open(os.path.join(entry, "meta.json"), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        return entry
+    except Exception:
+        return ""
+
+
+def _flush_outbox(account=None):
+    """Долить на Диск всё, что предыдущие прогоны отложили в outbox.
+    Возвращает (залито_записей, осталось_записей)."""
+    base = _outbox_dir()
+    ok = fail = 0
+    for entry in sorted(os.listdir(base)):
+        d = os.path.join(base, entry)
+        mp = os.path.join(d, "meta.json")
+        if not os.path.isfile(mp):
+            continue
+        try:
+            meta = json.load(open(mp, encoding="utf-8"))
+            comp_dir = meta["comp_dir"]
+            DO.ensure_dir(comp_dir, account, set())
+            for rname in meta.get("files") or []:
+                lp = os.path.join(d, rname)
+                if os.path.isfile(lp):
+                    DO._upload(lp, f"{comp_dir}/{rname}", account, True)
+            shutil.rmtree(d, ignore_errors=True)
+            ok += 1
+            print(f"[outbox] долито: {meta.get('name') or entry} -> {comp_dir}")
+        except Exception as e:
+            fail += 1
+            print(f"[outbox] не долилось {entry}: {str(e)[:90]}")
+    return ok, fail
+
+
+async def _drain_outbox(account, label):
+    """Долить отложенное в outbox и отчитаться одной строкой (label — момент прогона:
+    «долив с прошлых прогонов» на старте или «финальный долив» в конце)."""
+    n_up, n_left = await asyncio.to_thread(_flush_outbox, account)
+    if n_up or n_left:
+        print(f"[outbox] {label}: {n_up} ок" + (f", {n_left} осталось" if n_left else ""))
+
+
 async def main():
     ap = argparse.ArgumentParser(
         description="Полная цепочка: сбор (RusProfile) + ресёрч (2 пресейл-документа) в папки Яндекс Диска")
@@ -458,6 +693,9 @@ async def main():
     ap.add_argument("--model", default="opus", help="opus (качество) | sonnet (дешевле)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
+    ap.add_argument("--redo", action="store_true",
+                    help="переделать даже компании, у которых на Диске уже лежат реальные "
+                         "документы (по умолчанию резюм их пропускает)")
     # 3-я стадия (one-page .pptx через скилл pptx) ВКЛючена ПО УМОЛЧАНИЮ. Отключить:
     # --no-presentation или GEN_PRESENTATION=0. Если предусловия (assets/*.png + soffice +
     # node + установленный скилл pptx) не выполнены — стадия мягко пропускается, два .docx
@@ -477,6 +715,16 @@ async def main():
     ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
                     help="не обогащать ЛПР прямыми контактами")
     a = ap.parse_args()
+    # Копия ВСЕГО вывода (stdout+stderr, включая трейсбеки) в файл: диагноз упавшего
+    # прогона не должен зависеть от того, сохранил ли кто-то консоль.
+    try:
+        log_path = os.path.join(_tmp_root(), time.strftime("run_%Y%m%d_%H%M%S.log"))
+        _log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+        sys.stdout = _Tee(sys.stdout, _log_fh)
+        sys.stderr = _Tee(sys.stderr, _log_fh)
+        print(f"[лог] копия вывода: {log_path}")
+    except OSError:
+        pass
     # Удобство: ОТРАСЛЬ можно указать позиционно (py orchestrator.py mining) — приравниваем
     # к --industries, если позиционный аргумент — не существующий путь, а ключ(и) отрасли.
     if not a.industries and a.leads and not os.path.exists(a.leads):
@@ -535,22 +783,28 @@ async def main():
     # Транзитная рабочая папка. Файлы здесь ВРЕМЕННЫЕ: после заливки на Я.Диск папка удаляется
     # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места, а стадия
     # .pptx пишет сюда же pdf+jpg на каждую компанию); если D: нет — системный %TEMP%.
-    _tmp_dir = None
-    if os.path.isdir("D:\\"):
-        _tmp_dir = os.path.join("D:\\", "orq_tmp")
-        os.makedirs(_tmp_dir, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix="orq_", dir=_tmp_dir)
+    tmp = tempfile.mkdtemp(prefix="orq_", dir=_tmp_root())
 
+    disk_cache = set()                      # кэш созданных путей Диска — общий на прогон
+    if not a.no_upload and not a.dry_run:   # сперва долить отложенное прошлыми прогонами
+        await _drain_outbox(a.account, "долив с прошлых прогонов")
     # верхние уровни (отрасль/категория) у первого агента уже есть; mkdir идемпотентный.
     if not a.no_upload:
-        cache = set()
-        await asyncio.to_thread(DO.ensure_dir, a.base, a.account, cache)
-        for lead in sel:
-            ind = DO._safe(DO.industry_folder(lead))
-            cat = DO._safe(DO.category_for(lead))
-            await asyncio.to_thread(DO.ensure_dir, f"{a.base}/{ind}/{cat}", a.account, cache)
+        try:
+            await asyncio.to_thread(DO.ensure_dir, a.base, a.account, disk_cache)
+            for lead in sel:
+                ind = DO._safe(DO.industry_folder(lead))
+                cat = DO._safe(DO.category_for(lead))
+                await asyncio.to_thread(DO.ensure_dir, f"{a.base}/{ind}/{cat}", a.account, disk_cache)
+        except Exception as e:
+            # сеть/Диск чихнули — НЕ валим прогон: недостающие уровни создадутся по-компанейски
+            print(f"[!] пред-создание папок на Диске: {str(e)[:90]} — продолжаю, создам по ходу")
 
     sem = asyncio.Semaphore(max(1, a.workers))
+    pptx_sem = asyncio.Semaphore(1)   # .pptx-стадия (LibreOffice+node+CLI) — строго по одной
+    min_ram = float(os.environ.get("ORQ_MIN_RAM_GB", "2.5"))
+    research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", "1800"))  # сек на попытку ресёрча
+    pptx_timeout = float(os.environ.get("ORQ_PPTX_TIMEOUT", "1200"))          # сек на попытку .pptx
 
     async def process(idx, lead):
         async with sem:
@@ -561,8 +815,26 @@ async def main():
             p_tmp = os.path.join(comp_tmp, "p.pptx")     # презентация (третий деливерабл)
             cost = 0.0
             findings = ""
-            have_pptx = False           # готова ли реальная .pptx у этой компании
+            have_pptx = False            # готова ли реальная .pptx у этой компании
+            skip_docx = False            # оба .docx уже на Диске (резюм) — доделываем только .pptx
+            keep_tmp = False             # файлы не удалось ни залить, ни отложить — temp не удалять
+            comp_dir = _company_dir(lead, a.base, dup_names)
+            dn = DO._safe(lead.get("name"))
+            bp_name, rc_name, pptx_name = _doc_names(dn)
             try:
+                # ---- РЕЗЮМ: не переделывать (и не переоплачивать) уже готовое на Диске ----
+                if not a.dry_run and not a.no_upload and not a.redo:
+                    docx_done, pptx_done = await asyncio.to_thread(
+                        _remote_state, comp_dir, (bp_name, rc_name, pptx_name))
+                    if docx_done and (pptx_done or not gen_pptx):
+                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: уже на Диске — пропуск (--redo, чтобы переделать)")
+                        return {"name": lead.get("name"), "ok": True, "cost": 0.0,
+                                "dir": comp_dir, "resumed": True, "pptx": pptx_done, "files": 0}
+                    if docx_done:
+                        skip_docx = True    # догоняем только презентацию
+                        findings = _cached_findings(lead.get("name"), lead.get("_inn"))
+                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже на Диске — делаю только .pptx")
+
                 if a.dry_run:
                     try:
                         await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
@@ -572,104 +844,139 @@ async def main():
                             have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
                     except Exception as e:
                         print(f"  [!] {lead.get('name')}: {e}")
-                        return {"name": lead.get("name"), "ok": False, "cost": cost}
+                        return {"name": lead.get("name"), "ok": False, "cost": cost, "why": "dry-run заглушки"}
                 else:
                     # ресёрч+писатель: ретраим до 3 раз ПО ФАКТУ отсутствия двух .docx — ловим И
-                    # исключения (0xC0000409 OOM / сеть), И «тихие» сбои, когда сессия вернулась БЕЗ
-                    # исключения, но писатель ничего не сохранил (idle-timeout стрима / "error result").
+                    # исключения (0xC0000409 OOM / сеть / таймаут зависшей сессии), И «тихие» сбои,
+                    # когда сессия вернулась без исключения, но писатель ничего не сохранил.
                     # Новая попытка = свежая сессия; частичные файлы чистим, чтобы стартовать начисто.
-                    ok_docx = False
-                    for attempt in range(3):
-                        try:
-                            cost, findings = await _research_one(lead, idx, d_tmp, s_tmp, a.model, a.person_enrich)
-                        except Exception as e:
-                            print(f"  [retry {attempt + 1}/3] {lead.get('name')}: {str(e)[:70]}")
-                        if (os.path.exists(d_tmp) and os.path.getsize(d_tmp) > 5000
-                                and os.path.exists(s_tmp) and os.path.getsize(s_tmp) > 5000):
-                            ok_docx = True
-                            break
-                        if attempt < 2:
-                            bp = os.path.getsize(d_tmp) if os.path.exists(d_tmp) else 0
-                            rc = os.path.getsize(s_tmp) if os.path.exists(s_tmp) else 0
-                            print(f"  [retry {attempt + 1}/3] {lead.get('name')}: писатель не сохранил "
-                                  f"оба .docx (bp={bp}б, rc={rc}б) — повтор")
-                            for _f in (d_tmp, s_tmp):
-                                if os.path.exists(_f):
-                                    try:
-                                        os.remove(_f)
-                                    except OSError:
-                                        pass
-                            await asyncio.sleep(4)
-                    if not ok_docx:
-                        print(f"  [!] {lead.get('name')}: писатель не сохранил оба документа за 3 попытки — пропуск")
-                        return {"name": lead.get("name"), "ok": False, "cost": cost}
+                    if not skip_docx:
+                        ok_docx = False
+                        for attempt in range(3):
+                            await _wait_ram(min_ram, f"[{idx}]")
+                            res = await _attempt(
+                                _research_one(lead, idx, d_tmp, s_tmp, a.model, a.person_enrich),
+                                research_timeout, f"  [retry {attempt + 1}/3] {lead.get('name')}")
+                            if res is not None:
+                                c1, findings = res
+                                cost += c1
+                            if (os.path.exists(d_tmp) and os.path.getsize(d_tmp) > 5000
+                                    and os.path.exists(s_tmp) and os.path.getsize(s_tmp) > 5000):
+                                ok_docx = True
+                                break
+                            if attempt < 2:
+                                bp = os.path.getsize(d_tmp) if os.path.exists(d_tmp) else 0
+                                rc = os.path.getsize(s_tmp) if os.path.exists(s_tmp) else 0
+                                print(f"  [retry {attempt + 1}/3] {lead.get('name')}: писатель не сохранил "
+                                      f"оба .docx (bp={bp}б, rc={rc}б) — повтор")
+                                _rm(d_tmp, s_tmp)
+                                await asyncio.sleep(4)
+                        if not ok_docx:
+                            print(f"  [!] {lead.get('name')}: писатель не сохранил оба документа за 3 попытки — пропуск")
+                            return {"name": lead.get("name"), "ok": False, "cost": cost,
+                                    "why": "писатель не сохранил .docx"}
 
-                    # Третья стадия (опц.). Сбой НЕ валит компанию — два .docx уже готовы.
-                    # Ретраим ПО ФАКТУ отсутствия .pptx (>5КБ): ловим и исключения (0xC0000409),
-                    # и «тихие» сбои — idle-timeout стрима / "error result" приходят ТЕКСТОМ, а не
-                    # исключением. Есть валидная .pptx после попытки — берём, не перегенерируем.
+                    # Третья стадия (опц.). Сбой НЕ валит компанию — .docx уже готовы/на Диске.
+                    # Ретраим ПО ФАКТУ отсутствия .pptx (>5КБ): ловим и исключения (0xC0000409,
+                    # таймаут), и «тихие» сбои. Стадия сериализована pptx_sem: LibreOffice+node+CLI —
+                    # самая прожорливая по RAM связка, две параллельно машина не тянет.
                     if gen_pptx:
                         remark = ""
-                        for attempt in range(3):
-                            try:
-                                p_cost, remark = await _presentation_one(lead, idx, p_tmp, a.model, findings)
-                                cost += p_cost
-                            except Exception as e:
-                                print(f"    [{idx}] [presentation retry {attempt + 1}/3]: {str(e)[:70]}")
-                            if os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000:
-                                break                       # дек готов
-                            if attempt < 2:
-                                print(f"    [{idx}] [presentation retry {attempt + 1}/3]: .pptx не получена — повтор")
-                                if os.path.exists(p_tmp):   # убрать недописанный перед повтором
-                                    try:
-                                        os.remove(p_tmp)
-                                    except OSError:
-                                        pass
-                                await asyncio.sleep(4)
+                        async with pptx_sem:
+                            for attempt in range(3):
+                                await _wait_ram(min_ram, f"[{idx}] [pptx]")
+                                res = await _attempt(
+                                    _presentation_one(lead, idx, p_tmp, a.model, findings),
+                                    pptx_timeout, f"    [{idx}] [presentation retry {attempt + 1}/3]")
+                                if res is not None:
+                                    p_cost, remark = res
+                                    cost += p_cost
+                                if os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000:
+                                    break                       # дек готов
+                                if attempt < 2:
+                                    print(f"    [{idx}] [presentation retry {attempt + 1}/3]: .pptx не получена — повтор")
+                                    _rm(p_tmp)                  # убрать недописанный перед повтором
+                                    await asyncio.sleep(4)
                         have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
                         # «замечание» по Булату печатаем ТОЛЬКО при реальном деке (иначе это текст ошибки API)
                         if have_pptx and remark and "API Error" not in remark and "error result" not in remark:
                             print(f"    [{idx}] [presentation] замечание: {remark[:300]}")
                         if not have_pptx:
-                            print(f"    [{idx}] [presentation] .pptx не получена (>5КБ) за 3 попытки — зальём только два .docx")
+                            print(f"    [{idx}] [presentation] .pptx не получена (>5КБ) за 3 попытки — "
+                                  + (".docx уже на Диске" if skip_docx else "зальём только два .docx"))
 
-                comp_dir = _company_dir(lead, a.base, dup_names)
-                dn = DO._safe(lead.get("name"))
-                bp_name, rc_name, pptx_name = _doc_names(dn)
-                if not a.no_upload:
+                pairs = [] if skip_docx else [(d_tmp, bp_name), (s_tmp, rc_name)]
+                if have_pptx:           # презентация — в ту же папку компании (если получилась)
+                    pairs.append((p_tmp, pptx_name))
+                if not a.no_upload and pairs:
                     try:
-                        await asyncio.to_thread(DO._mkdir, comp_dir, a.account)  # папка обычно уже есть
-                        await asyncio.to_thread(DO._upload, d_tmp, f"{comp_dir}/{bp_name}", a.account, True)
-                        await asyncio.to_thread(DO._upload, s_tmp, f"{comp_dir}/{rc_name}", a.account, True)
-                        if have_pptx:       # презентацию грузим в ту же папку компании (если получилась)
-                            await asyncio.to_thread(DO._upload, p_tmp, f"{comp_dir}/{pptx_name}", a.account, True)
+                        await asyncio.to_thread(DO.ensure_dir, comp_dir, a.account, disk_cache)
+                        for lp, rname in pairs:
+                            await asyncio.to_thread(DO._upload, lp, f"{comp_dir}/{rname}", a.account, True)
                     except Exception as e:
                         print(f"  [!] upload {lead.get('name')}: {e}")
-                        return {"name": lead.get("name"), "ok": False, "cost": cost}
-                print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}"
-                      + ("  +pptx" if have_pptx else "")
+                        # деньги уже потрачены: файлы НЕ удаляем, а откладываем в outbox на долив
+                        saved = await asyncio.to_thread(_outbox_defer, lead.get("name"), comp_dir, pairs)
+                        if saved:
+                            print(f"  [outbox] готовые файлы отложены: {saved} — будут долиты следующим прогоном")
+                            return {"name": lead.get("name"), "ok": False, "cost": cost, "why": "заливка на Диск (файлы в outbox)"}
+                        keep_tmp = True
+                        print(f"  [outbox] отложить не удалось — файлы остаются в {comp_tmp}")
+                        return {"name": lead.get("name"), "ok": False, "cost": cost,
+                                "why": "заливка на Диск", "kept": comp_tmp}
+                tag = "  +pptx" if have_pptx else ""
+                if skip_docx:
+                    tag += ("  (докинута только .pptx)" if have_pptx
+                            else "  (.pptx не вышла — на Диске прежние .docx)")
+                print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}" + tag
                       + (f"  (${cost:.2f})" if cost else ""))
                 return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": comp_dir,
-                        "pptx": have_pptx}
+                        "pptx": have_pptx, "files": len(pairs)}
             finally:
-                # транзит компании чистим СРАЗУ после заливки (не копим все 200 до конца —
+                # транзит компании чистим СРАЗУ после заливки/отложки (не копим все 200 до конца —
                 # минимальный локальный след). При --no-upload оставляем: файлы смотрят локально.
-                if not a.no_upload:
+                if not a.no_upload and not keep_tmp:
                     shutil.rmtree(comp_tmp, ignore_errors=True)
 
-    results = await asyncio.gather(*(process(i, l) for i, l in enumerate(sel)))
+    raw = await asyncio.gather(*(process(i, l) for i, l in enumerate(sel)),
+                               return_exceptions=True)   # сбой одной компании не валит прогон
+    results = []
+    for i, r in enumerate(raw):
+        if isinstance(r, BaseException):
+            if _fatal_exc(r):
+                raise r
+            print(f"  [!] {sel[i].get('name')}: необработанный сбой компании: {str(r)[:120]}")
+            r = {"name": sel[i].get("name"), "ok": False, "cost": 0.0, "why": "сбой процесса"}
+        results.append(r)
     ok = [r for r in results if r and r.get("ok")]
+    fails = [r for r in results if not (r and r.get("ok"))]
+    resumed = sum(1 for r in ok if r.get("resumed"))
     total = sum(r.get("cost") or 0 for r in results if r)
     n_pptx = sum(1 for r in ok if r.get("pptx"))
-    n_files = 2 * len(ok) + n_pptx           # два .docx на компанию + презентация там, где получилась
-    print(f"\n[ГОТОВО] компаний: {len(ok)}/{len(sel)} | файлов: {n_files}"
+    n_files = sum(r.get("files") or 0 for r in ok)   # реально сделанных/залитых в ЭТОТ прогон
+    print(f"\n[ГОТОВО] компаний: {len(ok)}/{len(sel)}"
+          + (f" (из них {resumed} по резюму, без затрат)" if resumed else "")
+          + f" | файлов за прогон: {n_files}"
           + (f" (в т.ч. {n_pptx} презентаций)" if n_pptx else "") + " "
           + ("(локально, без Диска) " if a.no_upload else f"в {a.base} ")
-          + (f"| стоимость ~${total:.2f}" if total else "| dry-run, $0"))
+          + (f"| стоимость ~${total:.2f}" if total else "| $0"))
+    if fails:
+        print(f"[ВНИМАНИЕ] {len(fails)} компаний остались БЕЗ свежих документов "
+              "(на Диске у них лежат заготовки ФАЗЫ 1):")
+        for r in fails:
+            print(f"  - {(r or {}).get('name')}: {(r or {}).get('why') or 'сбой'}")
+        print("  Повтори ту же команду: резюм пропустит готовые компании и доделает только эти.")
+    if not a.no_upload and not a.dry_run:
+        await _drain_outbox(a.account, "финальный долив")
+    kept = [r.get("kept") for r in results if r and isinstance(r, dict) and r.get("kept")]
     if a.no_upload:
         print(f"[локально] .docx/.pptx во временной папке: {tmp}")
+    elif kept:
+        print(f"[!] файлы {len(kept)} компаний не спасены в outbox — temp сохранён: {tmp}")
     else:
         shutil.rmtree(tmp, ignore_errors=True)
+    if sel and not ok and not a.dry_run:
+        raise SystemExit(3)   # системный провал: ни одной компании за весь прогон
 
 
 def _no_sleep(on=True):
