@@ -386,14 +386,13 @@ async def _presentation_one(lead, idx, p_tmp, model, findings=""):
     return cost, remark
 
 
-def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, out_xlsx):
-    """ФАЗА 1 (первый агент): RusProfile -> контакты -> отбор -> Excel -> папки+заготовки на Диске.
+def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
+    """ФАЗА 1 (первый агент): RusProfile -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
     Блокирующий (открывает Chrome; offscreen=True -> окно за экраном, не видно). Возвращает picked[]."""
     import math
     import source_rusprofile as RP
     import rusprofile_session as RPS
     import pipeline
-    from build_excel import build
 
     inds = [s.strip() for s in industries.split(",") if s.strip() in RP.INDUSTRY]
     if not inds:
@@ -401,7 +400,6 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     if not os.path.exists(RPS.COOKIES_FILE):
         raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
     per_ind = math.ceil(count / max(1, len(inds)))
-    json_out = os.path.splitext(out_xlsx)[0] + ".json"
 
     print(f"[1/2] RusProfile: {inds} | порог >{min_revenue / 1e9:g} млрд"
           + (f" | регион {region}" if region else ""))
@@ -437,9 +435,8 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("Контакты RusProfile закрыты — платная сессия протухла. Один раз: "
                          f"py rusprofile_session.py --login (сырой список уже сохранён: {json_out})")
     picked = pipeline._select(leads, count, inds)
-    build(picked, ("Лиды: " + ", ".join(inds))[:90], out_xlsx)
     pipeline._save(picked, json_out)
-    print(f"[1/2] собрано {len(picked)} | Excel: {out_xlsx}")
+    print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
     print("[1/2] раскладка папок+заготовок на Диске ...")
     DO.organize_to_disk(picked, base=base, account=account, log=print)   # папки создаёт ПЕРВЫЙ агент
     return picked
@@ -677,14 +674,18 @@ async def main():
     # --- ФАЗА 1: сбор (первый агент). Задаёшь --industries -> оркестратор сам соберёт лиды и создаст папки ---
     ap.add_argument("--industries", default=None,
                     help="ЗАПУСТИТЬ СБОР: отрасли через запятую (mining,construction,energy,...)")
-    ap.add_argument("--count", type=int, default=200, help="сколько лидов собрать (с --industries)")
+    ap.add_argument("--count", type=int, default=200,
+                    help="сколько лидов собрать ВСЕГО, суммарно по отраслям (с --industries)")
+    ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,
+                    help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
     ap.add_argument("--region", default=None, help="регион названием/аббревиатурой (с --industries)")
     ap.add_argument("--show-browser", dest="show_browser", action="store_true",
                     help="показать окно Chrome при сборе (по умолчанию СКРЫТО/headless)")
     ap.add_argument("--headless", action="store_true",
                     help=argparse.SUPPRESS)  # deprecated: headless теперь по умолчанию (флаг оставлен для совместимости)
-    ap.add_argument("--out", default=None, help="путь к .xlsx (с --industries)")
+    ap.add_argument("--out", default=None,
+                    help="путь к .json лидов (с --industries); Excel больше не создаётся")
     # --- общее + ФАЗА 2: ресёрч ---
     ap.add_argument("--base", default="disk:/Лиды")
     ap.add_argument("--account", default=None)
@@ -732,6 +733,12 @@ async def main():
         _keys = [s.strip() for s in a.leads.split(",") if s.strip()]
         if _keys and all(k in RP.INDUSTRY for k in _keys):
             a.industries, a.leads = ",".join(_keys), None
+    # «N на отрасль» перекрывает --count: итог = N × число валидных отраслей
+    if a.industries and a.per_industry:
+        import source_rusprofile as RP
+        _n = len([s for s in a.industries.split(",") if s.strip() in RP.INDUSTRY]) or 1
+        a.count = a.per_industry * _n
+        print(f"[объём] {a.per_industry} на отрасль × {_n} отраслей = {a.count} компаний всего")
     # режим окна сбора: по умолчанию headed, но ЗА ЭКРАНОМ (антибот RusProfile проходит,
     # окна не видно). --show-browser => видимое окно; --headless => без окна (может НЕ пройти антибот).
     headless = bool(a.headless)
@@ -741,10 +748,12 @@ async def main():
         mode = ("без окна (headless)" if headless
                 else "окно скрыто за экраном" if offscreen else "окно Chrome видно")
         print(f"=== ФАЗА 1: сбор лидов (RusProfile — {mode}) ===")
-        out_xlsx = a.out or os.path.join(r"D:\лиды", "leads_" + a.industries.replace(",", "_") + ".xlsx")
+        # --out терпимо принимает и старый .xlsx-путь: расширение всё равно станет .json
+        json_out = (os.path.splitext(a.out)[0] + ".json" if a.out
+                    else os.path.join(r"D:\лиды", "leads_" + a.industries.replace(",", "_") + ".json"))
         leads = await asyncio.to_thread(
             _collect, a.industries, a.count, a.min_revenue, a.region,
-            headless, offscreen, a.base, a.account, out_xlsx)
+            headless, offscreen, a.base, a.account, json_out)
     elif a.leads:                                     # готовый JSON — только ресёрч
         leads = json.load(open(a.leads, encoding="utf-8"))
     else:

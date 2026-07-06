@@ -399,10 +399,11 @@ def _is_locked(blob):
 
 
 def _is_transient(blob):
-    # транзиентные сетевые сбои (обрыв соединения, таймаут, 5xx шлюза) — стоит повторить
+    # транзиентные сбои: сеть (обрыв/таймаут), троттлинг 429 и 5xx самого Диска
+    # (включая 500 InternalServerError — Яндекс эпизодически отвечает им на mkdir) — повторяем
     keys = ("network", "error sending request", "timed out", "timeout",
             "connection", "reset", "temporarily", "temporary failure",
-            "handshake", "dns", "eof", " 502", " 503", " 504")
+            "handshake", "dns", "eof", " 429", " 500", " 502", " 503", " 504")
     return any(k in blob for k in keys)
 
 
@@ -430,9 +431,27 @@ def ensure_dir(path, account, cache):
 
 # --------------------------------- основное ---------------------------------
 
+def _put_stub(local, remote, account, overwrite=False):
+    """Залить заготовку. По умолчанию БЕЗ перезаписи: если файл на Диске уже есть
+    (в т.ч. РЕАЛЬНЫЙ документ прошлой ФАЗЫ 2 — резюм опирается на его размер),
+    не трогаем и не считаем ошибкой. Возвращает 1 (залито) / 0 (пропущено)."""
+    if overwrite:
+        _upload(local, remote, account, True)
+        return 1
+    try:
+        _upload(local, remote, account, False)
+        return 1
+    except RuntimeError as e:
+        if "уже есть" in str(e).lower():
+            return 0
+        raise
+
+
 def organize_to_disk(leads, base="disk:/Лиды", account=None, workers=4,
-                     overwrite=True, log=print):
-    """Разложить лиды по Диску. Возвращает сводку dict."""
+                     overwrite=False, log=print):
+    """Разложить лиды по Диску. Возвращает сводку dict.
+    overwrite=False (дефолт): заготовки НЕ перезаписывают уже существующие файлы —
+    повторный полный прогон не затирает реальные документы прошлых ФАЗ 2."""
     leads = [l for l in (leads or []) if l]
     if not leads:
         return {"companies": 0, "uploaded": 0, "errors": [], "by_category": {},
@@ -469,10 +488,10 @@ def organize_to_disk(leads, base="disk:/Лиды", account=None, workers=4,
         generate_strategy(lead, s_local)
         generate_presentation(lead, p_local)      # заготовка-презентация (паритет деливераблов)
         bp_name, rc_name, pptx_name = _doc_names(dn)
-        _upload(d_local, f"{comp_dir}/{bp_name}", account, overwrite)
-        _upload(s_local, f"{comp_dir}/{rc_name}", account, overwrite)
-        _upload(p_local, f"{comp_dir}/{pptx_name}", account, overwrite)
-        return 3
+        n = 0
+        for local, rname in ((d_local, bp_name), (s_local, rc_name), (p_local, pptx_name)):
+            n += _put_stub(local, f"{comp_dir}/{rname}", account, overwrite)
+        return n
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
