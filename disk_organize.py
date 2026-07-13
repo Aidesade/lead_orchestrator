@@ -40,7 +40,7 @@ def _doc_names(dn):
     Третий элемент (презентация) ДОЛЖЕН совпадать с orchestrator._doc_names."""
     return (f"{dn}_карта_бизнес-процессов.docx",
             f"{dn}_карта_ролей_и_контактов_пресейл.docx",
-            f"{dn}_презентация_Telepath.pptx")
+            f"{dn}_презентация_Telepatt.pdf")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -211,151 +211,95 @@ def generate_strategy(lead, path):
     _make_docx(path, P)
 
 
-def _make_pptx(path, title, lines):
-    """Записать МИНИМАЛЬНУЮ валидную .pptx (один слайд 16:9) без зависимости от
-    python-pptx — той же техникой, что и _make_docx (голый OOXML через zipfile).
-    Это ЗАГОТОВКА: настоящая 3-слайдовая презентация делается агентной стадией через
-    официальный скилл pptx. Текст пишем в заметках слайда (надёжный размер >5 КБ —
-    проходит общий гейт «реальный файл, а не болванка»)."""
+# Транслит для заготовки-PDF: базовые шрифты PDF (Helvetica/WinAnsi) кириллицу не несут,
+# а тащить сюда шрифтовый файл ради болванки незачем — модуль намеренно stdlib-only.
+# Настоящий one-pager кириллицу рендерит нормально (там Chromium + Google Fonts).
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya", "«": '"', "»": '"', "—": "-", "–": "-", "₽": "RUB", "№": "No",
+}
+
+
+def _ascii(text):
+    """Кириллица -> латиница; всё, что не влезло в ASCII, отбрасываем."""
+    out = []
+    for ch in str(text or ""):
+        low = ch.lower()
+        if low in _TRANSLIT:
+            t = _TRANSLIT[low]
+            out.append(t.upper() if ch.isupper() and t else t)
+        elif ord(ch) < 128:
+            out.append(ch)
+    return "".join(out)
+
+
+def _make_pdf(path, title, lines):
+    """Записать МИНИМАЛЬНЫЙ валидный PDF (одна страница A4) без зависимостей — голыми
+    объектами PDF, как _make_docx пишет голый OOXML.
+    Это ЗАГОТОВКА: настоящий one-pager делает стадия Kimi (orchestrator._onepager_one).
+    Размер держим в коридоре гейтов: >5 КБ (иначе примут за пустышку) и заведомо
+    < REAL_PDF_MIN=60 КБ (иначе резюм посчитает болванку готовым деливераблом)."""
     def esc(t):
-        return _xml_escape(t)
+        return _ascii(t).replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
 
-    NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
-    NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-    NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    # Текст страницы: заголовок + строки.
+    parts = ["BT", "/F1 16 Tf", "56 780 Td", f"({esc(title)}) Tj", "/F1 11 Tf", "0 -28 Td"]
+    for ln in lines:
+        if ln:
+            parts.append(f"({esc(ln)}) Tj")
+            parts.append("0 -18 Td")
+    parts.append("ET")
+    stream = "\n".join(parts).encode("latin-1", "replace")
 
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/ppt/presentation.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
-        '<Override PartName="/ppt/slides/slide1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
-        '<Override PartName="/ppt/slideLayouts/slideLayout1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml"/>'
-        '<Override PartName="/ppt/slideMasters/slideMaster1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml"/>'
-        '</Types>')
-    root_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'<Relationship Id="rId1" Type="{NS_R}/officeDocument" Target="ppt/presentation.xml"/>'
-        '</Relationships>')
-    # презентация 16:9 (12192000 x 6858000 EMU = 13.333"x7.5")
-    presentation = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<p:presentation xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
-        '<p:sldMasterIdLst><p:sldMasterId id="2147483648" r:id="rId1"/></p:sldMasterIdLst>'
-        '<p:sldIdLst><p:sldId id="256" r:id="rId2"/></p:sldIdLst>'
-        '<p:sldSz cx="12192000" cy="6858000"/>'
-        '<p:notesSz cx="6858000" cy="9144000"/></p:presentation>')
-    presentation_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'<Relationship Id="rId1" Type="{NS_R}/slideMaster" Target="slideMasters/slideMaster1.xml"/>'
-        f'<Relationship Id="rId2" Type="{NS_R}/slide" Target="slides/slide1.xml"/>'
-        '</Relationships>')
+    objs = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    ]
 
-    def _txt_body(paras):
-        body = []
-        for t, sz, bold in paras:
-            b = ' b="1"' if bold else ""
-            body.append(
-                '<a:p><a:r><a:rPr lang="ru-RU" sz="%d"%s/>'
-                '<a:t>%s</a:t></a:r></a:p>' % (sz, b, esc(t)))
-        return "".join(body)
+    buf = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for i, body in enumerate(objs, 1):
+        offsets.append(len(buf))
+        buf += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+    # Балласт комментарием (в PDF допустим где угодно): гейт «реальный файл» — строго >5 КБ,
+    # а сам PDF из пары строк текста весит меньше килобайта.
+    buf += b"% " + (b"zagotovka one-pager Telepatt - budet perezapisan stadiey Kimi. " * 120) + b"\n"
+    xref_at = len(buf)
+    buf += f"xref\n0 {len(objs) + 1}\n".encode()
+    buf += b"0000000000 65535 f \n"
+    for off in offsets:
+        buf += f"{off:010d} 00000 n \n".encode()
+    buf += (f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_at}\n%%EOF\n").encode()
 
-    paras = [(title, 2800, True)] + [(ln, 1400, False) for ln in lines if ln]
-    slide = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<p:sld xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
-        '<p:cSld><p:spTree>'
-        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
-        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
-        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
-        '<p:sp><p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>'
-        '<p:spPr><a:xfrm><a:off x="685800" y="685800"/><a:ext cx="10820400" cy="5486400"/></a:xfrm>'
-        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>'
-        '<p:txBody><a:bodyPr/><a:lstStyle/>' + _txt_body(paras) + '</p:txBody></p:sp>'
-        '</p:spTree></p:cSld><p:clrMapOvr><a:overrideClrMapping '
-        'bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" accent2="accent2" '
-        'accent3="accent3" accent4="accent4" accent5="accent5" accent6="accent6" '
-        'hlink="hlink" folHlink="folHlink"/></p:clrMapOvr></p:sld>')
-    slide_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'<Relationship Id="rId1" Type="{NS_R}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
-        '</Relationships>')
-    # минимальные мастер/лейаут — присутствуют только чтобы пакет открывался редакторами
-    slide_master = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<p:sldMaster xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}">'
-        '<p:cSld><p:spTree>'
-        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
-        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
-        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
-        '</p:spTree></p:cSld>'
-        '<p:clrMap bg1="lt1" tx1="dk1" bg2="lt2" tx2="dk2" accent1="accent1" '
-        'accent2="accent2" accent3="accent3" accent4="accent4" accent5="accent5" '
-        'accent6="accent6" hlink="hlink" folHlink="folHlink"/>'
-        '<p:sldLayoutIdLst><p:sldLayoutId id="2147483649" r:id="rId1"/></p:sldLayoutIdLst>'
-        '</p:sldMaster>')
-    slide_master_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'<Relationship Id="rId1" Type="{NS_R}/slideLayout" Target="../slideLayouts/slideLayout1.xml"/>'
-        '</Relationships>')
-    slide_layout = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<p:sldLayout xmlns:p="{NS_P}" xmlns:a="{NS_A}" xmlns:r="{NS_R}" type="blank" preserve="1">'
-        '<p:cSld name="Blank"><p:spTree>'
-        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
-        '<p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/>'
-        '<a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>'
-        '</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sldLayout>')
-    slide_layout_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        f'<Relationship Id="rId1" Type="{NS_R}/slideMaster" Target="../slideMasters/slideMaster1.xml"/>'
-        '</Relationships>')
-
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", root_rels)
-        z.writestr("ppt/presentation.xml", presentation)
-        z.writestr("ppt/_rels/presentation.xml.rels", presentation_rels)
-        z.writestr("ppt/slides/slide1.xml", slide)
-        z.writestr("ppt/slides/_rels/slide1.xml.rels", slide_rels)
-        z.writestr("ppt/slideMasters/slideMaster1.xml", slide_master)
-        z.writestr("ppt/slideMasters/_rels/slideMaster1.xml.rels", slide_master_rels)
-        z.writestr("ppt/slideLayouts/slideLayout1.xml", slide_layout)
-        z.writestr("ppt/slideLayouts/_rels/slideLayout1.xml.rels", slide_layout_rels)
-        # «балласт» БЕЗ сжатия (ZIP_STORED) — чтобы заготовка стабильно превышала гейт
-        # >5 КБ в orchestrator.process() (сжатый повторяющийся текст ужимается слишком сильно).
-        note = ("Заготовка презентации Telepath. Реальная 3-слайдовая .pptx делается "
-                "агентной стадией через официальный скилл pptx. " * 120)
-        z.writestr("docProps/_note.txt", note, compress_type=zipfile.ZIP_STORED)
+    with open(path, "wb") as f:
+        f.write(buf)
 
 
 def generate_presentation(lead, path):
-    """ЗАГОТОВКА презентации (третий деливерабл). Валидная .pptx >5 КБ, БЕЗ python-pptx.
-    Боевая 3-слайдовая презентация формируется агентной стадией _presentation_one через
-    официальный скилл pptx; здесь — паритет с двумя .docx для dry-run и раскладки ФАЗЫ 1."""
+    """ЗАГОТОВКА третьего деливерабла — валидный .pdf >5 КБ, БЕЗ зависимостей.
+    Боевой one-pager делает стадия Kimi (orchestrator._onepager_one); здесь — паритет
+    с двумя .docx для dry-run и раскладки ФАЗЫ 1. Текст транслитерирован (см. _ascii)."""
     rev = _fmt_money(lead.get("_revenue"))
     lines = [
-        "Презентация Telepath — заготовка",
-        f"Заказчик: {lead.get('name') or ''}",
-        f"ИНН: {lead.get('_inn', '')}   ОГРН: {lead.get('_ogrn', '')}",
-        f"Отрасль: {industry_folder(lead)}",
-        f"Ниша / ОКВЭД: {lead.get('niche', '')}",
-        f"Регион: {lead.get('_region', '')}",
-        f"Выручка: {rev} ₽ ({lead.get('_revenue_year', '')})",
-        "Боль (если известна): " + (lead.get("pain") or "(заполнить)"),
-        "— 3-слайдовая презентация будет сгенерирована стадией pptx. —",
+        "Zagotovka. Nastoyaschiy one-pager budet sgenerirovan stadiey Kimi.",
+        "",
+        f"Zakazchik: {lead.get('name') or ''}",
+        f"INN: {lead.get('_inn', '')}   OGRN: {lead.get('_ogrn', '')}",
+        f"Otrasl: {industry_folder(lead)}",
+        f"Nisha / OKVED: {lead.get('niche', '')}",
+        f"Region: {lead.get('_region', '')}",
+        f"Vyruchka: {rev} RUB ({lead.get('_revenue_year', '')})",
+        "Bol (esli izvestna): " + (lead.get("pain") or "(zapolnit)"),
     ]
-    _make_pptx(path, "Telepath — пресейл-презентация", lines)
+    _make_pdf(path, "Telepatt - presale one-pager (zagotovka)", lines)
 
 
 # --------------------------- коннектор Диска (python) ------------------------
@@ -483,13 +427,13 @@ def organize_to_disk(leads, base="disk:/Лиды", account=None, workers=4,
         dn = _safe(lead.get("name"))
         d_local = os.path.join(tmp, f"{idx}_d.docx")
         s_local = os.path.join(tmp, f"{idx}_s.docx")
-        p_local = os.path.join(tmp, f"{idx}_p.pptx")
+        p_local = os.path.join(tmp, f"{idx}_p.pdf")
         generate_dossier(lead, d_local)
         generate_strategy(lead, s_local)
-        generate_presentation(lead, p_local)      # заготовка-презентация (паритет деливераблов)
-        bp_name, rc_name, pptx_name = _doc_names(dn)
+        generate_presentation(lead, p_local)      # заготовка one-pager (паритет деливераблов)
+        bp_name, rc_name, pdf_name = _doc_names(dn)
         n = 0
-        for local, rname in ((d_local, bp_name), (s_local, rc_name), (p_local, pptx_name)):
+        for local, rname in ((d_local, bp_name), (s_local, rc_name), (p_local, pdf_name)):
             n += _put_stub(local, f"{comp_dir}/{rname}", account, overwrite)
         return n
 

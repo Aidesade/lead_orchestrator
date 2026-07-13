@@ -35,7 +35,6 @@ dry-run не требует ничего сверх stdlib.
 import argparse
 import asyncio
 import collections
-import glob
 import json
 import os
 import shutil
@@ -63,7 +62,7 @@ except Exception:
 def _doc_names(dn):
     return (f"{dn}_карта_бизнес-процессов.docx",
             f"{dn}_карта_ролей_и_контактов_пресейл.docx",
-            f"{dn}_презентация_Telepath.pptx")
+            f"{dn}_презентация_Telepatt.pdf")
 
 
 # Инструменты ресёрч-агента: оба документа (формат/схемы/промпт — из CRA).
@@ -74,27 +73,37 @@ ALLOWED = [
     "WebSearch", "WebFetch",
 ]
 
-# --- Стадия презентации (третий деливерабл, .pptx через официальный скилл pptx) ---
+# --- Стадия презентации (третий деливерабл: редакционный one-pager .pdf на Kimi) ---
+# Раньше здесь была брендированная .pptx (Claude SDK + официальный скилл pptx, LibreOffice/node).
+# Заменена на one-pager: модель Kimi по своему системному промпту выдаёт HTML -> Playwright -> PDF.
 ASSETS_DIR = os.path.join(SCRIPTS, "assets")
-LOGO_PNG = os.path.join(ASSETS_DIR, "citrt_logo.png")        # логотип АО «ЦИТ РТ»
-PHOTO_PNG = os.path.join(ASSETS_DIR, "bulat_zamaliev.png")   # фото Булата Замалиева
+PHOTO_PNG = os.path.join(ASSETS_DIR, "bulat_zamaliev.png")   # фото Булата Замалиева (вшивается в PDF)
 
-# Портативные инструменты скилла pptx на D: (LibreOffice/Poppler поставлены туда — C: переполнен).
-# Гейт и агентная сессия находят soffice/pdftoppm и здесь, а не только в системном PATH.
-_LO_DIRS = [r"D:\Apps\LibreOffice\program"]
-_POPPLER_DIRS = glob.glob(r"D:\Apps\poppler\poppler-*\Library\bin") or [r"D:\Apps\poppler"]
+# Стадия живёт в СОСЕДНЕЙ папке со СВОИМ venv: kimi-agent-sdk конфликтует по зависимостям с
+# claude-agent-sdk (pydantic-core), поэтому в один интерпретатор их ставить нельзя. Отсюда зовём
+# её подпроцессом venv-питона — это и есть «сведение двух SDK» в одном прогоне.
+KIMI_DIR = os.path.join(os.path.dirname(SCRIPTS), "lead_orchestrator_kimi")
+KIMI_PY = os.path.join(KIMI_DIR, ".venv_kimi", "Scripts", "python.exe")
+KIMI_CLI = os.path.join(KIMI_DIR, "onepager_kimi.py")
+
+# Endpoint провайдера Kimi. Ключ — KIMI_API_KEY, иначе GPLLM_API_KEY (так он задан на этой машине).
+# base_url/модель имеют рабочие дефолты, любой из них перекрывается env.
+KIMI_BASE_URL_DEFAULT = "https://gpllmkeeper.dtc.tatar/v1"
+KIMI_MODEL_DEFAULT = "kimi-k2.7-code"
 
 
-def _which_tool(name, extra_dirs):
-    """Найти CLI-инструмент (soffice/pdftoppm): сначала в PATH, потом в портативных папках на D:."""
-    p = shutil.which(name) or shutil.which(name + ".exe")
-    if p:
-        return p
-    for d in extra_dirs:
-        cand = os.path.join(d, name + ".exe")
-        if os.path.exists(cand):
-            return cand
-    return None
+def _kimi_key():
+    return (os.environ.get("KIMI_API_KEY") or os.environ.get("GPLLM_API_KEY") or "").strip()
+
+
+def _kimi_env():
+    """Окружение для подпроцесса стадии: ключ/endpoint/модель поверх текущего env."""
+    env = dict(os.environ)
+    env["KIMI_API_KEY"] = _kimi_key()
+    env.setdefault("KIMI_BASE_URL", KIMI_BASE_URL_DEFAULT)
+    env.setdefault("KIMI_MODEL_NAME", KIMI_MODEL_DEFAULT)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def _handle(lead):
@@ -254,30 +263,22 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
 
 
 def _presentation_prereqs():
-    """Готовность стадии презентации. Возвращает (ok: bool, reason: str).
+    """Готовность стадии one-pager. Возвращает (ok: bool, reason: str).
     reason — человекочитаемая русская причина пропуска (пусто при ok=True).
-    Деградируем мягко: НИКОГДА не валим компанию — просто пропускаем стадию.
-      - оба ассета-PNG (логотип + фото) на месте;
-      - на PATH есть soffice (LibreOffice) — скилл pptx им рендерит слайды для самопроверки;
-      - на PATH есть node — скилл pptx генерит .pptx через pptxgenjs;
-      - скилл pptx реально установлен (~/.claude/skills/pptx/SKILL.md или проектный .claude/skills)."""
-    if not os.path.exists(LOGO_PNG):
-        return False, "нет assets/citrt_logo.png"
+    Деградируем мягко: НИКОГДА не валим компанию — просто пропускаем стадию (два .docx делаются).
+      - соседняя папка lead_orchestrator_kimi со своим venv (kimi-agent-sdk + playwright);
+      - фото спикера (вшивается в PDF data-URI);
+      - ключ провайдера Kimi (KIMI_API_KEY или GPLLM_API_KEY)."""
+    if not os.path.isfile(KIMI_CLI):
+        return False, f"нет {KIMI_CLI} (стадия one-pager живёт в соседней папке lead_orchestrator_kimi)"
+    if not os.path.isfile(KIMI_PY):
+        return False, (f"нет venv Kimi: {KIMI_PY} "
+                       "(создай: py -m venv .venv_kimi && .venv_kimi\\Scripts\\python.exe -m pip "
+                       "install kimi-agent-sdk playwright — и применить патчи, см. CLAUDE.md той папки)")
     if not os.path.exists(PHOTO_PNG):
-        return False, "нет assets/bulat_zamaliev.png"
-    if not _which_tool("soffice", _LO_DIRS):
-        return False, "не найден soffice/LibreOffice (поставь LibreOffice или положи в D:\\Apps\\LibreOffice)"
-    if not _which_tool("pdftoppm", _POPPLER_DIRS):
-        return False, "не найден pdftoppm/Poppler (поставь Poppler или положи в D:\\Apps\\poppler)"
-    if not (shutil.which("node") or shutil.which("node.exe")):
-        return False, "не найден node на PATH (нужен Node.js + npm-пакет pptxgenjs для скилла pptx)"
-    # скилл pptx должен быть обнаружим: пользовательский каталог или проектный .claude/skills
-    user_skill = os.path.join(os.path.expanduser("~"), ".claude", "skills", "pptx", "SKILL.md")
-    proj_skill = os.path.join(SCRIPTS, ".claude", "skills", "pptx", "SKILL.md")
-    if not (os.path.exists(user_skill) or os.path.exists(proj_skill)):
-        return False, ("не установлен официальный скилл pptx "
-                       "(положи его в ~/.claude/skills/pptx или в .claude/skills/pptx проекта; "
-                       "источник: github.com/anthropics/skills/tree/main/skills/pptx)")
+        return False, "нет assets/bulat_zamaliev.png (фото спикера для one-pager)"
+    if not _kimi_key():
+        return False, "не задан ключ Kimi (KIMI_API_KEY или GPLLM_API_KEY)"
     return True, ""
 
 
@@ -300,93 +301,47 @@ def _main_pain(findings):
     return "\n".join(hits)[:1200]
 
 
-async def _presentation_one(lead, idx, p_tmp, model, findings=""):
-    """Третий деливерабл: 3-слайдовая брендированная .pptx через ОФИЦИАЛЬНЫЙ скилл pptx.
-    Это ОТДЕЛЬНАЯ агентная сессия (code-execution/Bash + скилл pptx), НЕ python-рендерер.
-    Слайды 1–2 фиксированы, слайд 3 (оффер) адаптируется под боль заказчика из находок.
-    Пишет итог в p_tmp. Возвращает (cost, remark): remark — фактическое «замечание»
-    про Булата/ЦИТ РТ, которое требует промпт (его НЕ глушим — печатаем в лог)."""
-    import company_research_agent as CRA
-    from claude_agent_sdk import (
-        ClaudeAgentOptions, ClaudeSDKClient,
-        ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
-    )
+async def _onepager_one(lead, idx, p_tmp, findings=""):
+    """Третий деливерабл: редакционный one-pager .pdf (Kimi -> HTML -> Playwright -> PDF).
 
+    Запускается ПОДПРОЦЕССОМ venv-питона соседней папки: kimi-agent-sdk и claude-agent-sdk
+    несовместимы по зависимостям и в одном интерпретаторе не живут (см. CLAUDE.md там же).
+    Канон листа (шапка/герой/фичи/спикер/футер) зашит в onepager_kimi.py; под компанию
+    пишется только блок «Одна проблема — одно решение» — его кормим болью из находок.
+
+    Пишет итог в p_tmp. Возвращает (cost, remark): cost=0.0 — стоимость Kimi считает
+    провайдер, наружу CLI её не отдаёт; remark — хвост вывода при неудаче (для лога)."""
     h = _handle(lead)
     industry = DO.industry_folder(lead) if hasattr(DO, "industry_folder") else (lead.get("niche") or "")
     pain = _main_pain(findings)
 
-    # Скилл pptx зовёт python/soffice/pdftoppm по имени из своих скриптов. На этой машине:
-    #   - soffice/pdftoppm лежат на D: (вне системного PATH);
-    #   - `python` в PATH — это Store-заглушка WindowsApps, а не настоящий интерпретатор.
-    # Прокидываем КАТАЛОГ НАСТОЯЩЕГО python (sys.executable) + папки D: в начало PATH процесса;
-    # дочерняя claude-сессия наследует это окружение, поэтому скилл найдёт рабочие бинарники.
-    _pydir = os.path.dirname(sys.executable)
-    _extra = [d for d in ([_pydir] + _LO_DIRS + _POPPLER_DIRS) if d and os.path.isdir(d)]
-    if _extra:
-        os.environ["PATH"] = os.pathsep.join(_extra) + os.pathsep + os.environ.get("PATH", "")
+    cmd = [KIMI_PY, KIMI_CLI, h["company_name"], "--out", p_tmp]
+    if industry:
+        cmd += ["--industry", industry]
+    if pain:
+        cmd += ["--pain", pain]
 
-    # Опции сессии. setting_sources/skills/cwd/add_dirs — поля современного SDK; строим
-    # защитно: если установлен старый SDK без какого-то kwargs — стадию мягко пропустим
-    # (не валим компанию). allowed_tools включает Bash + ФС-инструменты, нужные скиллу
-    # pptx (python/node/soffice, чтение ассетов, запись .pptx, рендер для самопроверки).
-    opt_kwargs = dict(
-        model=model,
-        system_prompt=CRA.PRESENTATION_SYSTEM,
-        allowed_tools=["Bash", "Read", "Write", "Edit", "Glob"],
-        permission_mode="bypassPermissions",   # headless: без зависаний на аппруве
-        setting_sources=["user", "project"],   # ОПТ-ИН в обнаружение скиллов (.claude/skills)
-        skills=["pptx"],                        # включить именно официальный скилл pptx
-        cwd=os.path.dirname(p_tmp) or SCRIPTS,  # рабочая папка = temp компании (туда же пишет вывод)
-        add_dirs=[ASSETS_DIR, os.path.dirname(p_tmp) or SCRIPTS],  # доступ к ассетам и temp
-        max_turns=80,
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=KIMI_DIR, env=_kimi_env(),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     try:
-        options = ClaudeAgentOptions(**opt_kwargs)
-    except TypeError as e:
-        # старый claude-agent-sdk без skills/setting_sources/add_dirs -> пропустить стадию
-        print(f"    [{idx}] [presentation] пропущено: SDK не поддерживает опции скиллов ({str(e)[:80]})")
-        return 0.0, ""
+        out, _ = await proc.communicate()
+    except (asyncio.CancelledError, BaseException):
+        # таймаут/Ctrl+C: не оставляем осиротевший python+chromium висеть в фоне
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
 
-    user_msg = (
-        "Сделай 3-слайдовую презентацию .pptx строго по системному промпту. "
-        "ВХОДНЫЕ ДАННЫЕ:\n"
-        f"- НАЗВАНИЕ КОМПАНИИ-ЗАКАЗЧИКА: {h['company_name']}\n"
-        f"- ЧЕМ ЗАНИМАЕТСЯ / ОТРАСЛЬ: {industry or '(уточни по названию)'}\n"
-        f"- ГЛАВНАЯ БОЛЬ (если знаю): {pain or '(сформулируй сам по отрасли заказчика)'}\n\n"
-        "ВЛОЖЕНИЯ (используй ИМЕННО эти файлы, абсолютные пути):\n"
-        f"- Логотип ЦИТ РТ (PNG): {LOGO_PNG}\n"
-        f"- Фото Булата Замалиева (PNG): {PHOTO_PNG}\n\n"
-        f"Итоговый файл .pptx сохрани СТРОГО по пути: {p_tmp}\n"
-        "Слайды 1–2 — фиксированы; слайд 3 (оффер) — адаптируй под заказчика и его боль. "
-        "В конце ОБЯЗАТЕЛЬНО приведи отдельным блоком «ЗАМЕЧАНИЕ:» — расхождение по должности "
-        "Булата Замалиева (ЦИТ РТ vs Минцифры РТ) и проверяемую альтернативу."
-    )
-
-    cost = 0.0
-    remark = ""
-    summary = ""
-    async with ClaudeSDKClient(options=options) as client:
-        await client.query(user_msg)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        summary += block.text
-                    elif isinstance(block, ToolUseBlock):
-                        print(f"    [{idx}] → {getattr(block, 'name', '')}")
-            elif isinstance(message, ResultMessage):
-                if message.result:
-                    summary = message.result
-                if getattr(message, "total_cost_usd", None):
-                    cost += message.total_cost_usd
-
-    # вытащить фактическое «замечание» (его НЕ подавляем — это требование промпта)
-    if summary:
-        import re
-        m = re.search(r"замечани[ея][:\s].*", summary, re.I | re.DOTALL)
-        remark = (m.group(0) if m else summary).strip()[:1500]
-    return cost, remark
+    text = (out or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        # не валим компанию: два .docx уже готовы, стадию просто ретрайнут/пропустят
+        tail = text[-400:] if text else f"код возврата {proc.returncode}"
+        print(f"    [{idx}] [onepager] неуспех: {tail}")
+        return 0.0, tail
+    return 0.0, ""
 
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
@@ -587,11 +542,11 @@ def _cached_findings(name, inn, ttl_h=None):
     return ""
 
 
-REAL_PPTX_MIN = 60000   # заготовка _make_pptx ≈ 28 КБ; реальный дек с картинками — сотни КБ
+REAL_PDF_MIN = 60000   # заготовка _make_pdf ≈ 10 КБ; реальный one-pager с фото — сотни КБ
 
 
 def _remote_state(comp_dir, names):
-    """Резюм: какие деливераблы уже лежат на Диске. Возвращает (docx_ok, pptx_ok).
+    """Резюм: какие деливераблы уже лежат на Диске. Возвращает (docx_ok, pdf_ok).
     Любая ошибка (нет папки/сеть/токен) -> (False, False): резюм просто не срабатывает,
     компания честно переделывается."""
     try:
@@ -600,8 +555,8 @@ def _remote_state(comp_dir, names):
         return False, False
     bp, rc, pp = names
     docx_ok = sizes.get(bp, 0) > 5000 and sizes.get(rc, 0) > 5000
-    pptx_ok = sizes.get(pp, 0) > REAL_PPTX_MIN
-    return docx_ok, pptx_ok
+    pdf_ok = sizes.get(pp, 0) > REAL_PDF_MIN
+    return docx_ok, pdf_ok
 
 
 def _outbox_dir():
@@ -634,6 +589,40 @@ def _outbox_defer(name, comp_dir, pairs):
         return ""
 
 
+def _upload_verified(local, comp_dir, rname, account=None):
+    """Залить файл и УБЕДИТЬСЯ, что он лёг: перечитать папку и сверить размер.
+
+    ⚠️ Не убирать эту проверку. Яндекс Диск наблюдался (2026-07-13) в двух режимах
+    молчаливого вранья: (1) рапортует «✓ Загружено», а файла на Диске нет вовсе;
+    (2) при overwrite=True рапортует успех, но СТАРЫЙ файл остаётся (md5/размер прежние).
+    Без сверки прогон считает компанию успешной, а на Диске — пусто или прошлая версия,
+    и резюм такую компанию уже не догонит (она числится сделанной).
+    При расхождении: сносим старый файл в Корзину (перезапись не работает) и льём заново.
+    """
+    want = os.path.getsize(local)
+    remote = f"{comp_dir}/{rname}"
+    last = 0
+    for attempt in range(3):
+        DO._upload(local, remote, account, True)
+        time.sleep(1.5)                       # дать Диску применить запись
+        try:
+            last = DO._disk_client().list_file_sizes(comp_dir).get(rname, 0)
+        except Exception:
+            last = 0
+        if last == want:
+            return
+        print(f"    [!] {rname}: Диск отрапортовал успех, а лежит {last} б вместо {want} б "
+              f"— перезаливаю ({attempt + 2}/3)")
+        if last:                              # старый файл мешает перезаписи — в Корзину
+            try:
+                DO._disk_client()._delete(remote, False)
+            except Exception:
+                pass
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"upload {remote}: файл не подтвердился на Диске "
+                       f"({last} б вместо {want} б) после 3 попыток")
+
+
 def _flush_outbox(account=None):
     """Долить на Диск всё, что предыдущие прогоны отложили в outbox.
     Возвращает (залито_записей, осталось_записей)."""
@@ -651,7 +640,8 @@ def _flush_outbox(account=None):
             for rname in meta.get("files") or []:
                 lp = os.path.join(d, rname)
                 if os.path.isfile(lp):
-                    DO._upload(lp, f"{comp_dir}/{rname}", account, True)
+                    # с проверкой чтением: иначе outbox «дольёт» в пустоту и сотрёт файлы
+                    _upload_verified(lp, comp_dir, rname, account)
             shutil.rmtree(d, ignore_errors=True)
             ok += 1
             print(f"[outbox] долито: {meta.get('name') or entry} -> {comp_dir}")
@@ -700,17 +690,16 @@ async def main():
     ap.add_argument("--redo", action="store_true",
                     help="переделать даже компании, у которых на Диске уже лежат реальные "
                          "документы (по умолчанию резюм их пропускает)")
-    # 3-я стадия (one-page .pptx через скилл pptx) ВКЛючена ПО УМОЛЧАНИЮ. Отключить:
-    # --no-presentation или GEN_PRESENTATION=0. Если предусловия (assets/*.png + soffice +
-    # node + установленный скилл pptx) не выполнены — стадия мягко пропускается, два .docx
-    # при этом делаются как обычно.
+    # 3-я стадия (one-pager .pdf на Kimi) ВКЛючена ПО УМОЛЧАНИЮ. Отключить: --no-presentation
+    # или GEN_PRESENTATION=0. Если предусловия (venv Kimi + фото + ключ) не выполнены —
+    # стадия мягко пропускается, два .docx при этом делаются как обычно.
     _pp_default = (os.environ.get("GEN_PRESENTATION", "1").strip().lower()
                    not in ("0", "false", "no", "off", "нет"))
     ap.add_argument("--presentation", dest="presentation", action="store_true",
                     default=_pp_default,
-                    help="3-я стадия .pptx через скилл pptx — ВКЛючена по умолчанию")
+                    help="3-я стадия: one-pager .pdf на Kimi — ВКЛючена по умолчанию")
     ap.add_argument("--no-presentation", dest="presentation", action="store_false",
-                    help="ОТКЛЮЧИТЬ 3-ю стадию (.pptx-презентацию)")
+                    help="ОТКЛЮЧИТЬ 3-ю стадию (one-pager .pdf)")
     _pe_default = (os.environ.get("PERSON_ENRICH", "1").strip().lower()
                    not in ("0", "false", "no", "off", "нет"))
     ap.add_argument("--person-enrich", dest="person_enrich", action="store_true", default=_pe_default,
@@ -771,7 +760,9 @@ async def main():
 
     print("\n=== ФАЗА 2: ресёрч (карта бизнес-процессов + карта ролей и контактов) ===")
     if not a.dry_run:
-        _lo, _hi, _what = ((3 * len(sel), int(4.5 * len(sel)), "2 .docx + .pptx")
+        # Оценка — по стоимости Claude-сессий (2 .docx). One-pager считает провайдер Kimi
+        # отдельно и наружу цену не отдаёт, поэтому в вилку он не входит.
+        _lo, _hi, _what = ((len(sel), 2 * len(sel), "2 .docx + one-pager .pdf (Kimi — отдельный счёт)")
                            if a.presentation else (len(sel), 2 * len(sel), "2 .docx"))
         print(f"[оценка] {len(sel)} компаний = ~${_lo}–${_hi} ({a.model}, {_what} на компанию). "
               "Число = --count (по умолч. 200).")
@@ -784,17 +775,17 @@ async def main():
 
     # Стадия презентации опциональна и включается флагом --presentation / GEN_PRESENTATION.
     # Готовность проверяем ОДИН раз заранее — иначе один и тот же скип спамил бы по компаниям.
-    gen_pptx = bool(a.presentation)
-    if gen_pptx:
+    gen_pdf = bool(a.presentation)
+    if gen_pdf:
         ok_pp, why_pp = _presentation_prereqs()
         if not ok_pp:
-            print(f"[presentation] стадия отключена: {why_pp}. Два .docx делаются как обычно.")
-            gen_pptx = False
+            print(f"[onepager] стадия отключена: {why_pp}. Два .docx делаются как обычно.")
+            gen_pdf = False
         else:
-            print("[presentation] стадия включена: по каждой компании будет 3-слайдовая .pptx.")
+            print("[onepager] стадия включена: по каждой компании будет one-pager .pdf (Kimi).")
     # Транзитная рабочая папка. Файлы здесь ВРЕМЕННЫЕ: после заливки на Я.Диск папка удаляется
-    # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места, а стадия
-    # .pptx пишет сюда же pdf+jpg на каждую компанию); если D: нет — системный %TEMP%.
+    # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места);
+    # если D: нет — системный %TEMP%.
     tmp = tempfile.mkdtemp(prefix="orq_", dir=_tmp_root())
 
     disk_cache = set()                      # кэш созданных путей Диска — общий на прогон
@@ -813,47 +804,49 @@ async def main():
             print(f"[!] пред-создание папок на Диске: {str(e)[:90]} — продолжаю, создам по ходу")
 
     sem = asyncio.Semaphore(max(1, a.workers))
-    pptx_sem = asyncio.Semaphore(1)   # .pptx-стадия (LibreOffice+node+CLI) — строго по одной
+    # One-pager легче прежней .pptx (нет LibreOffice+node — только вызов Kimi и рендер chromium),
+    # поэтому не сериализуем его намертво, но и не даём разойтись: каждая стадия = свой chromium.
+    pdf_sem = asyncio.Semaphore(max(1, int(os.environ.get("ORQ_ONEPAGER_CONCURRENCY", "2"))))
     min_ram = float(os.environ.get("ORQ_MIN_RAM_GB", "2.5"))
     research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", "1800"))  # сек на попытку ресёрча
-    pptx_timeout = float(os.environ.get("ORQ_PPTX_TIMEOUT", "1200"))          # сек на попытку .pptx
+    pdf_timeout = float(os.environ.get("ORQ_ONEPAGER_TIMEOUT", "900"))        # сек на попытку one-pager
 
     async def process(idx, lead):
         async with sem:
-            comp_tmp = os.path.join(tmp, str(idx))       # СВОЯ папка на компанию: изоляция .pptx-рендера
-            os.makedirs(comp_tmp, exist_ok=True)         # (slide-*.jpg/pdf не пересекаются между воркерами)
+            comp_tmp = os.path.join(tmp, str(idx))       # СВОЯ папка на компанию: изоляция рендера
+            os.makedirs(comp_tmp, exist_ok=True)         # (файлы воркеров не пересекаются)
             d_tmp = os.path.join(comp_tmp, "d.docx")
             s_tmp = os.path.join(comp_tmp, "s.docx")
-            p_tmp = os.path.join(comp_tmp, "p.pptx")     # презентация (третий деливерабл)
+            p_tmp = os.path.join(comp_tmp, "p.pdf")      # one-pager (третий деливерабл)
             cost = 0.0
             findings = ""
-            have_pptx = False            # готова ли реальная .pptx у этой компании
-            skip_docx = False            # оба .docx уже на Диске (резюм) — доделываем только .pptx
+            have_pdf = False             # готов ли реальный one-pager у этой компании
+            skip_docx = False            # оба .docx уже на Диске (резюм) — доделываем только one-pager
             keep_tmp = False             # файлы не удалось ни залить, ни отложить — temp не удалять
             comp_dir = _company_dir(lead, a.base, dup_names)
             dn = DO._safe(lead.get("name"))
-            bp_name, rc_name, pptx_name = _doc_names(dn)
+            bp_name, rc_name, pdf_name = _doc_names(dn)
             try:
                 # ---- РЕЗЮМ: не переделывать (и не переоплачивать) уже готовое на Диске ----
                 if not a.dry_run and not a.no_upload and not a.redo:
-                    docx_done, pptx_done = await asyncio.to_thread(
-                        _remote_state, comp_dir, (bp_name, rc_name, pptx_name))
-                    if docx_done and (pptx_done or not gen_pptx):
+                    docx_done, pdf_done = await asyncio.to_thread(
+                        _remote_state, comp_dir, (bp_name, rc_name, pdf_name))
+                    if docx_done and (pdf_done or not gen_pdf):
                         print(f"  ↷ [{idx}] {lead.get('name')[:40]}: уже на Диске — пропуск (--redo, чтобы переделать)")
                         return {"name": lead.get("name"), "ok": True, "cost": 0.0,
-                                "dir": comp_dir, "resumed": True, "pptx": pptx_done, "files": 0}
+                                "dir": comp_dir, "resumed": True, "pdf": pdf_done, "files": 0}
                     if docx_done:
-                        skip_docx = True    # догоняем только презентацию
+                        skip_docx = True    # догоняем только one-pager
                         findings = _cached_findings(lead.get("name"), lead.get("_inn"))
-                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже на Диске — делаю только .pptx")
+                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже на Диске — делаю только one-pager")
 
                 if a.dry_run:
                     try:
                         await asyncio.to_thread(DO.generate_dossier, lead, d_tmp)
                         await asyncio.to_thread(DO.generate_strategy, lead, s_tmp)
-                        if gen_pptx:        # паритет с .docx: в dry-run кладём валидную болванку .pptx
+                        if gen_pdf:         # паритет с .docx: в dry-run кладём валидную болванку .pdf
                             await asyncio.to_thread(DO.generate_presentation, lead, p_tmp)
-                            have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
+                            have_pdf = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
                     except Exception as e:
                         print(f"  [!] {lead.get('name')}: {e}")
                         return {"name": lead.get("name"), "ok": False, "cost": cost, "why": "dry-run заглушки"}
@@ -889,42 +882,36 @@ async def main():
                                     "why": "писатель не сохранил .docx"}
 
                     # Третья стадия (опц.). Сбой НЕ валит компанию — .docx уже готовы/на Диске.
-                    # Ретраим ПО ФАКТУ отсутствия .pptx (>5КБ): ловим и исключения (0xC0000409,
-                    # таймаут), и «тихие» сбои. Стадия сериализована pptx_sem: LibreOffice+node+CLI —
-                    # самая прожорливая по RAM связка, две параллельно машина не тянет.
-                    if gen_pptx:
-                        remark = ""
-                        async with pptx_sem:
+                    # Ретраим ПО ФАКТУ отсутствия .pdf (>5КБ): ловим и исключения (таймаут, краш
+                    # подпроцесса), и «тихие» сбои. Параллелизм ограничен pdf_sem: каждая стадия —
+                    # свой python + chromium (ORQ_ONEPAGER_CONCURRENCY, дефолт 2).
+                    if gen_pdf:
+                        async with pdf_sem:
                             for attempt in range(3):
-                                await _wait_ram(min_ram, f"[{idx}] [pptx]")
-                                res = await _attempt(
-                                    _presentation_one(lead, idx, p_tmp, a.model, findings),
-                                    pptx_timeout, f"    [{idx}] [presentation retry {attempt + 1}/3]")
-                                if res is not None:
-                                    p_cost, remark = res
-                                    cost += p_cost
+                                await _wait_ram(min_ram, f"[{idx}] [onepager]")
+                                await _attempt(
+                                    _onepager_one(lead, idx, p_tmp, findings),
+                                    pdf_timeout, f"    [{idx}] [onepager retry {attempt + 1}/3]")
                                 if os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000:
-                                    break                       # дек готов
+                                    break                       # one-pager готов
                                 if attempt < 2:
-                                    print(f"    [{idx}] [presentation retry {attempt + 1}/3]: .pptx не получена — повтор")
+                                    print(f"    [{idx}] [onepager retry {attempt + 1}/3]: .pdf не получен — повтор")
                                     _rm(p_tmp)                  # убрать недописанный перед повтором
                                     await asyncio.sleep(4)
-                        have_pptx = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
-                        # «замечание» по Булату печатаем ТОЛЬКО при реальном деке (иначе это текст ошибки API)
-                        if have_pptx and remark and "API Error" not in remark and "error result" not in remark:
-                            print(f"    [{idx}] [presentation] замечание: {remark[:300]}")
-                        if not have_pptx:
-                            print(f"    [{idx}] [presentation] .pptx не получена (>5КБ) за 3 попытки — "
+                        have_pdf = os.path.exists(p_tmp) and os.path.getsize(p_tmp) > 5000
+                        if not have_pdf:
+                            print(f"    [{idx}] [onepager] .pdf не получен (>5КБ) за 3 попытки — "
                                   + (".docx уже на Диске" if skip_docx else "зальём только два .docx"))
 
                 pairs = [] if skip_docx else [(d_tmp, bp_name), (s_tmp, rc_name)]
-                if have_pptx:           # презентация — в ту же папку компании (если получилась)
-                    pairs.append((p_tmp, pptx_name))
+                if have_pdf:            # one-pager — в ту же папку компании (если получился)
+                    pairs.append((p_tmp, pdf_name))
                 if not a.no_upload and pairs:
                     try:
                         await asyncio.to_thread(DO.ensure_dir, comp_dir, a.account, disk_cache)
                         for lp, rname in pairs:
-                            await asyncio.to_thread(DO._upload, lp, f"{comp_dir}/{rname}", a.account, True)
+                            # с проверкой чтением: «✓ Загружено» от Диска — не доказательство
+                            await asyncio.to_thread(_upload_verified, lp, comp_dir, rname, a.account)
                     except Exception as e:
                         print(f"  [!] upload {lead.get('name')}: {e}")
                         # деньги уже потрачены: файлы НЕ удаляем, а откладываем в outbox на долив
@@ -936,14 +923,14 @@ async def main():
                         print(f"  [outbox] отложить не удалось — файлы остаются в {comp_tmp}")
                         return {"name": lead.get("name"), "ok": False, "cost": cost,
                                 "why": "заливка на Диск", "kept": comp_tmp}
-                tag = "  +pptx" if have_pptx else ""
+                tag = "  +one-pager" if have_pdf else ""
                 if skip_docx:
-                    tag += ("  (докинута только .pptx)" if have_pptx
-                            else "  (.pptx не вышла — на Диске прежние .docx)")
+                    tag += ("  (докинут только one-pager)" if have_pdf
+                            else "  (one-pager не вышел — на Диске прежние .docx)")
                 print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}" + tag
                       + (f"  (${cost:.2f})" if cost else ""))
                 return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": comp_dir,
-                        "pptx": have_pptx, "files": len(pairs)}
+                        "pdf": have_pdf, "files": len(pairs)}
             finally:
                 # транзит компании чистим СРАЗУ после заливки/отложки (не копим все 200 до конца —
                 # минимальный локальный след). При --no-upload оставляем: файлы смотрят локально.
@@ -964,12 +951,12 @@ async def main():
     fails = [r for r in results if not (r and r.get("ok"))]
     resumed = sum(1 for r in ok if r.get("resumed"))
     total = sum(r.get("cost") or 0 for r in results if r)
-    n_pptx = sum(1 for r in ok if r.get("pptx"))
+    n_pdf = sum(1 for r in ok if r.get("pdf"))
     n_files = sum(r.get("files") or 0 for r in ok)   # реально сделанных/залитых в ЭТОТ прогон
     print(f"\n[ГОТОВО] компаний: {len(ok)}/{len(sel)}"
           + (f" (из них {resumed} по резюму, без затрат)" if resumed else "")
           + f" | файлов за прогон: {n_files}"
-          + (f" (в т.ч. {n_pptx} презентаций)" if n_pptx else "") + " "
+          + (f" (в т.ч. {n_pdf} one-pager'ов)" if n_pdf else "") + " "
           + ("(локально, без Диска) " if a.no_upload else f"в {a.base} ")
           + (f"| стоимость ~${total:.2f}" if total else "| $0"))
     if fails:
@@ -982,7 +969,7 @@ async def main():
         await _drain_outbox(a.account, "финальный долив")
     kept = [r.get("kept") for r in results if r and isinstance(r, dict) and r.get("kept")]
     if a.no_upload:
-        print(f"[локально] .docx/.pptx во временной папке: {tmp}")
+        print(f"[локально] .docx/.pdf во временной папке: {tmp}")
     elif kept:
         print(f"[!] файлы {len(kept)} компаний не спасены в outbox — temp сохранён: {tmp}")
     else:
