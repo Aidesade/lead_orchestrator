@@ -7,13 +7,13 @@ deep_research_engine — НАСТОЯЩИЙ глубокий ресёрч-дви
 
   1) АРХИТЕКТУРА supervisor + параллельные коллекторы по ИСТОЧНИКАМ
      (как langchain-ai/open_deep_research): {официальная база, сайт компании,
-     ЕИС/zakupki по ИНН, суды+СМИ, hh.ru} — каждый коллектор узко «вытащи всё
+     ЕИС/zakupki по ИНН, суды+СМИ, hh.ru, TAdviser} — каждый коллектор узко «вытащи всё
      поимённо из этого источника», запуск конкурентно через asyncio.Semaphore,
      затем синтез находок.
 
   2) ПЕТЛЯ ЦЕЛЕВОГО ДОБОРА (как dzhng/deep-research): после первого прохода
      completeness_critic считает НЕЗАПОЛНЕННЫЕ ячейки целевых таблиц
-     (leadership / branches / departments.contact / соцсети / ИТ-контакт) и
+     (leadership / branches / departments.contact / соцсети / ИТ-контакт / ИТ-ландшафт) и
      генерирует follow-up запросы РОВНО под эти пробелы, повторяя релевантные
      коллекторы, пока пробелы не закрыты или не исчерпан depth-бюджет.
 
@@ -77,6 +77,10 @@ DR_MAX_PAGES = int(os.environ.get("DR_MAXPAGES", "25"))       # кап стра�
 DR_LLM_CONCURRENCY = int(os.environ.get("DR_LLM_CONCURRENCY", "2"))   # параллельных sonnet CLI
 DR_CRAWL_CONCURRENCY = int(os.environ.get("DR_CRAWL_CONCURRENCY", "4"))  # параллельных HTTP-фетчей
 EXTRACT_MODEL = os.environ.get("DR_EXTRACT_MODEL", "sonnet")  # дешёвая модель для экстракта/критика
+# Провайдер LLM-экстракта: 'claude' (по умолч., claude-agent-sdk) или 'kimi' (OpenAI-совместимый
+# шлюз, тот же, что у писателя). 'kimi' нужен, когда Claude недоступен (прод в РФ / Docker) —
+# тогда ВЕСЬ пайплайн работает без Anthropic. Имя модели Kimi берётся из KIMI_MODEL_NAME.
+DR_LLM_PROVIDER = (os.environ.get("DR_LLM_PROVIDER", "claude") or "claude").strip().lower()
 DR_USE_LLM = os.environ.get("DR_USE_LLM", "1") not in ("0", "false", "no", "")
 DR_PAGE_CHARS = int(os.environ.get("DR_PAGE_CHARS", "9000"))  # кап текста страницы для LLM
 DR_MAX_DOMAINS = int(os.environ.get("DR_MAX_DOMAINS", "3"))   # подтверждённых сайтов на компанию
@@ -87,7 +91,10 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Ключевые слова релевантности (для Crawl4AI scorer и поиска подстраниц).
 KEYWORDS = ["контакт", "руководств", "филиал", "ДРСУ", "о компании", "реквизит",
             "закуп", "тендер", "структура", "сотрудник", "директор", "отдел",
-            "проектн", "институт", "ваканс"]
+            "проектн", "институт", "ваканс",
+            # ИТ-ландшафт (страницы TAdviser: «Проекты», «ИТ-системы», «Внедрения»)
+            "внедрен", "автоматизац", "цифров", "ит-систем", "информационные технологии",
+            "ERP", "CRM", "SAP", "1С", "ECM", "MES", "интегратор"]
 
 # Пути-кандидаты для HTTP-фолбэка (для не-Tilda сайтов; Tilda всё держит на главной).
 FALLBACK_PATHS = ("", "/contacts", "/kontakty", "/kontakty-i-rekvizity", "/contact",
@@ -100,7 +107,7 @@ AGGREGATORS = ("checko.ru", "list-org", "rusprofile", "audit-it", "zachestnyibiz
                "spark-interfax", "b2b.house", "tbank.ru", "tinkoff", "sbis.ru",
                "testfirm", "rbc.ru", "sudact", "kad.arbitr", "zakupki.gov",
                "clearspending", "hh.ru", "find-org", "ruscatalog", "czn-",
-               "bigorg", "ogrn", "vbankcenter", "synapsenet", "cmm.",
+               "bigorg", "ogrn", "vbankcenter", "synapsenet", "cmm.", "tadviser",
                # реальные нарушители из логов прогонов (карточки-каталоги за анти-ботом)
                "focus.kontur", "kontragent", "vbr.ru", "cataloxy", "tilbagevise",
                "e-disclosure", "cbr.ru", "saby.ru")
@@ -144,11 +151,18 @@ def _sem(name, n):
 # ============================================================================
 # НИЗКОУРОВНЕВОЕ: HTTP-фетч, html->текст, поиск (DuckDuckGo HTML)
 # ============================================================================
+def _host_headers(url):
+    """Заголовки под конкретный хост. TAdviser отдаёт 403 на ЛЮБОЙ русский Accept-Language
+    (проверено: 'ru', 'ru,en;q=0.8', 'ru-RU,...' -> 403; 'en-US,en;q=0.9' -> 200)."""
+    host = urlparse(url).netloc.lower()
+    lang = "en-US,en;q=0.9" if "tadviser.ru" in host else "ru,en;q=0.8"
+    return {"User-Agent": UA, "Accept-Language": lang, "Accept-Encoding": "gzip"}
+
+
 def _fetch_sync(url, timeout=12):
     """GET -> (final_url, text) или (url, '') при ошибке. Прозрачно жмёт gzip."""
     try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA, "Accept-Language": "ru,en;q=0.8", "Accept-Encoding": "gzip"})
+        req = urllib.request.Request(url, headers=_host_headers(url))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
             if r.headers.get("Content-Encoding") == "gzip":
@@ -387,15 +401,32 @@ def _email_role(email, source_url=""):
     return "personal"
 
 
+def _tadviser_project_system(url):
+    """«…/Проект:Северсталь_(Citeck_ECOS)» -> «Citeck ECOS». Заголовок статьи-проекта TAdviser
+    по соглашению = «<Компания> (<ИТ-система>)» — детерминированная страховка без LLM."""
+    title = urllib.parse.unquote(url or "").split("/index.php/", 1)[-1]
+    if not title.startswith("Проект:"):
+        return ""
+    m = re.search(r"\(([^()]{2,80})\)\s*\d*$", title.replace("_", " ").strip())
+    return m.group(1).strip() if m else ""
+
+
 def regex_findings(pages):
     """pages:[{url,markdown,source}] -> частичные находки БЕЗ LLM (с source URL у строк)."""
-    branches, social, emails, phones = [], [], [], []
+    branches, social, emails, phones, it_landscape = [], [], [], [], []
     seen_b, seen_s, seen_e, seen_p = set(), set(), set(), set()
 
     for pg in pages or []:
         url = pg.get("url", "")
         text = pg.get("markdown", "") or ""
         flat = re.sub(r"\s+", " ", text)
+
+        # ИТ-система из заголовка статьи-проекта TAdviser
+        if "tadviser" in (pg.get("source", "") + url):
+            sysname = _tadviser_project_system(url)
+            if sysname:
+                it_landscape.append({"system": sysname, "vendor": "", "year": "",
+                                     "note": "статья-проект TAdviser", "source": url})
 
         # филиалы
         for m in _BRANCH_RE.finditer(flat):
@@ -441,6 +472,7 @@ def regex_findings(pages):
         "branches": branches,
         "departments": [],
         "ecosystem": [],
+        "it_landscape": it_landscape,
         "contacts": {"phones": phones, "emails": emails, "social": social,
                      "address": "", "schedule": ""},
         "procurement": {"summary": "", "contacts": [], "source": ""},
@@ -473,6 +505,7 @@ def _merge_list(dst, src, key):
 def merge_findings(parts):
     """Слить список частичных находок в один документ (dedup по ключам, союз контактов)."""
     out = {"leadership": [], "branches": [], "departments": [], "ecosystem": [],
+           "it_landscape": [],
            "contacts": {"phones": [], "emails": [], "social": [], "address": "", "schedule": ""},
            "procurement": {"summary": "", "contacts": [], "source": ""},
            "project_institute": {}, "courts": [], "media": []}
@@ -487,6 +520,9 @@ def merge_findings(parts):
                     lambda x: re.sub(r"[^а-яёa-z]", "", str(x.get("block", "")).lower())[:40])
         _merge_list(out["ecosystem"], p.get("ecosystem"),
                     lambda x: re.sub(r"[^а-яёa-z0-9]", "", str(x.get("entity", "")).lower())[:50])
+        _merge_list(out["it_landscape"], p.get("it_landscape"),
+                    lambda x: re.sub(r"[^а-яёa-z0-9]", "",
+                                     (str(x.get("system", "")) + str(x.get("vendor", ""))).lower())[:50])
         c = p.get("contacts") or {}
         _merge_list(out["contacts"]["phones"], c.get("phones"), lambda x: _digits(x.get("phone")))
         _merge_list(out["contacts"]["emails"], c.get("emails"), lambda x: (x.get("email") or "").lower())
@@ -570,6 +606,16 @@ def completeness_critic(findings, name="", inn="", domain=""):
         followups.append({"goal": "it",
                           "query": f"{name} директор по ИТ цифровизация информационные технологии начальник"})
 
+    # 3b) ИТ-ландшафт: внедрённые системы/вендоры (TAdviser) — база под оффер LLM/RAG
+    it_landscape = findings.get("it_landscape") or []
+    has_it_landscape = bool(it_landscape)
+    if not has_it_landscape:
+        gaps.append("ИТ-ландшафт (внедрённые системы, вендоры, годы) не выявлен")
+        followups.append({"goal": "it_landscape",
+                          "query": f"site:tadviser.ru {_core_name(name)}"})
+        followups.append({"goal": "it_landscape",
+                          "query": f"{name} tadviser внедрение ERP CRM ИТ-система проект"})
+
     # 4) соцсети
     has_social = bool(contacts.get("social"))
     if not has_social:
@@ -597,6 +643,7 @@ def completeness_critic(findings, name="", inn="", domain=""):
     counts = {"branches_total": b_total, "branches_filled": b_filled,
               "leadership": len(leadership), "departments": len(departments),
               "has_tender": has_tender, "has_it": has_it, "has_social": has_social,
+              "has_it_landscape": has_it_landscape, "it_systems": len(it_landscape),
               "has_ecosystem": has_ecosystem, "ecosystem": len(ecosystem),
               "emails": len(contacts.get("emails") or []),
               "social": len(contacts.get("social") or []), "gaps": len(gaps)}
@@ -611,7 +658,9 @@ _EXTRACT_SYSTEM = (
     "для B2B-пресейла. На входе — текст реально загруженных страниц, КАЖДАЯ помечена "
     "строкой [URL: ...]. Извлекай ТОЛЬКО то, что дословно присутствует в тексте: ФИО, "
     "должности, телефоны, e-mail, адреса, соцсети, филиалы и их директоров, контактных "
-    "лиц закупок, проектный институт, суды/СМИ, а также ЭКОСИСТЕМУ — связи вертикали "
+    "лиц закупок, проектный институт, суды/СМИ, ИТ-ЛАНДШАФТ (внедрённые ИТ-системы: "
+    "название системы, вендор/интегратор, год внедрения — на страницах TAdviser это "
+    "таблицы проектов), а также ЭКОСИСТЕМУ — связи вертикали "
     "принятия решений: учредитель/собственник, курирующее ведомство/министерство, "
     "головные/материнские и сестринские организации, комиссии/советы, членство в "
     "группах/холдингах (relation — тип связи, person — ключевое лицо, если названо). "
@@ -623,6 +672,7 @@ _EXTRACT_SYSTEM = (
     '"branches":[{"branch":str,"director":str,"phone":str,"source":str}],'
     '"departments":[{"block":str,"contact":str,"relevance":str,"source":str}],'
     '"ecosystem":[{"entity":str,"relation":str,"person":str,"note":str,"source":str}],'
+    '"it_landscape":[{"system":str,"vendor":str,"year":str,"note":str,"source":str}],'
     '"contacts":{"phones":[{"phone":str,"source":str}],'
     '"emails":[{"email":str,"role":"tender|general|personal","source":str}],'
     '"social":[{"kind":str,"url":str,"source":str}],"address":str,"schedule":str},'
@@ -698,8 +748,50 @@ def _pages_blob(pages, max_total=24000):
     return "\n\n----\n\n".join(parts)
 
 
+async def _kimi_extract(system, prompt):
+    """LLM-экстракт через Kimi (OpenAI-совместимый шлюз, как у писателя). '' при сбое/без ключа.
+    Переиспользует env-хелперы writer_kimi (ключ/endpoint/модель) — единый источник настроек Kimi."""
+    try:
+        import writer_kimi as WK
+        from openai import AsyncOpenAI
+    except Exception as e:                          # noqa: BLE001
+        _note(f"Kimi недоступен для LLM-экстракта: {e}")
+        return ""
+    key = WK.kimi_key()
+    if not key:
+        _note("нет ключа Kimi (KIMI_API_KEY/GPLLM_API_KEY) для LLM-экстракта")
+        return ""
+    model = WK.kimi_model("kimi")
+    timeout = float(os.environ.get("DR_LLM_TIMEOUT", "300"))
+    max_tokens = int(os.environ.get("DR_KIMI_MAX_TOKENS", "8000"))
+    client = AsyncOpenAI(base_url=WK.kimi_base_url(), api_key=key, timeout=timeout, max_retries=0)
+    try:
+        async with _sem("llm", DR_LLM_CONCURRENCY):
+            for attempt in (1, 2):                  # 2-я попытка — без response_format (шлюз мог не принять)
+                kwargs = {
+                    "model": model,
+                    "messages": [{"role": "system", "content": system},
+                                 {"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens, "temperature": 0.2,
+                }
+                if attempt == 1:
+                    kwargs["response_format"] = {"type": "json_object"}
+                try:
+                    r = await client.chat.completions.create(**kwargs)
+                    return r.choices[0].message.content or ""
+                except Exception as e:              # noqa: BLE001 — сеть/шлюз/лимиты
+                    if attempt == 1:
+                        continue
+                    _note(f"Kimi LLM-экстракт не удался: {str(e)[:80]}")
+                    return ""
+    finally:
+        await client.close()
+    return ""
+
+
 async def llm_extract(pages, focus="", model=EXTRACT_MODEL):
-    """Сырые страницы -> структурный JSON находок через sonnet. {} при недоступности/сбое."""
+    """Сырые страницы -> структурный JSON находок. Провайдер — DR_LLM_PROVIDER
+    ('claude' через claude-agent-sdk, либо 'kimi'). {} при недоступности/сбое."""
     if not DR_USE_LLM or not pages:
         return {}
     blob = _pages_blob(pages)
@@ -707,8 +799,12 @@ async def llm_extract(pages, focus="", model=EXTRACT_MODEL):
         return {}
     prompt = (f"Источник: {focus}. Извлеки факты из загруженных страниц ниже в JSON по схеме "
               f"из системного промпта. Особое внимание: филиалы+их директора+телефоны, "
-              f"контактные лица закупок, соцсети, ИТ/цифровизация, проектный институт, "
+              f"контактные лица закупок, соцсети, ИТ/цифровизация, ИТ-ландшафт "
+              f"(системы/вендоры/годы внедрения — особенно на страницах tadviser.ru), проектный институт, "
               f"вертикаль/экосистема (учредитель, ведомство, сестринские структуры, комиссии).\n\n{blob}")
+    # Kimi-путь: тот же промпт, но через OpenAI-совместимый шлюз — весь пайплайн без Anthropic.
+    if DR_LLM_PROVIDER == "kimi":
+        return _extract_json(await _kimi_extract(_EXTRACT_SYSTEM, prompt))
     try:
         from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage,
                                       TextBlock, ResultMessage)
@@ -1116,6 +1212,108 @@ async def collect_courts_media(name, inn):
     return {"source": "courts_media", "pages": pages, "notes": [], "links": links}
 
 
+TADVISER_HOST = "https://www.tadviser.ru"
+_TADVISER_LINK_RE = re.compile(r'href="(/index\.php/(?:%D0%9A%D0%BE%D0%BC%D0%BF%D0%B0%D0%BD%D0%B8%D1%8F'
+                               r'|%D0%9F%D1%80%D0%BE%D0%B5%D0%BA%D1%82|Компания|Проект)[^"#]*)"', re.I)
+_OPF_PREFIX_RE = re.compile(r"\b(ПАО|ОАО|ЗАО|АО|ООО|НАО|ГУП|МУП|ФГУП|ФГБУ|ФКУ|ГБУ|МБУ|АНО|ПК|НПО|НПП)\b\.?",
+                            re.I)
+
+
+# Несуществующая статья TAdviser отдаёт HTTP 200 и ПЕЧАТАЕТ запрошенное название в шапке —
+# _text_belongs на ней проходит. Отличаем заглушку по тексту и объёму (реальная карточка
+# компании — десятки КБ; заглушка — ~5 КБ голой навигации).
+_TADVISER_STUB_RE = re.compile(r"недоступна\s+для\s+прос|стать[яи]\s+не\s+найдена", re.I)
+_TADVISER_MIN_CHARS = 5500  # замер: заглушка 5009-5022, реальная статья-проект 7318+, карточка 51486
+
+
+def _tadviser_is_stub(txt):
+    t = txt or ""
+    return bool(_TADVISER_STUB_RE.search(t)) or len(t) < _TADVISER_MIN_CHARS
+
+
+def _core_name(name):
+    """«ПАО "Алтай-Кокс"» -> «Алтай-Кокс»: без ОПФ и кавычек (заголовки статей TAdviser)."""
+    s = re.sub(r"[«»\"'`]", " ", str(name or ""))
+    s = _OPF_PREFIX_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip(" -–—,")
+
+
+def _tadviser_url(title):
+    return TADVISER_HOST + "/index.php/" + urllib.parse.quote(title.replace(" ", "_"))
+
+
+def _tadviser_title_matches(link, core):
+    """Заголовок статьи содержит ВСЕ значимые токены названия (поиск TAdviser нечёткий:
+    по «Алтай-Кокс» он выдаёт «Республика Алтай», «Алтай-Кабель» и т.п.)."""
+    title = urllib.parse.unquote(link).split("/index.php/", 1)[-1]
+    title = title.split(":", 1)[-1].replace("_", " ").lower()
+    toks = [t for t in re.split(r"[^а-яёa-z0-9]+", core.lower()) if len(t) >= 4]
+    return bool(toks) and all(t in title for t in toks)
+
+
+async def collect_tadviser(name, inn):
+    """TAdviser (tadviser.ru) — ИТ-ландшафт компании: внедрённые системы, вендоры/интеграторы,
+    ИТ-проекты по годам, ИТ-руководители. Ключевой источник под оффер LLM/RAG/ИИ-агентов.
+    Путь: прямая статья «Компания:<имя>» -> внутренний поиск вики -> веб-поиск site:tadviser.ru.
+    BEST-EFFORT: никогда не роняет пайплайн."""
+    core = _core_name(name)
+    if not core:
+        return {"source": "tadviser", "pages": [], "notes": ["TAdviser: пустое название"], "links": []}
+    pages, links, notes = [], [], []
+    sem = _sem("crawl", DR_CRAWL_CONCURRENCY)
+
+    async def _get(u, src):
+        async with sem:
+            g = await fetch_page(u)
+        if not g:
+            return False
+        txt = g.get("markdown") or ""
+        if _tadviser_is_stub(txt) or not _text_belongs(txt, name, inn):
+            return False
+        pages.append({**g, "source": src})
+        links.append(g.get("url") or u)
+        return True
+
+    # 1) прямая статья компании
+    got = await _get(_tadviser_url("Компания:" + core), "tadviser:company")
+
+    # 2) внутренний поиск вики (нечёткий -> фильтруем заголовки по всем токенам названия)
+    cand_company, cand_project = [], []
+    search_url = TADVISER_HOST + "/index.php?fulltext=1&search=" + urllib.parse.quote(core)
+    _, html = await asyncio.to_thread(_fetch_sync, search_url, 15)
+    for href in dict.fromkeys(_TADVISER_LINK_RE.findall(html or "")):
+        if not _tadviser_title_matches(href, core):
+            continue
+        u = TADVISER_HOST + href
+        if u in links:
+            continue
+        (cand_company if "%D0%9A" in href or "Компания" in href else cand_project).append(u)
+
+    if not got:
+        for u in cand_company[:2]:
+            got = await _get(u, "tadviser:company") or got
+    # 3) статьи-проекты («<Компания> (<ИТ-система>)») — это и есть перечень внедрений
+    for u in cand_project[:3]:
+        await _get(u, "tadviser:project")
+
+    # 4) фолбэк: веб-поиск по домену. ТОЛЬКО как источник URL — сниппеты в находки не идут.
+    #    Заголовок статьи обязан содержать все токены названия: _text_belongs здесь бессилен
+    #    (он пропускает по ЛЮБОМУ отличительному токену, а на 700-КБ обзоре TAdviser найдётся
+    #    и «алтай», и «промресурс» — проверено, обе страницы были чужими).
+    if not pages:
+        for r in (await web_search(f"site:tadviser.ru {core}", 5))[:3]:
+            path = urlparse(r["url"]).path
+            if "tadviser.ru" in urlparse(r["url"]).netloc.lower() \
+                    and _tadviser_title_matches(path, core):
+                await _get(r["url"], "tadviser:page")
+
+    if not pages:
+        notes.append("TAdviser: статья о компании не найдена (ИТ-ландшафт из tadviser.ru не собран)")
+    else:
+        _note(f"TAdviser: собрано страниц {len(pages)}")
+    return {"source": "tadviser", "pages": pages, "notes": notes, "links": links}
+
+
 async def collect_hh(name, inn):
     """hh.ru: профиль работодателя -> численность/стек/оргструктура (сниппеты + страница)."""
     pages = []
@@ -1189,6 +1387,7 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
     raws = await asyncio.gather(
         collect_site(domains), eis_by_inn(inn),
         collect_courts_media(name, inn), collect_hh(name, inn),
+        collect_tadviser(name, inn),
         return_exceptions=True)
     raws = [r for r in raws if isinstance(r, dict)]
     all_pages = [pg for r in raws for pg in r.get("pages", [])]
@@ -1295,6 +1494,18 @@ def consolidate(name, inn, domain, official_md, findings, crit,
                      f"{d.get('relevance', '')} [источник: {d.get('source', '')}]")
     L.append("")
 
+    itl = findings.get("it_landscape") or []
+    L.append("## ИТ-ландшафт: внедрённые системы, вендоры, годы (TAdviser и открытые источники)")
+    if itl:
+        L.append("| Система | Вендор / интегратор | Год | Примечание | Источник |")
+        L.append("|---|---|---|---|---|")
+        for x in itl[:20]:
+            L.append(f"| {x.get('system', '')} | {x.get('vendor', '') or '—'} | "
+                     f"{x.get('year', '') or '—'} | {x.get('note', '') or '—'} | {x.get('source', '')} |")
+    else:
+        L.append("- Внедрённые ИТ-системы на открытых страницах (вкл. tadviser.ru) не обнаружены.")
+    L.append("")
+
     pi = findings.get("project_institute") or {}
     if pi.get("name"):
         L.append("## Проектный институт / профильное подразделение")
@@ -1352,6 +1563,8 @@ def consolidate(name, inn, domain, official_md, findings, crit,
              f"(директор+телефон).")
     L.append(f"- Тендерный контакт: {'ЕСТЬ' if counts['has_tender'] else 'НЕ найден'}.")
     L.append(f"- ИТ/цифровизация: {'ЕСТЬ' if counts['has_it'] else 'НЕ выявлен (критичный пробел)'}.")
+    L.append(f"- ИТ-ландшафт (TAdviser): "
+             f"{'ЕСТЬ, систем ' + str(counts.get('it_systems', 0)) if counts.get('has_it_landscape') else 'НЕ выявлен'}.")
     L.append(f"- Соцсети: {'ЕСТЬ' if counts['has_social'] else 'НЕ найдены'}.")
     L.append(f"- Руководство сверх первого лица: строк {counts['leadership']}.")
     L.append(f"- Экосистема/вертикаль (учредитель/ведомство/сёстры-структуры): "

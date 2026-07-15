@@ -4,8 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Оркестратор лидогенерации для B2B-агентства, продающего **корпоративную on-premises
 LLM-платформу** (RAG-база знаний, автономные ИИ-агенты, ИИ-Коуч «Наставник»).
-Код проекта — в подпапке **`lead_orchestrator/`**. Платформа Windows, Python 3.12,
-запуск через `py`. Комментарии в коде — на русском.
+Ядро пайплайна — в подпапке **`lead_orchestrator/`**; рядом — изолированная стадия one-pager
+**`lead_orchestrator_kimi/`** (свой venv), веб-интерфейс **`web/`** и контейнеризация под прод
+(`Dockerfile`/`docker-compose.yml`). Корень репозитория — **`D:\lead_gen`**. Основная платформа —
+Windows, Python 3.12, запуск через `py`; прод-цель — Docker в Linux. Комментарии в коде — на русском.
 
 ## Что делает
 
@@ -48,6 +50,8 @@ py orchestrator.py mining --count 10              # явно 10
 py orchestrator.py "D:\лиды\leads_mining.json"
 # без 3-й стадии (one-pager .pdf), только 2 .docx:
 py orchestrator.py mining --no-presentation
+# писатель двух .docx на Kimi вместо Claude (дёшево/без Anthropic; веб-UI так делает по умолчанию):
+py orchestrator.py "D:\лиды\leads_mining.json" --model kimi
 # локально без заливки на Диск (файлы остаются в temp, путь печатается):
 py orchestrator.py "D:\лиды\leads_mining.json" --no-upload
 # дёшево проверить связку без LLM и без следов (заглушки обоих .docx; заглушка .pdf — если стоят предусловия стадии):
@@ -63,6 +67,12 @@ DR_USE_LLM=0 py deep_research_engine.py --company "АО Рязаньавтодо
 py deep_research_engine.py --crawl avtodor-rzn.ru # отладка: только краул сайта (SiteCrawler)
 # разовый логин RusProfile (cookie в .rp_cookies.json):
 py rusprofile_session.py --login
+# сбор лидов через Checko API (без браузера/антибота; годится для Docker/Linux) -> leads.json:
+py source_checko.py --industries processing --min-revenue 1e9 --region Татарстан --out leads.json
+# Docker (из корня D:\lead_gen; секреты в .env): собрать и прогнать 10 компаний:
+docker compose build && docker compose run --rm lead-orchestrator mining --count 10
+# веб-интерфейс (из корня): API + фронт (подробности web/README.md):
+py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev / npm run build
 ```
 
 Через ярлык/обёртку достаточно назвать **только отрасль** (`mining`, «добыча угля», «нефтегаз»…):
@@ -86,9 +96,13 @@ py rusprofile_session.py --login
 |---|---|
 | `orchestrator.py` | **главный вход** ФАЗА 1+2 (asyncio). `_collect` = ФАЗА 1; `_research_one` = ресёрч+2 .docx; `_onepager_one` = 3-я стадия (one-pager .pdf: ПОДПРОЦЕСС venv-питона `../lead_orchestrator_kimi`); `_presentation_prereqs` = venv Kimi + фото + ключ; `_kimi_env` = KIMI_API_KEY (фолбэк `GPLLM_API_KEY`) / KIMI_BASE_URL / KIMI_MODEL_NAME; `_no_sleep` блокирует сон Windows на время прогона |
 | `orchestrator_agent.py` | SDK-обёртка (NL→запуск `orchestrator.py` подпроцессом); дефолт count=200, презентация по умолчанию; прокидывает не все флаги CLI |
-| `../lead_orchestrator_kimi/` | **3-я стадия целиком** (свой venv, Kimi Agent SDK): `onepager_kimi.py` (канон-константы + CLI), `onepager_system.py` (промпт), `html_to_pdf.py` (HTML→PDF). Свой `CLAUDE.md` — читать перед правкой стадии |
+| `../lead_orchestrator_kimi/` | **3-я стадия целиком** (свой venv, Kimi Agent SDK): `onepager_kimi.py` (канон-константы + CLI), `onepager_system.py` (промпт), `html_to_pdf.py` (HTML→PDF), `requirements.txt` (лок: `kimi-agent-sdk==0.0.5` + `kimi-cli==1.12.0` + `playwright==1.60.0`), `patches/apply_patches.py` (один идемпотентный скрипт патчей venv, есть `--check`). Свой `CLAUDE.md` — читать перед правкой стадии |
+| `web/` (корень репо) | **веб-интерфейс** (FastAPI + React/Vite). `web/api` спавнит `orchestrator.py` подпроцессом и парсит его stdout в SSE-события (структурированных событий у оркестратора нет); один активный прогон (второй → 409). Свой `README.md` |
+| `Dockerfile` / `docker-compose.yml` / `DEPLOY_TIMEWEB.md` (корень) | **контейнеризация под Timeweb Cloud (Москва)**. Два venv в образе (основной + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен (источник — Checko). Сборка = build-gate (`py_compile`, офлайн `test_deep_research.py`, `apply_patches.py --check`). `AUDIT_KIMI.md` — аудит стадии Kimi |
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк, PNG не нужен |
 | `company_research_agent.py` (CRA) | **формат документов и промпты**: `PRESALE_SYSTEM` (промпт `PRESENTATION_SYSTEM` удалён вместе с .pptx-стадией), рендереры `_write_process_map_docx`/`_write_roles_contacts_docx`, схемы `PROCESS_MAP_SCHEMA`/`ROLES_CONTACTS_SCHEMA` (в карте ролей с 2026-07-06 — секция `ecosystem_table` «Экосистема и вертикаль принятия решений»; писателю разрешена доверка по ЛЮБЫМ существенным пробелам, не только ИТ/тендер), тул `deep_research`, триаж stage-1; CLI-режим `--contacts`; standalone-модели захардкожены (писатель opus, триаж sonnet) — `--model` оркестратора на CRA-CLI не влияет |
+| `writer_kimi.py` | **альтернативный писатель двух .docx на Kimi** (`--model kimi`). НЕ агент: инструментов нет, ресёрч уже выполнен движком → модель ОДНИМ HTTP-вызовом (OpenAI-совместимый `openai`, БЕЗ kimi-agent-sdk → тот же основной venv) возвращает JSON по ТЕМ ЖЕ схемам CRA, рендерят ТЕ ЖЕ `CRA._write_*_docx`. `is_kimi`/`kimi_model` зовёт `orchestrator` ещё на разборе флагов, поэтому CRA импортится лениво. Env: `KIMI_WRITER_MODEL`→`KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`), `KIMI_WRITER_MAX_TOKENS`/`_TIMEOUT`/`_ATTEMPTS`. Следствие: у Kimi-писателя НЕТ веб-инструментов — качество ограничено полнотой находок движка |
+| `source_checko.py` | **источник лидов через Checko API — замена RusProfile без браузера/антибота** (обычный HTTPS). Drop-in для `source_rusprofile.harvest()`. В `_collect` НЕ подключён (оркестратор всё ещё зовёт RusProfile) — это отдельный CLI/Docker-путь: делает `leads.json`, который потом кормится ФАЗЕ 2. ⚠️ ОКВЭД матчится ТОЧНО (не префиксом) и не короче NN.NN — отрасли уровня NN.N через Checko не работают, пока коды не разложены (готовы `processing`, `opk`); выручки в /search нет → добор из ГИР БО + фильтр порогом в коде; ИП (`obj=org`) не попадают |
 | `deep_research_engine.py` | **настоящий deep-research**: supervisor — шаг-0 официальная база (`official_lookup`, блокирующе) + 4 параллельных коллектора (site/eis/courts_media/hh), Crawl4AI BestFirst (PRIMARY) → HTTP-фолбэк, петля целевого добора пустых ячеек, `completeness_critic` (в т.ч. ячейка «экосистема»: учредитель/ведомство/сёстры-структуры/комиссии — добавлено 2026-07-06), `consolidate` (у строк source URL); сбой supervisor'а пайплайн не роняет. Поиск — мульти-бэкенд brave→ddg→bing (ротация, кулдаун 90 с на 429). **Мульти-домен** (2026-07-06): `discover_domains` подтверждает до `DR_MAX_DOMAINS`=3 сайтов (у госструктур свой сайт + ведомственный портал), краулятся все (доп. — половинный кап страниц); дополнительные домены — строго по ИНН на странице либо по полной фразе названия в SERP-сниппете, когда портал не отдаётся HTTP (анти-бот; краул сделает Crawl4AI); карточки-каталоги режутся блок-листом `AGGREGATORS` и формой URL (глубокий путь/query = отказ). Валидация `_text_belongs` для «родовых» названий («Центр информационных технологий») требует ПОЛНУЮ фразу или ИНН — одиночное слово матчило и Центробанк (кейс cbr.ru); отличительные токены — по границе слова. Чужой ДОСТУПНЫЙ `website` из Фазы-1 отбрасывается, недоступный берётся как есть |
 | `source_rusprofile.py` | сбор RusProfile по ОКВЭД (uc, антибот); карта `INDUSTRY` (21 отрасль); строгий фильтр выручки; `parse_region_query` — регион-фильтр с отрицанием («НЕ Москва», списки через запятую) |
 | `rusprofile_session.py` | контакты с платного аккаунта (cookie; `--login`) |
@@ -117,8 +131,12 @@ py rusprofile_session.py --login
    ВКЛ по умолчанию (`--no-person-enrich` / `PERSON_ENRICH=0`); SMTP-проверка email
    (`PERSON_VERIFY_EMAIL=1`) и соцпоиск (`PERSON_SOCIAL=1`) по умолчанию ВЫКЛ — чтобы 200-прогон
    был быстрым и не долбил чужие серверы.
-3. **Писатель** (opus, `PRESALE_SYSTEM`) получает находки и обязан вызвать ОБА `save_*_docx`;
-   есть нудж-ретрай, если не сохранил.
+3. **Писатель.** Развилка по `--model` (`writer_kimi.is_kimi`): **Claude** (`opus`/`sonnet`,
+   `PRESALE_SYSTEM`) — агент с инструментами, получает находки и обязан вызвать ОБА `save_*_docx`
+   (есть нудж-ретрай, если не сохранил); либо **Kimi** (`--model kimi`, `writer_kimi.write_two_docx`)
+   — не агент, ОДИН JSON-вызов по тем же схемам → те же рендереры (см. карту кода). CLI-дефолт —
+   `opus`; веб-UI по умолчанию `kimi`. На Kimi долларовая вилка `[оценка]` не печатается (цену за
+   вызов шлюз наружу не отдаёт → итог `$0`, это не баг).
 4. **Гард против болванок:** заливаются только реальные .docx (>5000 байт, проверка в `process()`);
    иначе компания = неуспех.
 
@@ -127,7 +145,8 @@ python-рендерер: оркестратор запускает **ПОДПР�
 `../lead_orchestrator_kimi/.venv_kimi/Scripts/python.exe onepager_kimi.py <компания> --industry …
 --pain … --out <p.pdf>`. Так решено сведение двух SDK: `kimi-agent-sdk` тянет `pydantic-core 2.41.5`,
 а `claude-agent-sdk`/`anthropic` требуют `2.46.4` — в одном интерпретаторе они не живут, поэтому
-Kimi-стадия изолирована в своём venv (детали и ДВА обязательных патча venv — в `CLAUDE.md` той папки).
+Kimi-стадия изолирована в своём venv (зависимости пиннятся `lead_orchestrator_kimi/requirements.txt`,
+патчи venv накатывает ОДИН идемпотентный `patches/apply_patches.py` — детали в `CLAUDE.md` той папки).
 Боль берётся из находок ресёрча (`_main_pain`) и идёт в единственный вариативный блок листа.
 Гард: заливается только реальный .pdf (>5000 байт); сбой стадии НЕ валит компанию (2 .docx уже готовы),
 ретрай 3×, таймаут `ORQ_ONEPAGER_TIMEOUT`. Стоимость Kimi считает провайдер — CLI её наружу не отдаёт,
@@ -188,7 +207,9 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
 - Пресейл-брендинг (.docx): `PRESALE_VENDOR` (строка «Подготовлено для», по умолчанию пусто),
   `PRESALE_PLATFORM_DESC`.
 - **Стадия one-pager (.pdf):** живёт в `../lead_orchestrator_kimi/` — нужны её venv
-  (`.venv_kimi` с `kimi-agent-sdk` + `playwright`, **плюс ДВА патча venv** — см. `CLAUDE.md` там),
+  (`.venv_kimi`: `kimi-agent-sdk==0.0.5` + `kimi-cli==1.12.0` + `playwright==1.60.0` по
+  `requirements.txt`, **плюс патчи venv** через `patches/apply_patches.py` — см. `CLAUDE.md` там;
+  пин НЕ снимать: без него резолвер ставил kimi-cli 1.12, а патч бил вслепую под 1.4x → `TypeError`),
   фото `lead_orchestrator/assets/bulat_zamaliev.png` и **ключ провайдера Kimi**: `KIMI_API_KEY`,
   а если его нет — `GPLLM_API_KEY` (так он задан на этой машине). `KIMI_BASE_URL`
   (дефолт `https://gpllmkeeper.dtc.tatar/v1`) и `KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`)
@@ -216,6 +237,37 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   `ORQ_FINDINGS_TTL_H` (72). Служебные папки:
   `D:\orq_cache` (кэш находок движка), `D:\orq_outbox` (недолитые на Диск файлы — доливаются
   следующим прогоном), `D:\orq_tmp\run_*.log` (логи прогонов).
+- **Портируемость путей (для Docker/Linux; на Windows работают дефолты):** `ORQ_DATA_ROOT`
+  (корень служебных папок; в контейнере `/data`), `ORQ_LEADS_DIR` (дефолт `D:\лиды` / `/data/leads`),
+  `RUSPROFILE_PROFILE_DIR` / `RUSPROFILE_COOKIES_FILE` (иначе — абсолютные пути с именем `abalb`
+  внутри копии-скилла, см. «Подводные камни»), `KIMI_DIR` / `KIMI_PY` (папка и python-бинарь
+  venv стадии Kimi). Веб-обвязка читает ещё `ORQ_REPO_ROOT` / `ORQ_PYTHON` / `ORQ_DISK_BASE`.
+- **Kimi-писатель (`--model kimi`):** ключ — тот же `KIMI_API_KEY`→`GPLLM_API_KEY`; модель —
+  `KIMI_WRITER_MODEL`→`KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`); плюс `KIMI_WRITER_MAX_TOKENS`
+  (16000), `KIMI_WRITER_TIMEOUT` (600), `KIMI_WRITER_ATTEMPTS` (3).
+- **`.env.example` в репо нет** — обязательный состав секретов нигде не перечислен единым списком
+  (для Docker минимум: `KIMI_API_KEY`, `YANDEX_DISK_TOKEN`, опц. `DADATA_TOKEN`/`CHECKO_TOKEN`).
+
+## Развёртывание и веб-интерфейс (добавлено 2026-07-14)
+
+- **Docker / Timeweb Cloud** (`Dockerfile`, `docker-compose.yml`, `DEPLOY_TIMEWEB.md`). Целевой
+  прод — сервер в Москве (все внешние сервисы российские; Россия вне supported-countries Anthropic
+  → на прод-сервере Claude не жилец, писатель переносится на Kimi). Образ x86-64-only
+  (`google-chrome-stable` был amd64). Два venv (`/opt/venv` + `/opt/kimi-venv`), конфликт
+  `pydantic-core` сохраняется. **Chrome/Xvfb из образа убраны** → `source_rusprofile` в контейнере
+  неработоспособен; источник лидов там — `source_checko.py` (HTTPS, без антибота). Chromium в образе
+  остаётся (headless, Playwright) — им краулит Crawl4AI и рендерит PDF one-pager. Сборка — build-gate:
+  падает, если `py_compile`/`test_deep_research.py`/`apply_patches.py --check`/импорт стадии не прошли.
+  ⚠️ Главный операционный риск не решается кодом — антибот RusProfile против IP дата-центра
+  (см. `DEPLOY_TIMEWEB.md §3`); на Checko-пути он неактуален.
+- **Веб-интерфейс** (`web/`, FastAPI + React/Vite; свой `README.md`). Своей БД нет — источник правды
+  тот же, что у CLI (`ORQ_LEADS_DIR`, кэш находок, Яндекс Диск); журнал прогонов — `web_jobs/<id>/`.
+  `web/api` **спавнит `orchestrator.py` подпроцессом** (импортировать нельзя — `main()` забирает
+  stdout под `_Tee` и зовёт `sys.exit`) и парсит русский stdout в SSE-события (`events.py`;
+  структурированных событий нет, префиксы стабильны — тест `web/api/test_events.py` на реальных логах).
+  Один активный прогон (второй → `409`: параллельные прогоны не залочены и не безопасны). Объём —
+  через `--per-industry` (UI показывает `N × отраслей`), не `--count`. Выставлять API наружу без
+  авторизации нельзя — он запускает платные прогоны.
 
 ## Подводные камни
 
@@ -272,8 +324,10 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
 ## Конвенции
 
 - Python 3.12, запуск `py`. Комментарии и строки — на русском, под стиль соседнего кода.
-- Git: репозиторий — **внутри `lead_orchestrator/`** (origin `github.com/Aidesade/lead_orchestrator`,
-  ветка `master`; сообщения коммитов на русском); корень `D:\lead_gen` — НЕ репозиторий.
+- Git: корень репозитория — **`D:\lead_gen`** (перенесён туда 2026-07-14, коммит `075dcdb`; раньше
+  был внутри `lead_orchestrator/` — старые доки/докстринги ещё говорят так). Под git теперь ОБЕ папки
+  (`lead_orchestrator/` + `lead_orchestrator_kimi/`), `web/` и docker/деплой-доки. Origin
+  `github.com/Aidesade/lead_orchestrator`, рабочая ветка `kimi` (основная `master`); коммиты на русском.
 - Перед коммитом гонять `py -m py_compile` изменённых файлов; для движка — `py test_deep_research.py`.
 - Не плодить параллельные модули: формат .docx и промпт `PRESALE_SYSTEM` живут в CRA, ресёрч —
   в `deep_research_engine.py`, обвязка 3-й стадии — в `orchestrator.py` (`_onepager_one`), а сама

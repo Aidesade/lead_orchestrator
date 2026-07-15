@@ -1,0 +1,56 @@
+# Общий блок окружения для обоих сервисов (CLI и веб) — один источник истины.
+x-orch-env: &orch-env
+  PYTHONUNBUFFERED: "1"
+  ORQ_DATA_ROOT: /data
+  ORQ_LEADS_DIR: /data/leads
+  RUSPROFILE_PROFILE_DIR: /data/rusprofile/profile
+  RUSPROFILE_COOKIES_FILE: /data/rusprofile/cookies.json
+  KIMI_DIR: /app/lead_orchestrator_kimi
+  KIMI_PY: /opt/kimi-venv/bin/python
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  YANDEX_DISK_TOKEN: ${YANDEX_DISK_TOKEN:-}
+  DADATA_TOKEN: ${DADATA_TOKEN:-}
+  CHECKO_TOKEN: ${CHECKO_TOKEN:-}
+  KIMI_API_KEY: ${KIMI_API_KEY:-}
+  GPLLM_API_KEY: ${GPLLM_API_KEY:-}
+  KIMI_BASE_URL: ${KIMI_BASE_URL:-https://gpllmkeeper.dtc.tatar/v1}
+  KIMI_MODEL_NAME: ${KIMI_MODEL_NAME:-kimi-k2.7-code}
+  FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+
+services:
+  lead-orchestrator:
+    image: lead-orchestrator:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    shm_size: "2gb"
+    environment: *orch-env
+    volumes:
+      - ./docker-data:/data
+    # Безопасный дефолт: показать CLI и завершиться. Реальный пример:
+    # docker compose run --rm lead-orchestrator mining --count 10
+    command: ["--help"]
+
+  # Веб-интерфейс (FastAPI + собранный React). Образ — тонкий слой поверх базового
+  # с доустановленным fastapi (базовый lock его не содержит):
+  #   printf 'FROM lead-orchestrator:local\nRUN pip install --no-cache-dir "fastapi>=0.115"\n' \
+  #     | docker build -t lead-orchestrator-web:local -
+  # Поднять:  docker compose up -d web   ->  http://localhost:8000
+  # Писатель по умолчанию — kimi (RunParams.model / /api/models). ORQ_PYTHON указывает
+  # на основной venv, которым API спавнит orchestrator.py подпроцессом.
+  # Порт биндится ТОЛЬКО на localhost: API запускает платные прогоны, наружу его нельзя.
+  web:
+    image: lead-orchestrator-web:local
+    init: true
+    shm_size: "2gb"
+    working_dir: /app
+    environment:
+      <<: *orch-env
+      ORQ_REPO_ROOT: /app
+      ORQ_PYTHON: /opt/venv/bin/python
+    volumes:
+      - ./docker-data:/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    entrypoint: ["python", "-m", "uvicorn", "web.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -35,8 +35,14 @@ try:
 except Exception:
     pass
 
-PROFILE_DIR = r"C:\Users\abalb\.claude\skills\lead-finder\.rp_profile"
-COOKIES_FILE = r"C:\Users\abalb\.claude\skills\lead-finder\.rp_cookies.json"
+PROFILE_DIR = os.environ.get(
+    "RUSPROFILE_PROFILE_DIR",
+    r"C:\Users\abalb\.claude\skills\lead-finder\.rp_profile",
+)
+COOKIES_FILE = os.environ.get(
+    "RUSPROFILE_COOKIES_FILE",
+    r"C:\Users\abalb\.claude\skills\lead-finder\.rp_cookies.json",
+)
 HOME = "https://www.rusprofile.ru/"
 TEST_CARD = "https://www.rusprofile.ru/id/4464622"  # любая карточка для проверки масок
 PAYWALL = "оформите профессиональный доступ"

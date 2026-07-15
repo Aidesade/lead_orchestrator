@@ -82,8 +82,12 @@ PHOTO_PNG = os.path.join(ASSETS_DIR, "bulat_zamaliev.png")   # фото Була
 # Стадия живёт в СОСЕДНЕЙ папке со СВОИМ venv: kimi-agent-sdk конфликтует по зависимостям с
 # claude-agent-sdk (pydantic-core), поэтому в один интерпретатор их ставить нельзя. Отсюда зовём
 # её подпроцессом venv-питона — это и есть «сведение двух SDK» в одном прогоне.
-KIMI_DIR = os.path.join(os.path.dirname(SCRIPTS), "lead_orchestrator_kimi")
-KIMI_PY = os.path.join(KIMI_DIR, ".venv_kimi", "Scripts", "python.exe")
+KIMI_DIR = os.environ.get(
+    "KIMI_DIR", os.path.join(os.path.dirname(SCRIPTS), "lead_orchestrator_kimi"))
+KIMI_PY = os.environ.get(
+    "KIMI_PY",
+    os.path.join(KIMI_DIR, ".venv_kimi", "Scripts", "python.exe"),
+)
 KIMI_CLI = os.path.join(KIMI_DIR, "onepager_kimi.py")
 
 # Endpoint провайдера Kimi. Ключ — KIMI_API_KEY, иначе GPLLM_API_KEY (так он задан на этой машине).
@@ -96,9 +100,42 @@ def _kimi_key():
     return (os.environ.get("KIMI_API_KEY") or os.environ.get("GPLLM_API_KEY") or "").strip()
 
 
+# Белый список переменных, которые доезжают до подпроцесса стадии. Всё остальное — не доезжает.
+# Список, а не «весь os.environ минус секреты»: при чёрном списке каждый НОВЫЙ токен в окружении
+# автоматически утекал бы в стадию, и про него надо было бы вспомнить. Здесь — наоборот: новая
+# переменная по умолчанию НЕ передаётся.
+_KIMI_ENV_ALLOW = frozenset((
+    # Ради чего стадия и запускается.
+    "KIMI_API_KEY", "KIMI_BASE_URL", "KIMI_MODEL_NAME",
+    # Python и кодировки. PYTHONPATH намеренно НЕ пропускаем: он подмешал бы site-packages
+    # основного venv в интерпретатор Kimi — а это ровно тот конфликт pydantic-core, из-за
+    # которого venv и разведены.
+    "PATH", "PYTHONIOENCODING", "PYTHONUTF8",
+    # Windows: без SYSTEMROOT на старте падают сокеты и ssl; остальное нужно python и chromium.
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "TEMP", "TMP", "TMPDIR", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "APPDATA", "LOCALAPPDATA", "ALLUSERSPROFILE", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "PUBLIC",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    # Linux/Docker: контейнер + xvfb (headless-рендер PDF).
+    "HOME", "USER", "LANG", "LC_ALL", "TZ", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+    # Chromium для рендера PDF.
+    "PLAYWRIGHT_BROWSERS_PATH",
+    # Сеть и TLS: иначе перестанут работать корпоративный прокси и свой CA.
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+))
+
+
 def _kimi_env():
-    """Окружение для подпроцесса стадии: ключ/endpoint/модель поверх текущего env."""
-    env = dict(os.environ)
+    """Окружение для подпроцесса стадии: ключ/endpoint/модель + инфраструктура. Больше ничего.
+
+    Стадию исполняет СТОРОННИЙ kimi-cli (альфа 0.0.5) и запускается он с yolo=True, то есть
+    с авто-аппрувом вызовов инструментов. Отдавать ему весь os.environ незачем: раньше туда
+    уезжали ANTHROPIC_API_KEY, YANDEX_DISK_TOKEN, DADATA_TOKEN, CHECKO_TOKEN и FIRECRAWL_API_KEY,
+    хотя стадии нужен ровно один ключ — свой. Сравнение имён по upper() заодно ловит linux'овые
+    http_proxy/https_proxy в нижнем регистре, сохраняя исходное написание ключа."""
+    env = {k: v for k, v in os.environ.items() if k.upper() in _KIMI_ENV_ALLOW}
     env["KIMI_API_KEY"] = _kimi_key()
     env.setdefault("KIMI_BASE_URL", KIMI_BASE_URL_DEFAULT)
     env.setdefault("KIMI_MODEL_NAME", KIMI_MODEL_DEFAULT)
@@ -128,6 +165,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
     import company_research_agent as CRA
     import deep_research_engine as DRE
+    import writer_kimi as WK
     from claude_agent_sdk import (
         tool, create_sdk_mcp_server, ClaudeAgentOptions, ClaudeSDKClient,
         ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
@@ -196,6 +234,15 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
                   + ("" if pe.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
         except Exception as e:
             print(f"    [{idx}] person_enrich пропущен: {str(e)[:80]}")
+
+    # --- писатель на Kimi -----------------------------------------------------------
+    # Ресёрч (движок + person_enrich) выше УЖЕ выполнен, поэтому писателю инструменты не
+    # нужны: Kimi возвращает JSON по тем же схемам, а .docx рендерят те же CRA._write_*.
+    # Ветка стоит здесь, а не выше, ровно чтобы находки и обогащение ЛПР были общими для
+    # обеих моделей — меняется автор текста, а не пайплайн.
+    if WK.is_kimi(model):
+        cost = await WK.write_two_docx(lead, idx, findings, d_tmp, s_tmp, model)
+        return cost, findings
 
     options = ClaudeAgentOptions(
         model=model,
@@ -345,20 +392,26 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
 
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
-    """ФАЗА 1 (первый агент): RusProfile -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
-    Блокирующий (открывает Chrome; offscreen=True -> окно за экраном, не видно). Возвращает picked[]."""
+    """ФАЗА 1 (первый агент): сбор -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
+    Источник — env LEAD_SOURCE: 'rusprofile' (по умолч., живой Chrome + платная сессия) либо
+    'checko' (Checko API, без браузера/антибота — для Docker/Linux). Возвращает picked[]."""
     import math
-    import source_rusprofile as RP
-    import rusprofile_session as RPS
+    import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
 
     inds = [s.strip() for s in industries.split(",") if s.strip() in RP.INDUSTRY]
     if not inds:
         raise SystemExit("не распознаны отрасли. Доступно: " + ", ".join(sorted(RP.INDUSTRY)))
-    if not os.path.exists(RPS.COOKIES_FILE):
-        raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
     per_ind = math.ceil(count / max(1, len(inds)))
 
+    source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
+    if source in ("checko", "checko_api", "api"):
+        return _collect_checko(inds, count, min_revenue, region, base, account, json_out, per_ind)
+
+    # --- RusProfile (по умолчанию): живой Chrome + платная сессия контактов ---
+    import rusprofile_session as RPS
+    if not os.path.exists(RPS.COOKIES_FILE):
+        raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
     print(f"[1/2] RusProfile: {inds} | порог >{min_revenue / 1e9:g} млрд"
           + (f" | регион {region}" if region else ""))
     leads = []
@@ -397,6 +450,42 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
     print("[1/2] раскладка папок+заготовок на Диске ...")
     DO.organize_to_disk(picked, base=base, account=account, log=print)   # папки создаёт ПЕРВЫЙ агент
+    return picked
+
+
+def _collect_checko(inds, count, min_revenue, region, base, account, json_out, per_ind):
+    """ФАЗА 1 через Checko API (LEAD_SOURCE=checko): без браузера/антибота — годится для Docker/Linux.
+    harvest сам добирает выручку из ГИР БО и режет порогом; контакты (сайт/тел/email/ЛПР) добираются
+    по ИНН через checko_enrich — аналог платной сессии RusProfile. Дальше — общий отбор/сохранение/раскладка."""
+    import source_checko as CK
+    import checko_enrich as CE
+    import pipeline
+
+    print(f"[1/2] Checko: {inds} | порог >{min_revenue / 1e9:g} млрд"
+          + (f" | регион {region}" if region else ""))
+    try:
+        leads = CK.harvest(inds, min_revenue=min_revenue, per_industry=per_ind,
+                           region=region, out_path=json_out)
+    except CK.CheckoSourceError as e:
+        raise SystemExit(f"Checko: {e}")
+    except Exception as e:                          # сеть/токен/лимит — стоп с понятным сообщением
+        raise SystemExit(f"Checko: сбор упал — {str(e)[:160]}")
+    if not leads:
+        raise SystemExit("Checko ничего не вернул — проверь коды ОКВЭД (нужен уровень NN.NN), "
+                         "регион и CHECKO_TOKEN.")
+
+    # Контакты по ИНН (сайт/тел/email/ЛПР). Best-effort: сбой не должен ронять уже собранные лиды.
+    try:
+        cap = int(os.environ.get("CHECKO_CONTACTS_CAP", "100"))
+        CE.checko_contacts_pass(CE.CheckoClient(), leads, cap=cap, only_missing=True, log=print)
+    except Exception as e:                          # noqa: BLE001
+        print(f"[1/2] контакты Checko не добраны: {str(e)[:120]}")
+
+    picked = pipeline._select(leads, count, inds)
+    pipeline._save(picked, json_out)
+    print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
+    print("[1/2] раскладка папок+заготовок на Диске ...")
+    DO.organize_to_disk(picked, base=base, account=account, log=print)
     return picked
 
 
@@ -486,6 +575,11 @@ async def _wait_ram(min_gb, tag, max_wait=300):
 
 def _tmp_root():
     """Базовая папка временных файлов/логов прогона: D:\\orq_tmp (C: тесный), иначе %TEMP%."""
+    data_root = os.environ.get("ORQ_DATA_ROOT", "").strip()
+    if data_root:
+        d = os.path.join(data_root, "orq_tmp")
+        os.makedirs(d, exist_ok=True)
+        return d
     if os.path.isdir("D:\\"):
         d = os.path.join("D:\\", "orq_tmp")
         os.makedirs(d, exist_ok=True)
@@ -496,6 +590,9 @@ def _tmp_root():
 def _work_base(subdir):
     """Путь к постоянной папке данных прогона рядом с temp: D:\\<subdir> (на C: мало
     места) или %TEMP%\\<subdir>. Саму папку НЕ создаёт."""
+    data_root = os.environ.get("ORQ_DATA_ROOT", "").strip()
+    if data_root:
+        return os.path.join(data_root, subdir)
     return os.path.join("D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir(), subdir)
 
 
@@ -684,7 +781,10 @@ async def main():
     ap.add_argument("--account", default=None)
     ap.add_argument("--workers", type=int, default=2,
                     help="параллельных ресёрч-агентов (claude CLI). При нехватке RAM авто-снижается до 1")
-    ap.add_argument("--model", default="opus", help="opus (качество) | sonnet (дешевле)")
+    ap.add_argument("--model", default="opus",
+                    help="писатель двух .docx: kimi | opus (качество) | sonnet (дешевле). "
+                         "kimi — псевдоним, конкретную модель берём из KIMI_WRITER_MODEL/"
+                         "KIMI_MODEL_NAME (дефолт kimi-k2.7-code)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
     ap.add_argument("--redo", action="store_true",
@@ -741,8 +841,13 @@ async def main():
                 else "окно скрыто за экраном" if offscreen else "окно Chrome видно")
         print(f"=== ФАЗА 1: сбор лидов (RusProfile — {mode}) ===")
         # --out терпимо принимает и старый .xlsx-путь: расширение всё равно станет .json
+        default_leads_dir = os.environ.get("ORQ_LEADS_DIR", "").strip()
+        if not default_leads_dir:
+            default_leads_dir = r"D:\лиды" if os.name == "nt" else "/data/leads"
+        os.makedirs(default_leads_dir, exist_ok=True)
         json_out = (os.path.splitext(a.out)[0] + ".json" if a.out
-                    else os.path.join(r"D:\лиды", "leads_" + a.industries.replace(",", "_") + ".json"))
+                    else os.path.join(default_leads_dir,
+                                      "leads_" + a.industries.replace(",", "_") + ".json"))
         leads = await asyncio.to_thread(
             _collect, a.industries, a.count, a.min_revenue, a.region,
             headless, offscreen, a.base, a.account, json_out)
@@ -759,13 +864,21 @@ async def main():
         return
 
     print("\n=== ФАЗА 2: ресёрч (карта бизнес-процессов + карта ролей и контактов) ===")
+    import writer_kimi as WK          # лёгкий модуль: CRA внутри него импортируется лениво
     if not a.dry_run:
-        # Оценка — по стоимости Claude-сессий (2 .docx). One-pager считает провайдер Kimi
-        # отдельно и наружу цену не отдаёт, поэтому в вилку он не входит.
-        _lo, _hi, _what = ((len(sel), 2 * len(sel), "2 .docx + one-pager .pdf (Kimi — отдельный счёт)")
-                           if a.presentation else (len(sel), 2 * len(sel), "2 .docx"))
-        print(f"[оценка] {len(sel)} компаний = ~${_lo}–${_hi} ({a.model}, {_what} на компанию). "
-              "Число = --count (по умолч. 200).")
+        _what = ("2 .docx + one-pager .pdf" if a.presentation else "2 .docx")
+        if WK.is_kimi(a.model):
+            # Вилка в долларах верна ТОЛЬКО для Claude-сессий. На Kimi писателя считает
+            # провайдер (gpllmkeeper), цену за вызов он наружу не отдаёт — врать вилкой нельзя.
+            print(f"[оценка] {len(sel)} компаний, писатель на {WK.kimi_model(a.model)} "
+                  f"({_what} на компанию). Стоимость считает провайдер Kimi — "
+                  "оркестратор её не видит, в итоге будет $0.")
+        else:
+            # One-pager считает провайдер Kimi отдельно и цену не отдаёт — в вилку не входит.
+            _lo, _hi = len(sel), 2 * len(sel)
+            _tail = " (one-pager — отдельный счёт Kimi)" if a.presentation else ""
+            print(f"[оценка] {len(sel)} компаний = ~${_lo}–${_hi} ({a.model}, {_what} "
+                  f"на компанию){_tail}. Число = --count (по умолч. 200).")
         free = _free_ram_gb()                         # каждый ресёрч = свой claude CLI (Node, сотни МБ)
         if free is not None and free < 3.0 and a.workers > 1:
             print(f"[ОЗУ] свободно ~{free:.1f} ГБ — снижаю параллелизм ресёрча до 1 "

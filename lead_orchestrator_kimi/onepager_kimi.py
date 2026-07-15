@@ -21,7 +21,7 @@ ONEPAGER_SYSTEM генерит самодостаточный HTML, а html_to_p
     set KIMI_MODEL_NAME=<ID модели K2.7 у провайдера>
 
 CLI (разовый прогон одной компании):
-    py onepager_kimi.py "АО «Рязаньавтодор»" --inn 6234065445 --out out.pdf
+    py onepager_kimi.py "АО «Рязаньавтодор»" --industry "дорожное строительство" --out out.pdf
 """
 import argparse
 import asyncio

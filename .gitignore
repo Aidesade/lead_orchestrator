@@ -1,9 +1,10 @@
 # Корневой .gitignore. Внутри lead_orchestrator/ действует ещё свой — он не отменён,
 # правила gitignore применяются к своему поддереву.
 
-# Изолированное окружение Kimi-стадии: ставится локально (см. lead_orchestrator_kimi/CLAUDE.md),
-# весит сотни МБ и содержит ДВА ручных патча — в git ему делать нечего.
-lead_orchestrator_kimi/.venv_kimi/
+# Изолированное окружение Kimi-стадии: воспроизводится из lead_orchestrator_kimi/requirements.txt
+# + patches/apply_patches.py, весит сотни МБ и содержит патч в site-packages — в git ему делать
+# нечего. Со звёздочкой: правило ловит и бэкапы вида .venv_kimi_bak_1.48.
+lead_orchestrator_kimi/.venv_kimi*/
 
 # Python
 __pycache__/
@@ -16,8 +17,14 @@ venv/
 # действует в ЛЮБОЙ подпапке, а не только в корне.
 settings.local.json
 
+# Секреты и данные Docker-запуска: .env с токенами и том ./docker-data (лиды/куки/кэш) —
+# в git им не место (см. DEPLOY_TIMEWEB.md: .env с правами 600, никогда не коммитить).
+.env
+docker-data/
+
 # Артефакты прогонов
 *.pdf
+*.log
 out.html
 raw.html
 
