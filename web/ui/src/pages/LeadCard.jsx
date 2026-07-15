@@ -21,7 +21,6 @@ export default function LeadCard() {
   if (!card) return <div className="empty">Загружаю…</div>
 
   const { lead: l, deliverables: d, findings } = card
-  const copy = (t) => navigator.clipboard?.writeText(t)
 
   return (
     <>
@@ -91,32 +90,37 @@ export default function LeadCard() {
       </div>
 
       <div className="card">
-        <h2>Деливераблы на Яндекс Диске</h2>
+        <h2>Деливераблы</h2>
         {!d.available && <div className="muted">правила имён недоступны: {d.error}</div>}
         {d.available && (
           <>
-            <p className="muted mono" style={{ marginTop: 0 }}>
-              {d.dir}{' '}
-              <button className="ghost" style={{ padding: '2px 8px', fontSize: 12 }}
-                      onClick={() => copy(d.dir)}>копировать путь</button>
-            </p>
+            {!d.any && (
+              <p className="muted" style={{ marginTop: 0 }}>
+                Файлов пока нет — по этой компании ФАЗА 2 (ресёрч + материалы) ещё не прогонялась.
+              </p>
+            )}
             <table>
               <tbody>
                 {d.files.map((f) => (
-                  <tr key={f.name}>
-                    <td style={{ width: 240 }}>{f.kind}</td>
+                  <tr key={f.slug}>
+                    <td style={{ width: 260 }}>{f.kind}</td>
                     <td className="mono muted">{f.name}</td>
-                    <td style={{ width: 120 }}>
-                      <button className="ghost" style={{ padding: '3px 9px', fontSize: 12 }}
-                              onClick={() => copy(f.path)}>копировать</button>
+                    <td style={{ width: 150 }}>
+                      {f.exists ? (
+                        <a className="btn" href={f.url} download={f.name}>
+                          Скачать{f.size ? ` · ${(f.size / 1024).toFixed(0)} КБ` : ''}
+                        </a>
+                      ) : (
+                        <span className="muted" style={{ fontSize: 12 }}>ещё не готово</span>
+                      )}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
             <p className="muted" style={{ marginBottom: 0, fontSize: 12 }}>
-              Пути вычислены по правилам disk_organize. Файл появляется на Диске только
-              после успешного прогона по этой компании.
+              Файлы хранит сам сайт (не Яндекс Диск). Появляются после успешного прогона ФАЗЫ 2
+              по этой компании.
             </p>
           </>
         )}

@@ -110,6 +110,14 @@ def _company_name(lead, dup_names):
     return base
 
 
+def deliverables_subdir(lead):
+    """Ключ компании в ЛОКАЛЬНОМ хранилище деливераблов (ORQ_DATA_ROOT/deliverables/<ключ>/).
+    ЕДИНЫЙ источник для пайплайна (orchestrator) и веба (web/api/leads): карточка ищет по ИНН,
+    поэтому ключ = ИНН; фолбэк — безопасное имя. Не менять без синхронной правки веба."""
+    inn = str(lead.get("_inn") or "").strip()
+    return inn or _safe(lead.get("name"))
+
+
 # ----------------------------- .docx (заготовки) -----------------------------
 
 def _xml_escape(t):

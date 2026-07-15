@@ -135,6 +135,25 @@ async def lead_card(inn: str) -> Dict[str, Any]:
     return card
 
 
+_DELIVERABLE_MEDIA = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+}
+
+
+@app.get("/api/leads/{inn}/file/{slug}")
+async def lead_file(inn: str, slug: str) -> FileResponse:
+    """Скачать один готовый деливерабл компании из хранилища сайта (slug: process|roles|onepager).
+    Объявлен ДО SPA-catch-all, поэтому не перехватывается им."""
+    got = leads_store.deliverable_file(inn, slug)
+    if not got:
+        raise HTTPException(404, "файл ещё не готов")
+    path, name = got
+    return FileResponse(path, filename=name,
+                        media_type=_DELIVERABLE_MEDIA.get(path.suffix.lower(),
+                                                          "application/octet-stream"))
+
+
 # --- прогоны -----------------------------------------------------------------
 class RunParams(BaseModel):
     industries: List[str] = Field(default_factory=list)

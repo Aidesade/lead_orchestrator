@@ -70,6 +70,14 @@ button {
 button:hover:not(:disabled) { filter: brightness(1.1); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+
+/* кнопка-ссылка первичного действия (напр. «Скачать» на карточке компании) */
+a.btn, button.btn {
+  display: inline-block; padding: 5px 12px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--accent); color: var(--bg); text-decoration: none; cursor: pointer;
+}
+a.btn:hover, button.btn:hover { filter: brightness(1.1); text-decoration: none; }
 button.danger { background: var(--err); }
 
 /* --- бейджи --- */

@@ -448,8 +448,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     picked = pipeline._select(leads, count, inds)
     pipeline._save(picked, json_out)
     print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
-    print("[1/2] раскладка папок+заготовок на Диске ...")
-    DO.organize_to_disk(picked, base=base, account=account, log=print)   # папки создаёт ПЕРВЫЙ агент
+    if _store_mode() == "disk":
+        print("[1/2] раскладка папок+заготовок на Диске ...")
+        DO.organize_to_disk(picked, base=base, account=account, log=print)   # папки создаёт ПЕРВЫЙ агент
     return picked
 
 
@@ -484,8 +485,9 @@ def _collect_checko(inds, count, min_revenue, region, base, account, json_out, p
     picked = pipeline._select(leads, count, inds)
     pipeline._save(picked, json_out)
     print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
-    print("[1/2] раскладка папок+заготовок на Диске ...")
-    DO.organize_to_disk(picked, base=base, account=account, log=print)
+    if _store_mode() == "disk":
+        print("[1/2] раскладка папок+заготовок на Диске ...")
+        DO.organize_to_disk(picked, base=base, account=account, log=print)
     return picked
 
 
@@ -596,6 +598,18 @@ def _work_base(subdir):
     return os.path.join("D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir(), subdir)
 
 
+def _store_mode():
+    """Куда складывать деливераблы: 'local' (сервер сайта, по умолчанию) или 'disk' (Яндекс Диск).
+    ORQ_STORE=disk возвращает прежнее поведение с заливкой на Диск."""
+    return (os.environ.get("ORQ_STORE") or "local").strip().lower()
+
+
+def _store_root():
+    """Корень ЛОКАЛЬНОГО хранилища деливераблов: ORQ_DATA_ROOT/deliverables (или D:\\deliverables).
+    Тот же путь читает веб (web/api/config.DELIVERABLES_DIR) и отдаёт файлы на скачивание."""
+    return _work_base("deliverables")
+
+
 class _Tee:
     """Дублирование потока в файл: лог прогона переживает закрытую консоль и жёсткий крах."""
 
@@ -653,6 +667,21 @@ def _remote_state(comp_dir, names):
     bp, rc, pp = names
     docx_ok = sizes.get(bp, 0) > 5000 and sizes.get(rc, 0) > 5000
     pdf_ok = sizes.get(pp, 0) > REAL_PDF_MIN
+    return docx_ok, pdf_ok
+
+
+def _local_state(store_dir, names):
+    """Резюм для локального хранилища: какие деливераблы уже лежат в store_dir.
+    Пороги те же, что у Диска (_remote_state): .docx >5 КБ, реальный .pdf >REAL_PDF_MIN."""
+    def _sz(fn):
+        p = os.path.join(store_dir, fn)
+        try:
+            return os.path.getsize(p) if os.path.isfile(p) else 0
+        except OSError:
+            return 0
+    bp, rc, pp = names
+    docx_ok = _sz(bp) > 5000 and _sz(rc) > 5000
+    pdf_ok = _sz(pp) > REAL_PDF_MIN
     return docx_ok, pdf_ok
 
 
@@ -901,11 +930,16 @@ async def main():
     # если D: нет — системный %TEMP%.
     tmp = tempfile.mkdtemp(prefix="orq_", dir=_tmp_root())
 
-    disk_cache = set()                      # кэш созданных путей Диска — общий на прогон
-    if not a.no_upload and not a.dry_run:   # сперва долить отложенное прошлыми прогонами
+    store = _store_mode()                   # 'local' (хранилище сайта) по умолчанию | 'disk' (Яндекс Диск)
+    if store == "local" and not a.no_upload:
+        print(f"[хранилище] деливераблы -> {os.path.join(_store_root(), '<инн>')} "
+              "(Диск отключён; ORQ_STORE=disk вернёт заливку на Я.Диск)")
+
+    disk_cache = set()                      # кэш созданных путей Диска — общий на прогон (режим disk)
+    if store == "disk" and not a.no_upload and not a.dry_run:   # сперва долить отложенное прошлыми прогонами
         await _drain_outbox(a.account, "долив с прошлых прогонов")
     # верхние уровни (отрасль/категория) у первого агента уже есть; mkdir идемпотентный.
-    if not a.no_upload:
+    if store == "disk" and not a.no_upload:
         try:
             await asyncio.to_thread(DO.ensure_dir, a.base, a.account, disk_cache)
             for lead in sel:
@@ -939,19 +973,24 @@ async def main():
             comp_dir = _company_dir(lead, a.base, dup_names)
             dn = DO._safe(lead.get("name"))
             bp_name, rc_name, pdf_name = _doc_names(dn)
+            store_dir = os.path.join(_store_root(), DO.deliverables_subdir(lead))  # хранилище сайта (режим local)
+            dest = comp_dir if store == "disk" else store_dir                      # куда лягут файлы (для логов)
             try:
-                # ---- РЕЗЮМ: не переделывать (и не переоплачивать) уже готовое на Диске ----
+                # ---- РЕЗЮМ: не переделывать (и не переоплачивать) уже готовое ----
                 if not a.dry_run and not a.no_upload and not a.redo:
-                    docx_done, pdf_done = await asyncio.to_thread(
-                        _remote_state, comp_dir, (bp_name, rc_name, pdf_name))
+                    names = (bp_name, rc_name, pdf_name)
+                    if store == "disk":
+                        docx_done, pdf_done = await asyncio.to_thread(_remote_state, comp_dir, names)
+                    else:
+                        docx_done, pdf_done = _local_state(store_dir, names)
                     if docx_done and (pdf_done or not gen_pdf):
-                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: уже на Диске — пропуск (--redo, чтобы переделать)")
+                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: уже готово — пропуск (--redo, чтобы переделать)")
                         return {"name": lead.get("name"), "ok": True, "cost": 0.0,
-                                "dir": comp_dir, "resumed": True, "pdf": pdf_done, "files": 0}
+                                "dir": dest, "resumed": True, "pdf": pdf_done, "files": 0}
                     if docx_done:
                         skip_docx = True    # догоняем только one-pager
                         findings = _cached_findings(lead.get("name"), lead.get("_inn"))
-                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже на Диске — делаю только one-pager")
+                        print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже готовы — делаю только one-pager")
 
                 if a.dry_run:
                     try:
@@ -1017,32 +1056,44 @@ async def main():
                                   + (".docx уже на Диске" if skip_docx else "зальём только два .docx"))
 
                 pairs = [] if skip_docx else [(d_tmp, bp_name), (s_tmp, rc_name)]
-                if have_pdf:            # one-pager — в ту же папку компании (если получился)
+                if have_pdf:            # one-pager — рядом с .docx (если получился)
                     pairs.append((p_tmp, pdf_name))
                 if not a.no_upload and pairs:
-                    try:
-                        await asyncio.to_thread(DO.ensure_dir, comp_dir, a.account, disk_cache)
-                        for lp, rname in pairs:
-                            # с проверкой чтением: «✓ Загружено» от Диска — не доказательство
-                            await asyncio.to_thread(_upload_verified, lp, comp_dir, rname, a.account)
-                    except Exception as e:
-                        print(f"  [!] upload {lead.get('name')}: {e}")
-                        # деньги уже потрачены: файлы НЕ удаляем, а откладываем в outbox на долив
-                        saved = await asyncio.to_thread(_outbox_defer, lead.get("name"), comp_dir, pairs)
-                        if saved:
-                            print(f"  [outbox] готовые файлы отложены: {saved} — будут долиты следующим прогоном")
-                            return {"name": lead.get("name"), "ok": False, "cost": cost, "why": "заливка на Диск (файлы в outbox)"}
-                        keep_tmp = True
-                        print(f"  [outbox] отложить не удалось — файлы остаются в {comp_tmp}")
-                        return {"name": lead.get("name"), "ok": False, "cost": cost,
-                                "why": "заливка на Диск", "kept": comp_tmp}
+                    if store == "local":
+                        # ХРАНИЛИЩЕ САЙТА: копируем готовые файлы под красивыми именами; их отдаёт веб
+                        try:
+                            os.makedirs(store_dir, exist_ok=True)
+                            for lp, rname in pairs:
+                                await asyncio.to_thread(shutil.copy2, lp, os.path.join(store_dir, rname))
+                        except Exception as e:
+                            keep_tmp = True     # копия не удалась — не теряем оплаченные файлы
+                            print(f"  [!] сохранение в хранилище {lead.get('name')}: {e} — файлы в {comp_tmp}")
+                            return {"name": lead.get("name"), "ok": False, "cost": cost,
+                                    "why": "сохранение в хранилище", "kept": comp_tmp}
+                    else:
+                        try:
+                            await asyncio.to_thread(DO.ensure_dir, comp_dir, a.account, disk_cache)
+                            for lp, rname in pairs:
+                                # с проверкой чтением: «✓ Загружено» от Диска — не доказательство
+                                await asyncio.to_thread(_upload_verified, lp, comp_dir, rname, a.account)
+                        except Exception as e:
+                            print(f"  [!] upload {lead.get('name')}: {e}")
+                            # деньги уже потрачены: файлы НЕ удаляем, а откладываем в outbox на долив
+                            saved = await asyncio.to_thread(_outbox_defer, lead.get("name"), comp_dir, pairs)
+                            if saved:
+                                print(f"  [outbox] готовые файлы отложены: {saved} — будут долиты следующим прогоном")
+                                return {"name": lead.get("name"), "ok": False, "cost": cost, "why": "заливка на Диск (файлы в outbox)"}
+                            keep_tmp = True
+                            print(f"  [outbox] отложить не удалось — файлы остаются в {comp_tmp}")
+                            return {"name": lead.get("name"), "ok": False, "cost": cost,
+                                    "why": "заливка на Диск", "kept": comp_tmp}
                 tag = "  +one-pager" if have_pdf else ""
                 if skip_docx:
                     tag += ("  (докинут только one-pager)" if have_pdf
-                            else "  (one-pager не вышел — на Диске прежние .docx)")
-                print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {comp_dir}" + tag
+                            else "  (one-pager не вышел — прежние .docx на месте)")
+                print(f"  ✓ [{idx}] {lead.get('name')[:40]} -> {dest}" + tag
                       + (f"  (${cost:.2f})" if cost else ""))
-                return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": comp_dir,
+                return {"name": lead.get("name"), "ok": True, "cost": cost, "dir": dest,
                         "pdf": have_pdf, "files": len(pairs)}
             finally:
                 # транзит компании чистим СРАЗУ после заливки/отложки (не копим все 200 до конца —
@@ -1070,7 +1121,9 @@ async def main():
           + (f" (из них {resumed} по резюму, без затрат)" if resumed else "")
           + f" | файлов за прогон: {n_files}"
           + (f" (в т.ч. {n_pdf} one-pager'ов)" if n_pdf else "") + " "
-          + ("(локально, без Диска) " if a.no_upload else f"в {a.base} ")
+          + ("(в temp, без сохранения) " if a.no_upload
+             else f"в {a.base} " if store == "disk"
+             else f"в хранилище {_store_root()} ")
           + (f"| стоимость ~${total:.2f}" if total else "| $0"))
     if fails:
         print(f"[ВНИМАНИЕ] {len(fails)} компаний остались БЕЗ свежих документов "
@@ -1078,7 +1131,7 @@ async def main():
         for r in fails:
             print(f"  - {(r or {}).get('name')}: {(r or {}).get('why') or 'сбой'}")
         print("  Повтори ту же команду: резюм пропустит готовые компании и доделает только эти.")
-    if not a.no_upload and not a.dry_run:
+    if store == "disk" and not a.no_upload and not a.dry_run:
         await _drain_outbox(a.account, "финальный долив")
     kept = [r.get("kept") for r in results if r and isinstance(r, dict) and r.get("kept")]
     if a.no_upload:

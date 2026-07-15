@@ -40,7 +40,10 @@ if str(ORCH_DIR) not in sys.path:
 DATA_ROOT = _data_root()
 TMP_DIR = DATA_ROOT / "orq_tmp"           # логи прогонов run_<ts>.log
 CACHE_DIR = DATA_ROOT / "orq_cache"       # findings_<ИНН>.md
-OUTBOX_DIR = DATA_ROOT / "orq_outbox"     # недолитые деливераблы
+OUTBOX_DIR = DATA_ROOT / "orq_outbox"     # недолитые деливераблы (режим Диска)
+# Хранилище готовых деливераблов сайта (режим ORQ_STORE=local): deliverables/<ключ>/<файлы>.
+# Тот же путь пишет пайплайн (orchestrator._store_root); отсюда веб отдаёт файлы на скачивание.
+DELIVERABLES_DIR = Path(os.environ.get("ORQ_DELIVERABLES_DIR") or (DATA_ROOT / "deliverables"))
 
 
 def _leads_dir() -> Path:
@@ -66,3 +69,4 @@ DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 def ensure_dirs() -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    DELIVERABLES_DIR.mkdir(parents=True, exist_ok=True)

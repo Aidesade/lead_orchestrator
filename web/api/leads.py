@@ -16,7 +16,8 @@ import io
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from . import config
 
@@ -144,18 +145,45 @@ def findings(lead: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "size": st.st_size, "text": p.read_text(encoding="utf-8", errors="replace")}
 
 
+_SLUGS = ("process", "roles", "onepager")
+_KINDS = ("Карта бизнес-процессов", "Карта ролей и контактов", "One-pager Telepatt")
+
+
+def _store_dir(lead: Dict[str, Any]) -> Path:
+    """Папка компании в хранилище сайта — ключ ТОТ ЖЕ, что у пайплайна (DO.deliverables_subdir)."""
+    return config.DELIVERABLES_DIR / DO.deliverables_subdir(lead)
+
+
 def deliverables(lead: Dict[str, Any]) -> Dict[str, Any]:
-    """Где на Яндекс Диске лежат три файла компании. Правила имён — из disk_organize."""
+    """Готовые файлы компании в хранилище сайта (ORQ_STORE=local): какие есть + ссылка на скачивание.
+    Имена — из disk_organize._doc_names (те же, что кладёт пайплайн)."""
     if not DO:
         return {"available": False, "error": _DO_ERR}
-    dn = DO._safe(lead["name"])
-    comp_dir = "/".join([config.DISK_BASE.rstrip("/"),
-                         DO.industry_folder(lead), DO.category_for(lead), dn])
-    names = DO._doc_names(dn)
-    kinds = ["Карта бизнес-процессов", "Карта ролей и контактов", "One-pager Telepatt"]
-    return {"available": True, "dir": comp_dir,
-            "files": [{"kind": k, "name": n, "path": f"{comp_dir}/{n}"}
-                      for k, n in zip(kinds, names)]}
+    ddir = _store_dir(lead)
+    names = DO._doc_names(DO._safe(lead["name"]))
+    key = str(lead.get("_inn") or lead.get("name") or "").strip()
+    files = []
+    for slug, kind, name in zip(_SLUGS, _KINDS, names):
+        p = ddir / name
+        size = p.stat().st_size if p.is_file() else 0
+        files.append({"slug": slug, "kind": kind, "name": name,
+                      "exists": size > 0, "size": size,
+                      "url": f"/api/leads/{quote(key)}/file/{slug}" if size > 0 else None})
+    return {"available": True, "dir": str(ddir),
+            "any": any(f["exists"] for f in files), "files": files}
+
+
+def deliverable_file(inn: str, slug: str) -> Optional[Tuple[Path, str]]:
+    """(абсолютный Path, красивое имя) одного деливерабла для скачивания, или None если файла нет.
+    slug ∈ process|roles|onepager. Лид резолвится по ИНН/имени — как в card()."""
+    if not DO or slug not in _SLUGS:
+        return None
+    lead = find(inn)
+    if not lead:
+        return None
+    name = DO._doc_names(DO._safe(lead["name"]))[_SLUGS.index(slug)]
+    p = _store_dir(lead) / name
+    return (p, name) if p.is_file() else None
 
 
 def card(inn: str) -> Optional[Dict[str, Any]]:
