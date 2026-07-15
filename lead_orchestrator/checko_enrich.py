@@ -32,34 +32,56 @@ class CheckoError(RuntimeError):
     pass
 
 
+def checko_keys():
+    """Ключи Checko ПО ПОРЯДКУ: CHECKO_TOKEN (можно несколько через запятую), затем запасные
+    CHECKO_TOKEN_ALT / _2 / _3 — на случай исчерпанного лимита или 403. Дедуп, порядок сохранён.
+    Единый источник для обоих клиентов (checko_enrich.CheckoClient и source_checko.CheckoSearch)."""
+    out = []
+    for var in ("CHECKO_TOKEN", "CHECKO_TOKEN_ALT", "CHECKO_TOKEN_2", "CHECKO_TOKEN_3"):
+        v = (os.environ.get(var) or "").strip()
+        if v:
+            out += [k.strip() for k in v.split(",") if k.strip()]
+    return list(dict.fromkeys(out))
+
+
 class CheckoClient:
     def __init__(self, token=None, pause=0.2, retries=3):
-        self.token = token or os.environ.get("CHECKO_TOKEN") or ""
-        if not self.token:
+        self.keys = [token.strip()] if token else checko_keys()
+        if not self.keys:
             raise CheckoError("Не задан CHECKO_TOKEN (env или token=...)")
+        self._ki = 0                              # индекс текущего ключа (запоминаем рабочий)
         self.pause = pause
         self.retries = retries
 
+    @property
+    def token(self):
+        return self.keys[self._ki]
+
     def _get(self, method, params):
-        params = dict(params, key=self.token)
-        url = f"{BASE}/{method}?" + urllib.parse.urlencode(params)
-        for attempt in range(self.retries):
-            try:
-                req = urllib.request.Request(url, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    time.sleep(self.pause)
-                    return json.loads(r.read().decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    time.sleep(1.5 * (attempt + 1)); continue
-                if e.code in (401, 403):
-                    raise CheckoError(f"{e.code}: неверный ключ или нет доступа")
-                if e.code == 404:
-                    return {}
-                raise CheckoError(f"HTTP {e.code}: {e.read()[:200]}")
-            except urllib.error.URLError:
-                time.sleep(1.0 * (attempt + 1))
-        raise CheckoError(f"Сеть/лимит Checko после {self.retries} попыток")
+        tried = 0
+        while tried < len(self.keys):
+            url = f"{BASE}/{method}?" + urllib.parse.urlencode(dict(params, key=self.token))
+            for attempt in range(self.retries):
+                try:
+                    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=20) as r:
+                        time.sleep(self.pause)
+                        return json.loads(r.read().decode("utf-8"))
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        return {}
+                    if e.code == 429:                 # транзиентный троттл — подождать и повторить
+                        time.sleep(1.5 * (attempt + 1)); continue
+                    if e.code in (401, 403):          # ключ невалиден/исчерпан — на следующий
+                        break
+                    raise CheckoError(f"HTTP {e.code}: {e.read()[:200]}")
+                except urllib.error.URLError:
+                    time.sleep(1.0 * (attempt + 1))
+            tried += 1                                # текущий ключ не сработал -> следующий
+            if tried < len(self.keys):
+                self._ki = (self._ki + 1) % len(self.keys)
+                print(f"[checko] ключ исчерпан/невалиден — переключаюсь на запасной #{self._ki + 1}")
+        raise CheckoError("Checko: все ключи исчерпаны/недоступны (лимит или 403)")
 
     def company(self, inn, dump=False):
         """ИНН -> карточка организации ЕГРЮЛ (включая блок 'Контакты'). {} если нет."""

@@ -61,6 +61,14 @@ try:
 except Exception:
     pass
 
+# Справочник подклассов ОКВЭД-2 — чтобы разворачивать коды отраслей уровня NN / NN.N в
+# реальные NN.NN (Checko матчит точно, префиксы не работают). Фолбэк на пустой набор:
+# без справочника поведение прежнее (короткие коды просто отбрасываются).
+try:
+    from okved2_codes import OKVED2_SUBCLASSES
+except Exception:                            # noqa: BLE001
+    OKVED2_SUBCLASSES = frozenset()
+
 BASE = "https://api.checko.ru/v2"
 PAGE_LIMIT = 100          # максимум, который отдаёт Checko за один запрос
 MAX_PAGES_HARD = 50       # предохранитель: 50 стр = 5000 компаний на код = 50 запросов
@@ -111,16 +119,32 @@ def _digits(s):
     return re.sub(r"\D", "", str(s or ""))
 
 
-def usable_okved(codes):
-    """Разделить коды на пригодные (NN.NN и глубже) и бесполезные для Checko (NN, NN.N).
+def _okved_children(prefix):
+    """NN / NN.N -> список реальных подклассов NN.NN из справочника ОКВЭД-2."""
+    p = str(prefix).strip()
+    if re.fullmatch(r"\d{2}", p):            # класс NN -> все NN.xx
+        return sorted(c for c in OKVED2_SUBCLASSES if c[:2] == p)
+    if re.fullmatch(r"\d{2}\.\d", p):        # группа NN.N -> NN.Nx
+        return sorted(c for c in OKVED2_SUBCLASSES if c.startswith(p))
+    return []
 
-    Причина в docstring модуля: основной ОКВЭД короче 4 знаков в реестре не встречается,
-    поэтому запрос по '42' или '42.1' вернёт 0 записей — не потому что компаний нет.
+
+def usable_okved(codes):
+    """Коды отрасли -> (пригодные_для_Checko, реально_бесполезные).
+
+    NN.NN и глубже берём как есть. NN и NN.N РАЗВОРАЧИВАЕМ в реальные подклассы NN.NN по
+    справочнику ОКВЭД-2 (okved2_codes) — Checko матчит основной ОКВЭД точно, префиксы не
+    работают, а короче 4 знаков основной ОКВЭД в реестре не встречается. В coarse попадают
+    только коды, у которых в справочнике нет подклассов (почти не бывает, либо нет справочника).
     """
     ok, coarse = [], []
     for c in codes:
-        (ok if len(_digits(c)) >= 4 else coarse).append(c)
-    return ok, coarse
+        if len(_digits(c)) >= 4:
+            ok.append(c)
+            continue
+        kids = _okved_children(c)
+        (ok.extend(kids) if kids else coarse.append(c))
+    return list(dict.fromkeys(ok)), coarse
 
 
 def resolve_region(region):
@@ -133,30 +157,45 @@ def resolve_region(region):
     """
     if not region:
         return None, None
-    q = str(region).strip()
-    neg = bool(re.match(r"^\s*(НЕ|не|NOT|!)\s+", q))
-    q = re.sub(r"^\s*(НЕ|не|NOT|!)\s+", "", q).strip()
+    # Алиасы аббревиатур (ХМАО/ЯНАО/СПб/МСK…) — ЕДИНЫЙ источник с RusProfile-путём.
+    # Ленивый импорт с фолбэком: в минимальном образе source_rusprofile может не встать.
+    try:
+        from source_rusprofile import region_patterns
+    except Exception:                                   # noqa: BLE001
+        region_patterns = lambda s: [str(s or "").strip().lower()]  # noqa: E731
 
-    codes, names = [], []
-    for part in re.split(r"[,;]", q):
+    # Негатив разбираем ПО КАЖДОМУ элементу списка, а не по всей строке: иначе
+    # «Дагестан, не Москва» трактовалось как ВКЛючить и Дагестан, И Москву (список
+    # начинался не с «не», а внутри «не Москва» подстрокой матчилась Москва как include).
+    _NEG = r"^\s*(НЕ|не|NOT|not|КРОМЕ|кроме|!|-)\s*"
+    inc_codes, exc_names = [], []          # include -> коды (серверный фильтр); exclude -> имена (клиентский)
+    for part in re.split(r"[,;]", str(region)):
         part = part.strip()
         if not part:
             continue
-        if part.isdigit():
-            codes.append(part.zfill(2))
-            names.append(REGION_CODES.get(part.zfill(2), part))
+        neg = bool(re.match(_NEG, part))
+        part = re.sub(_NEG, "", part).strip()
+        if not part:
             continue
-        low = part.lower().replace("ё", "е")
-        hit = [c for c, n in REGION_CODES.items()
-               if low in n.lower().replace("ё", "е") or n.lower().replace("ё", "е") in low]
-        if hit:
-            codes.extend(hit)
-            names.extend(REGION_CODES[c] for c in hit)
+        if part.isdigit():
+            hits = [part.zfill(2)]
         else:
+            hits = []                       # аббревиатура -> подстроки полного имени субъекта
+            for pat in (region_patterns(part) or []):
+                p = pat.replace("ё", "е")
+                for c, n in REGION_CODES.items():
+                    nl = n.lower().replace("ё", "е")
+                    if p in nl or nl in p:
+                        hits.append(c)
+            hits = list(dict.fromkeys(hits))            # дедуп с сохранением порядка
+        if not hits:
             log(f"[!] регион «{part}» не опознан — фильтр по нему применён НЕ БУДЕТ")
-    if neg:
-        return None, names or [q]        # исключение -> только клиентски
-    return (codes or None), None
+            continue
+        if neg:
+            exc_names.extend(REGION_CODES.get(c, c) for c in hits)
+        else:
+            inc_codes.extend(hits)
+    return (inc_codes or None), (exc_names or None)
 
 
 def region_name(code):
@@ -168,39 +207,47 @@ class CheckoSearch:
     /company и не считает страницы. Ошибки/429/лимит обрабатываем здесь же."""
 
     def __init__(self, token=None, pause=0.25, retries=3):
-        import os
-        self.token = token or os.environ.get("CHECKO_TOKEN") or ""
-        if not self.token:
+        from checko_enrich import checko_keys        # единый источник ключей (+ запасные)
+        self.keys = [token.strip()] if token else checko_keys()
+        if not self.keys:
             raise CheckoSourceError("Не задан CHECKO_TOKEN (env или token=...)")
+        self._ki = 0                                 # индекс текущего ключа (запоминаем рабочий)
         self.pause = pause
         self.retries = retries
         self.requests_used = 0
 
+    @property
+    def token(self):
+        return self.keys[self._ki]
+
     def _get(self, params):
-        url = f"{BASE}/search?" + urllib.parse.urlencode(dict(params, key=self.token))
-        for attempt in range(self.retries):
-            try:
-                req = urllib.request.Request(url, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req, timeout=25) as r:
-                    self.requests_used += 1
-                    time.sleep(self.pause)
-                    return json.loads(r.read().decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                if e.code == 429:               # суточный лимит/троттл
-                    if attempt == self.retries - 1:
-                        raise CheckoSourceError(
-                            "Checko: 429 — исчерпан лимит запросов. На бесплатном тарифе "
-                            "это 100/сутки; для прогона нужен платный доступ.")
-                    time.sleep(2.0 * (attempt + 1))
-                    continue
-                if e.code in (401, 403):
-                    raise CheckoSourceError(f"Checko {e.code}: неверный ключ или нет доступа")
-                if e.code == 404:
-                    return {}
-                raise CheckoSourceError(f"Checko HTTP {e.code}: {e.read()[:200]}")
-            except urllib.error.URLError:
-                time.sleep(1.0 * (attempt + 1))
-        raise CheckoSourceError(f"Checko: сеть недоступна после {self.retries} попыток")
+        tried = 0
+        while tried < len(self.keys):
+            url = f"{BASE}/search?" + urllib.parse.urlencode(dict(params, key=self.token))
+            for attempt in range(self.retries):
+                try:
+                    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=25) as r:
+                        self.requests_used += 1
+                        time.sleep(self.pause)
+                        return json.loads(r.read().decode("utf-8"))
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        return {}
+                    if e.code == 429:               # троттл/лимит текущего ключа — подождать и повторить
+                        time.sleep(2.0 * (attempt + 1)); continue
+                    if e.code in (401, 403):        # ключ невалиден/исчерпан — на следующий
+                        break
+                    raise CheckoSourceError(f"Checko HTTP {e.code}: {e.read()[:200]}")
+                except urllib.error.URLError:
+                    time.sleep(1.0 * (attempt + 1))
+            tried += 1                               # текущий ключ не сработал -> следующий
+            if tried < len(self.keys):
+                self._ki = (self._ki + 1) % len(self.keys)
+                log(f"[checko] ключ исчерпан/невалиден — переключаюсь на запасной #{self._ki + 1}")
+        raise CheckoSourceError(
+            "Checko: все ключи исчерпаны/недоступны — лимит (100/сут на бесплатном тарифе) или "
+            "неверный ключ. Добавь запасной ключ в CHECKO_TOKEN_ALT.")
 
     def by_okved(self, okved, region_code=None, max_pages=MAX_PAGES_HARD, active=True):
         """Все юрлица с ОСНОВНЫМ ОКВЭД=okved (опц. в регионе). Генератор записей."""
