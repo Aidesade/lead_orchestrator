@@ -143,8 +143,25 @@ def _kimi_env():
     return env
 
 
-def _handle(lead):
-    aspects = "профиль, процессы as-is, точки внедрения ИИ, оргструктура, ЛПР, контакты, СМИ за 5 лет"
+# ДВА прохода дипресёрча: у документов разные цели, значит и разный добор. Раньше был
+# один общий проход на оба — добор под роли/контакты разменивался на добор под процессы.
+# Проходы кэшируются раздельно (findings_<ключ>__<проход>.md), поэтому ретрай писателя и
+# повторный прогон не гоняют движок заново.
+RESEARCH_PASSES = (
+    ("process", "профиль и виды деятельности, услуги, процессы as-is, ИТ-ландшафт и "
+                "внедрённые ИС, госконтракты как заказчика и как поставщика, финансы, "
+                "вакансии, регламенты, суды и жалобы, точки внедрения ИИ"),
+    ("roles", "оргструктура, руководство и замы, ЛПР, руководитель ИТ/цифровизации, "
+              "закупки и контактные лица извещений, филиалы и их директора, официальные "
+              "контакты, деловые соцсети и публичные профили руководителей, учредитель и "
+              "курирующее ведомство, назначения в СМИ за 5 лет"),
+)
+
+_ASPECTS_DEFAULT = "профиль, процессы as-is, точки внедрения ИИ, оргструктура, ЛПР, контакты, СМИ за 5 лет"
+
+
+def _handle(lead, aspects=None):
+    aspects = aspects or _ASPECTS_DEFAULT
     # website из ФАЗЫ 1 -> подсказка-домен движку deep_research (сайт-коллектор без зависимости от поиска)
     site = (lead.get("website") or "").strip()
     if site:
@@ -196,22 +213,28 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     # SDK-вызовов. Движок отдаёт готовые находки (филиалы+телефоны, соцсети, контакты,
     # официалка), у строк — source URL. Результат кэшируется на диске: ретрай писателя
     # и повторный прогон не гоняют (и не оплачивают) deep-research заново.
+    # ДВА прохода (RESEARCH_PASSES): свой добор под процессы и свой — под роли/контакты.
     ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
-    findings = _cached_findings(h["company_name"], h["inn"], ttl_h=ttl_h)
-    if findings:
-        print(f"    [{idx}] deep_research: находки из кэша (моложе {ttl_h:g} ч) — движок пропущен")
-    else:
-        print(f"    [{idx}] deep_research (движок) ...")
+    f = {}
+    for pass_, aspects in RESEARCH_PASSES:
+        hp = _handle(lead, aspects)
+        cached = _cached_findings(hp["company_name"], hp["inn"], ttl_h=ttl_h, pass_=pass_)
+        if cached:
+            print(f"    [{idx}] deep_research[{pass_}]: находки из кэша "
+                  f"(моложе {ttl_h:g} ч) — движок пропущен")
+            f[pass_] = cached
+            continue
+        print(f"    [{idx}] deep_research[{pass_}] (движок) ...")
         try:
-            findings = await DRE.deep_research(h["company_name"], h["inn"], h["aspects"])
+            f[pass_] = await DRE.deep_research(hp["company_name"], hp["inn"], hp["aspects"])
         except Exception as e:
-            print(f"    [{idx}] deep_research engine error: {str(e)[:90]}")
-            findings = ""
-        cp = _findings_cache_path(h["company_name"], h["inn"])
-        if cp and findings and len(findings) > 200:
+            print(f"    [{idx}] deep_research[{pass_}] engine error: {str(e)[:90]}")
+            f[pass_] = ""
+        cp = _findings_cache_path(hp["company_name"], hp["inn"], pass_)
+        if cp and f[pass_] and len(f[pass_]) > 200:
             try:
                 os.makedirs(os.path.dirname(cp), exist_ok=True)
-                open(cp, "w", encoding="utf-8").write(findings)
+                open(cp, "w", encoding="utf-8").write(f[pass_])
             except OSError:
                 pass
 
@@ -220,6 +243,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     # «пробив»/утечки исключены в самом person_enrich (DENY_SOURCES). SMTP-проверка email
     # и соц-поиск — под env (PERSON_VERIFY_EMAIL / PERSON_SOCIAL), по умолчанию выключены,
     # чтобы 200-прогон был быстрым и не долбил чужие серверы.
+    # Идёт в проход roles: это контакты ЛПР, карте процессов они не нужны.
     if person_enrich and lead.get("contact_person") and lead.get("_inn"):
         try:
             import person_enrich as PEN
@@ -228,12 +252,15 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
             pe = await asyncio.to_thread(
                 PEN.enrich_person, lead["contact_person"], lead["_inn"],
                 domain=lead.get("website"), verify_email=_pv, social=_ps)
-            findings = (findings or "") + "\n\n" + PEN.format_findings_block(pe)
+            f["roles"] = (f.get("roles") or "") + "\n\n" + PEN.format_findings_block(pe)
             print(f"    [{idx}] person_enrich: email {len(pe['contacts']['work_emails'])}, "
                   f"тел {len(pe['contacts']['work_phones'])}"
                   + ("" if pe.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
         except Exception as e:
             print(f"    [{idx}] person_enrich пропущен: {str(e)[:80]}")
+
+    # Боль для слайда 3 one-pager'а ищется в процессном проходе — там она и живёт.
+    pain_findings = f.get("process") or f.get("roles") or ""
 
     # --- писатель на Kimi -----------------------------------------------------------
     # Ресёрч (движок + person_enrich) выше УЖЕ выполнен, поэтому писателю инструменты не
@@ -241,8 +268,14 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     # Ветка стоит здесь, а не выше, ровно чтобы находки и обогащение ЛПР были общими для
     # обеих моделей — меняется автор текста, а не пайплайн.
     if WK.is_kimi(model):
-        cost = await WK.write_two_docx(lead, idx, findings, d_tmp, s_tmp, model)
-        return cost, findings
+        cost = await WK.write_two_docx(lead, idx, f.get("process", ""), f.get("roles", ""),
+                                       d_tmp, s_tmp, model)
+        return cost, pain_findings
+
+    # Писатель на Claude — одна сессия на PRESALE_SYSTEM, поэтому оба прохода отдаём ей
+    # склеенными и помеченными, чтобы модель понимала, где чей материал.
+    findings = (f"=== НАХОДКИ: ПРОЦЕССЫ ===\n{f.get('process', '')}\n\n"
+                f"=== НАХОДКИ: РОЛИ И КОНТАКТЫ ===\n{f.get('roles', '')}")
 
     options = ClaudeAgentOptions(
         model=model,
@@ -306,7 +339,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
             await _drive("Ты НЕ сохранил: " + "; ".join(missing) + ". Немедленно вызови "
                          "недостающий инструмент save_*_docx с заполненными данными из "
                          "находок. Больше ничего не делай.")
-    return cost, findings
+    return cost, pain_findings
 
 
 def _presentation_prereqs():
@@ -632,24 +665,36 @@ class _Tee:
                 pass
 
 
-def _findings_cache_path(name, inn):
-    """Файл кэша находок движка (переживает прогоны). Ключ — ИНН, фолбэк — имя."""
+def _findings_cache_path(name, inn, pass_=""):
+    """Файл кэша находок движка (переживает прогоны). Ключ — ИНН, фолбэк — имя.
+    pass_ разводит проходы дипресёрча по разным файлам; пустой — легаси-кэш от
+    одного общего прохода (его ещё читают старые каталоги, поэтому имя не трогаем)."""
     key = str(inn or "").strip() or DO._safe(name)[:60].replace(" ", "_")
     if not key:
         return ""
-    return os.path.join(_work_base("orq_cache"), f"findings_{key}.md")
+    suffix = f"__{pass_}" if pass_ else ""
+    return os.path.join(_work_base("orq_cache"), f"findings_{key}{suffix}.md")
 
 
-def _cached_findings(name, inn, ttl_h=None):
+def _cached_findings(name, inn, ttl_h=None, pass_="", legacy_ok=False):
     """Прочитать кэш находок, если он есть, содержателен (>200 симв.) и свеж.
-    ttl_h=None — возраст не проверять (например, боль для слайда 3 не протухает)."""
-    p = _findings_cache_path(name, inn)
-    try:
-        if p and os.path.isfile(p) and os.path.getsize(p) > 200:
-            if ttl_h is None or time.time() - os.path.getmtime(p) < ttl_h * 3600:
-                return open(p, encoding="utf-8", errors="replace").read()
-    except OSError:
-        pass
+    ttl_h=None — возраст не проверять (например, боль для слайда 3 не протухает).
+
+    legacy_ok — разрешить откат на кэш от старого ОДНОГО общего прохода. По умолчанию
+    выключено и включается только там, где находки нужны как справка (боль для слайда 3):
+    для самих проходов откат недопустим — оба прочитали бы ОДИН и тот же легаси-файл, и
+    двухпроходный ресёрч молча выродился бы в однопроходный на всех уже прогнанных
+    компаниях. Пусть лучше проход честно сходит в движок и заведёт свой кэш."""
+    paths = [_findings_cache_path(name, inn, pass_)]
+    if pass_ and legacy_ok:
+        paths.append(_findings_cache_path(name, inn))
+    for p in paths:
+        try:
+            if p and os.path.isfile(p) and os.path.getsize(p) > 200:
+                if ttl_h is None or time.time() - os.path.getmtime(p) < ttl_h * 3600:
+                    return open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            pass
     return ""
 
 
@@ -989,7 +1034,11 @@ async def main():
                                 "dir": dest, "resumed": True, "pdf": pdf_done, "files": 0}
                     if docx_done:
                         skip_docx = True    # догоняем только one-pager
-                        findings = _cached_findings(lead.get("name"), lead.get("_inn"))
+                        # .docx уже готовы — находки нужны только как справка для боли
+                        # на слайде 3, поэтому легаси-кэш здесь годится: гонять движок
+                        # ради одного абзаца незачем.
+                        findings = _cached_findings(lead.get("name"), lead.get("_inn"),
+                                                    pass_="process", legacy_ok=True)
                         print(f"  ↷ [{idx}] {lead.get('name')[:40]}: .docx уже готовы — делаю только one-pager")
 
                 if a.dry_run:

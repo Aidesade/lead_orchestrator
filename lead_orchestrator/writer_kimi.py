@@ -8,6 +8,10 @@
 возвращает JSON по ТОЙ ЖЕ схеме, а .docx рендерят ТЕ ЖЕ функции CRA._write_*_docx.
 Формат документов от смены модели не меняется — меняется только автор текста.
 
+У каждого документа СВОЙ системный промпт (CRA.PROCESS_MAP_SYSTEM / CRA.ROLES_CONTACTS_SYSTEM
++ SYSTEM_TAIL) и СВОИ находки — со своего прохода движка (orchestrator.RESEARCH_PASSES).
+Раньше был один PRESALE_SYSTEM и одни общие находки на оба документа.
+
 Почему не kimi-agent-sdk: он конфликтует с claude-agent-sdk по pydantic-core и потому
 живёт в отдельном venv (см. комментарий в Dockerfile). Тащить его в основной процесс
 нельзя. Здесь обычный OpenAI-совместимый HTTP через `openai`, который и так закреплён
@@ -64,18 +68,22 @@ def is_kimi(model: str | None) -> bool:
     return str(model or "").strip().lower().startswith("kimi")
 
 
-# Дополнение к PRESALE_SYSTEM: тот промпт написан под агента с инструментами и содержит
-# порядок «вызови deep_research, потом WebSearch». Для Kimi этот порядок неприменим —
-# переопределяем его явно, иначе модель будет просить инструменты, которых нет.
+# Дополнение к системным промптам документов: они написаны под агента с инструментами
+# («зови deep_research, ищи WebSearch'ем, вызови save_*_docx» — и метод отдан агенту).
+# Для Kimi инструментов нет, поэтому режим переопределяем явно, иначе модель будет
+# просить инструменты, которых нет, и считать работу невыполненной без вызова save_*.
 SYSTEM_TAIL = """
 
---- РЕЖИМ РАБОТЫ (ПЕРЕОПРЕДЕЛЯЕТ ПОРЯДОК ВЫШЕ) ---
-Инструментов у тебя НЕТ. deep_research уже отработал отдельным движком, его находки
-целиком даны в сообщении пользователя. Ничего не вызывай, ничего не проси, не пиши
-«я не могу выполнить поиск» — весь нужный материал уже перед тобой.
+--- РЕЖИМ РАБОТЫ (ПЕРЕОПРЕДЕЛЯЕТ ВСЁ ПРО ИНСТРУМЕНТЫ ВЫШЕ) ---
+Инструментов у тебя НЕТ: ни deep_research, ни WebSearch/WebFetch, ни save_*_docx.
+Дипресёрч уже отработал отдельным движком под ЭТОТ документ, его находки целиком даны
+в сообщении пользователя. Ничего не вызывай, ничего не проси, не пиши «я не могу
+выполнить поиск» — весь нужный материал уже перед тобой.
 
-ОТВЕТ: строго ОДИН JSON-объект по схеме из запроса. Без markdown, без ```-заборов,
-без пояснений до и после. Никаких комментариев внутри JSON.
+ДЕЛИВЕРАБЛ — не вызов инструмента, а ОТВЕТ: строго ОДИН JSON-объект по схеме из
+запроса. Без markdown, без ```-заборов, без пояснений до и после. Никаких комментариев
+внутри JSON. Требование «работа не выполнена, пока не вызван save_*_docx» здесь не
+действует: заполненный JSON и есть сохранение — .docx соберёт вызывающий код.
 
 ДАННЫЕ: бери из находок. Ничего не выдумывай: если данных по полю нет — оставь пустую
 строку или пустой список. Но и не пиши «не подтверждено» там, где в находках данные ЕСТЬ
@@ -102,15 +110,20 @@ def _user_prompt(title: str, schema: dict, name: str, inn: str,
 
 
 PROCESS_EXTRA = (
-    "Обязательно: разложи ключевые процессы as-is с болями и точкой внедрения ИИ "
-    "(RAG-база знаний / автономные агенты / ИИ-Коуч), опирайся на профиль, финансы и "
-    "контракты из находок. У фактов проставляй source."
+    "Обязательно: сначала process_catalog — ВЕСЬ спектр процессов компании (включая те, где "
+    "точки внедрения ИИ нет, с «—»), каталог не обрезай; затем processes — детальные карточки "
+    "по приоритетным процессам as-is с болями и точкой внедрения ИИ (RAG / автономные агенты "
+    "с упором в агентный режим / ИИ-Коуч). Опирайся на профиль, финансы и контракты из находок. "
+    "У фактов проставляй source."
 )
 
 ROLES_EXTRA = (
     "Обязательно перенеси из находок: таблицу филиалов (директор + телефон), соцсети, "
     "официальные контакты, блок «Экосистема и вертикаль» -> ecosystem_table, а если есть "
-    "блок «ПРЯМЫЕ КОНТАКТЫ ЛПР» — прямой email/телефон ЛПР с источником и уровнем доверия."
+    "блок «ПРЯМЫЕ КОНТАКТЫ ЛПР» — прямой email/телефон ЛПР с источником и уровнем доверия. "
+    "Обязательно заполни contacts_table — сводную таблицу ВСЕХ найденных лиц по корзинам "
+    "(IT/цифровизация/продукт, коммерция/продажи/закупки, первые лица, финансы, филиалы); "
+    "в неё лица из leadership_table и branches_table переносятся намеренно."
 )
 
 
@@ -164,9 +177,13 @@ def _tokens(usage) -> int:
     return int(getattr(usage, "total_tokens", 0) or 0) if usage else 0
 
 
-async def write_two_docx(lead: dict, idx: int, findings: str,
+async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_roles: str,
                          d_tmp: str, s_tmp: str, model: str | None = None) -> float:
     """Сделать оба .docx на Kimi. Возвращает стоимость (0.0 — шлюз цену не отдаёт).
+
+    У каждого документа СВОЙ системный промпт (PROCESS_MAP_SYSTEM / ROLES_CONTACTS_SYSTEM)
+    и СВОИ находки — со своего прохода движка. Раньше был один PRESALE_SYSTEM и одни общие
+    находки на оба документа.
 
     Ретраи и проверку размеров файлов делает вызывающий (orchestrator: 3 попытки по факту
     отсутствия/малого размера .docx) — здесь не дублируем.
@@ -175,21 +192,20 @@ async def write_two_docx(lead: dict, idx: int, findings: str,
     name = (lead.get("name") or "").strip()
     inn = str(lead.get("_inn") or "").strip()
     api_model = kimi_model(model)
-    system = CRA.PRESALE_SYSTEM + SYSTEM_TAIL
 
     jobs = (
-        ("карта бизнес-процессов", CRA.PROCESS_MAP_SCHEMA, PROCESS_EXTRA,
-         CRA._write_process_map_docx, d_tmp, "процессы"),
-        ("карта ролей и контактов · пресейл", CRA.ROLES_CONTACTS_SCHEMA, ROLES_EXTRA,
-         CRA._write_roles_contacts_docx, s_tmp, "роли"),
+        (CRA.PROCESS_MAP_SYSTEM, "карта бизнес-процессов", CRA.PROCESS_MAP_SCHEMA,
+         PROCESS_EXTRA, findings_process, CRA._write_process_map_docx, d_tmp, "процессы"),
+        (CRA.ROLES_CONTACTS_SYSTEM, "карта ролей и контактов · пресейл", CRA.ROLES_CONTACTS_SCHEMA,
+         ROLES_EXTRA, findings_roles, CRA._write_roles_contacts_docx, s_tmp, "роли"),
     )
 
     client = _client()
     total_tokens = 0
     try:
-        for title, schema, extra, render, path, label in jobs:
+        for system, title, schema, extra, findings, render, path, label in jobs:
             payload, usage = await _ask_json(
-                client, api_model, system,
+                client, api_model, system + SYSTEM_TAIL,
                 _user_prompt(title, schema, name, inn, findings, extra),
                 idx, label)
             total_tokens += _tokens(usage)
