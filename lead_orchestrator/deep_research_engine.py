@@ -564,8 +564,43 @@ def _looks_tender_email(em):
     return em.get("role") == "tender" or "zakup" in (em.get("source", "").lower())
 
 
-def completeness_critic(findings, name="", inn="", domain=""):
-    """Считает пустые/«не подтверждено» в целевых таблицах и генерит follow-up под пробелы."""
+# Цели добора и слова, которыми их просит ВЫЗЫВАЮЩИЙ в aspects (агент формулирует их сам
+# под свой документ). Совпадение — по НАЧАЛУ слова (\b), иначе «ит» ловилось бы внутри
+# «сайт»/«итог». Список намеренно широкий: пропустить нужную цель дороже, чем добрать лишнюю.
+_GOAL_HINTS = {
+    "branch":       ("филиал", "подразделен", "оргструктур", "структур", "площадк"),
+    "leadership":   ("руковод", "лпр", "заместител", "замы", "оргструктур", "менеджмент",
+                     "назначен", "директор", "команд", "первое лицо"),
+    # «профил» сюда НЕ класть: ловит «профиль компании» и тянет соцсети в процессный проход.
+    "social":       ("соцсет", "соцпрофил", "telegram", "телеграм", "вконтакт", "публичные профили"),
+    "tender":       ("закупк", "тендер", "еис", "госконтракт", "контракт", "223", "44",
+                     "извещен", "поставщик"),
+    "it":           ("ит", "it", "цифровизац", "информационн"),
+    "it_landscape": ("ландшафт", "внедрён", "внедрен", "erp", "crm", "tadviser", "автоматизац"),
+    "ecosystem":    ("учредител", "ведомств", "холдинг", "экосистем", "материнск",
+                     "сестринск", "вертикал", "собственник", "группа компаний"),
+}
+
+
+def _focus_followups(followups, aspects):
+    """Оставить добор ТОЛЬКО под цели, названные вызывающим в aspects.
+
+    Это единственное место, где aspects реально меняют поведение движка (раньше строка
+    доезжала до `_domain_hint_from_aspects` и там же умирала — оба прохода искали одно и
+    то же). Пустые aspects или ни одного совпадения -> все цели, как было."""
+    a = (aspects or "").lower()
+    if not a.strip():
+        return followups
+    wanted = {goal for goal, hints in _GOAL_HINTS.items()
+              if any(re.search(r"\b" + re.escape(h), a) for h in hints)}
+    if not wanted:
+        return followups
+    return [f for f in followups if f.get("goal") in wanted]
+
+
+def completeness_critic(findings, name="", inn="", domain="", aspects=""):
+    """Считает пустые/«не подтверждено» в целевых таблицах и генерит follow-up под пробелы.
+    aspects (если заданы) сужают добор до целей, которые нужны вызывающему."""
     branches = findings.get("branches") or []
     leadership = findings.get("leadership") or []
     departments = findings.get("departments") or []
@@ -647,7 +682,9 @@ def completeness_critic(findings, name="", inn="", domain=""):
               "has_ecosystem": has_ecosystem, "ecosystem": len(ecosystem),
               "emails": len(contacts.get("emails") or []),
               "social": len(contacts.get("social") or []), "gaps": len(gaps)}
-    return {"gaps": gaps, "counts": counts, "followups": followups}
+    # Пробелы считаем ВСЕ (в отчёт о полноте идёт честная картина), а гонимся — только за
+    # тем, что просил вызывающий.
+    return {"gaps": gaps, "counts": counts, "followups": _focus_followups(followups, aspects)}
 
 
 # ============================================================================
@@ -789,15 +826,20 @@ async def _kimi_extract(system, prompt):
     return ""
 
 
-async def llm_extract(pages, focus="", model=EXTRACT_MODEL):
+async def llm_extract(pages, focus="", model=EXTRACT_MODEL, aspects=""):
     """Сырые страницы -> структурный JSON находок. Провайдер — DR_LLM_PROVIDER
-    ('claude' через claude-agent-sdk, либо 'kimi'). {} при недоступности/сбое."""
+    ('claude' через claude-agent-sdk, либо 'kimi'). {} при недоступности/сбое.
+    aspects (если заданы) двигают ПРИОРИТЕТ извлечения, но не схему и не правило
+    «нет в тексте — нет строки»."""
     if not DR_USE_LLM or not pages:
         return {}
     blob = _pages_blob(pages)
     if not blob.strip():
         return {}
-    prompt = (f"Источник: {focus}. Извлеки факты из загруженных страниц ниже в JSON по схеме "
+    aim = (f"ПРИОРИТЕТ ЭТОГО ПРОХОДА: {aspects.strip()}. Что относится к приоритету — извлекай "
+           f"в первую очередь и максимально полно. Схему это не меняет, выдумывать по-прежнему "
+           f"нельзя: нет факта в тексте — нет строки.\n" if (aspects or "").strip() else "")
+    prompt = (f"Источник: {focus}. {aim}Извлеки факты из загруженных страниц ниже в JSON по схеме "
               f"из системного промпта. Особое внимание: филиалы+их директора+телефоны, "
               f"контактные лица закупок, соцсети, ИТ/цифровизация, ИТ-ландшафт "
               f"(системы/вендоры/годы внедрения — особенно на страницах tadviser.ru), проектный институт, "
@@ -1368,7 +1410,7 @@ async def run_followups(followups, name, inn, domains):
 # ============================================================================
 # SUPERVISOR + КОНСОЛИДАЦИЯ
 # ============================================================================
-async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=""):
+async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint="", aspects=""):
     # 0) официальная база (структурные API) — блокирующая, в поток
     try:
         payload, official_md = await asyncio.to_thread(official_lookup, name, inn)
@@ -1397,7 +1439,7 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
     # 3) синтез: регэксп (страховка) + per-source LLM-экстракт (sonnet), затем merge
     parts = [regex_findings(all_pages)]
     extracts = await asyncio.gather(
-        *[llm_extract(r["pages"], r["source"]) for r in raws if r.get("pages")])
+        *[llm_extract(r["pages"], r["source"], aspects=aspects) for r in raws if r.get("pages")])
     parts += [e for e in extracts if e]
     findings = merge_findings(parts)
 
@@ -1409,7 +1451,7 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
     rounds = 0
     opened_urls = {pg["url"] for pg in all_pages if pg.get("url")}
     while rounds < depth:
-        crit = completeness_critic(findings, name, inn, domain)
+        crit = completeness_critic(findings, name, inn, domain, aspects=aspects)
         if not crit["followups"]:
             break
         fu = crit["followups"][:breadth]
@@ -1420,7 +1462,8 @@ async def supervisor(name, inn, breadth=DR_BREADTH, depth=DR_DEPTH, domain_hint=
         if not new_pages:
             break
         opened_urls |= {p["url"] for p in new_pages if p.get("url")}
-        more = [regex_findings(new_pages), await llm_extract(new_pages, f"followup{rounds + 1}")]
+        more = [regex_findings(new_pages),
+                await llm_extract(new_pages, f"followup{rounds + 1}", aspects=aspects)]
         findings = merge_findings([findings] + [m for m in more if m])
         rounds += 1
 
@@ -1610,7 +1653,7 @@ async def deep_research(company_name, inn="", aspects=""):
     _NOTES.clear()
     hint = _domain_hint_from_aspects(aspects)
     try:
-        return await supervisor(company_name, _digits(inn), domain_hint=hint)
+        return await supervisor(company_name, _digits(inn), domain_hint=hint, aspects=aspects)
     except Exception as e:
         _note(f"supervisor аварийно завершился: {str(e)[:120]}")
         try:

@@ -65,9 +65,9 @@ def _doc_names(dn):
             f"{dn}_презентация_Telepatt.pdf")
 
 
-# Инструменты ресёрч-агента: оба документа (формат/схемы/промпт — из CRA).
+# Инструменты ресёрч-агента: свой save на документ + веб. Движка (deep_research) в списке
+# нет намеренно — см. _research_one: где искать, решает агент, а не зашитый конвейер.
 ALLOWED = [
-    "mcp__research__deep_research",
     "mcp__research__save_process_map_docx",
     "mcp__research__save_roles_contacts_docx",
     "WebSearch", "WebFetch",
@@ -174,11 +174,23 @@ def _handle(lead, aspects=None):
 
 
 async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
-    """Один ресёрч-проход. ПРЕД-ЗАПУСК движка deep_research ДО сессии писателя (без
-    вложенных SDK-сессий внутри тула — именно вложенность сбивала писателя), затем
-    писатель форматирует находки и СОХРАНЯЕТ оба .docx. Возвращает (стоимость, находки):
-    находки нужны стадии презентации для формулировки боли заказчика (слайд 3).
-    d_tmp = карта бизнес-процессов, s_tmp = карта ролей и контактов."""
+    """Один ресёрч-проход. Возвращает (стоимость, находки): находки нужны стадии
+    презентации для формулировки боли заказчика. d_tmp = карта бизнес-процессов,
+    s_tmp = карта ролей и контактов.
+
+    Ветки принципиально разные — и это осознанно:
+
+    * Claude (opus/sonnet) — АГЕНТ. Своя сессия на документ, свой системный промпт
+      (PROCESS_MAP_SYSTEM / ROLES_CONTACTS_SYSTEM), инструменты — только WebSearch/WebFetch
+      и свой save_*_docx. Движка тут НЕТ вообще: где искать и что брать, решает агент, а
+      направляет его ТОЛЬКО системный промпт. На вход даются известные данные лида.
+    * Kimi — НЕ агент (инструментов нет), поэтому движок гоняется ЗАРАНЕЕ двумя проходами
+      (RESEARCH_PASSES), а модель получает готовые находки.
+
+    Почему движок убран из агентной ветки: он решал за агента И где искать (зашитые
+    коллекторы site/ЕИС/суды-СМИ/hh/TAdviser), И что взять со страницы (схема llm_extract —
+    ролецентричная, бизнес-процессов в ней нет вовсе). Заодно исчезла вложенная SDK-сессия
+    (движок внутри сессии писателя) — та самая, из-за которой его когда-то и вынесли."""
     import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
     import company_research_agent as CRA
     import deep_research_engine as DRE
@@ -203,47 +215,16 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
         await asyncio.to_thread(CRA._write_roles_contacts_docx, dict(args), s_tmp)
         return {"content": [{"type": "text", "text": "карта ролей и контактов сохранена"}]}
 
-    server = create_sdk_mcp_server(
-        name="research", version="5.0.0",
-        tools=[_save_process_map, _save_roles_contacts],   # БЕЗ deep_research — он выполнен заранее
-    )
     h = _handle(lead)
-
-    # ПРЕД-ЗАПУСК движка: на верхнем уровне, НЕ внутри сессии писателя -> без вложенных
-    # SDK-вызовов. Движок отдаёт готовые находки (филиалы+телефоны, соцсети, контакты,
-    # официалка), у строк — source URL. Результат кэшируется на диске: ретрай писателя
-    # и повторный прогон не гоняют (и не оплачивают) deep-research заново.
-    # ДВА прохода (RESEARCH_PASSES): свой добор под процессы и свой — под роли/контакты.
     ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
-    f = {}
-    for pass_, aspects in RESEARCH_PASSES:
-        hp = _handle(lead, aspects)
-        cached = _cached_findings(hp["company_name"], hp["inn"], ttl_h=ttl_h, pass_=pass_)
-        if cached:
-            print(f"    [{idx}] deep_research[{pass_}]: находки из кэша "
-                  f"(моложе {ttl_h:g} ч) — движок пропущен")
-            f[pass_] = cached
-            continue
-        print(f"    [{idx}] deep_research[{pass_}] (движок) ...")
-        try:
-            f[pass_] = await DRE.deep_research(hp["company_name"], hp["inn"], hp["aspects"])
-        except Exception as e:
-            print(f"    [{idx}] deep_research[{pass_}] engine error: {str(e)[:90]}")
-            f[pass_] = ""
-        cp = _findings_cache_path(hp["company_name"], hp["inn"], pass_)
-        if cp and f[pass_] and len(f[pass_]) > 200:
-            try:
-                os.makedirs(os.path.dirname(cp), exist_ok=True)
-                open(cp, "w", encoding="utf-8").write(f[pass_])
-            except OSError:
-                pass
 
-    # Обогащение ЛПР прямыми контактами — детерминированно, БЕЗ вложенной SDK-сессии
-    # (как пред-запуск движка). Легитимные источники (Dadata/Checko/сайт/MX/SMTP);
-    # «пробив»/утечки исключены в самом person_enrich (DENY_SOURCES). SMTP-проверка email
-    # и соц-поиск — под env (PERSON_VERIFY_EMAIL / PERSON_SOCIAL), по умолчанию выключены,
-    # чтобы 200-прогон был быстрым и не долбил чужие серверы.
-    # Идёт в проход roles: это контакты ЛПР, карте процессов они не нужны.
+    # Обогащение ЛПР прямыми контактами — детерминированно, БЕЗ вложенной SDK-сессии.
+    # Считается ДО развилки: нужно обеим веткам (Kimi получит блок в находках, агент — в
+    # задании). Легитимные источники (Dadata/Checko/сайт/MX/SMTP); «пробив»/утечки
+    # исключены в самом person_enrich (DENY_SOURCES). SMTP-проверка email и соц-поиск —
+    # под env (PERSON_VERIFY_EMAIL / PERSON_SOCIAL), по умолчанию выключены, чтобы
+    # 200-прогон был быстрым и не долбил чужие серверы.
+    pe_block = ""
     if person_enrich and lead.get("contact_person") and lead.get("_inn"):
         try:
             import person_enrich as PEN
@@ -252,94 +233,131 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
             pe = await asyncio.to_thread(
                 PEN.enrich_person, lead["contact_person"], lead["_inn"],
                 domain=lead.get("website"), verify_email=_pv, social=_ps)
-            f["roles"] = (f.get("roles") or "") + "\n\n" + PEN.format_findings_block(pe)
+            pe_block = PEN.format_findings_block(pe)
             print(f"    [{idx}] person_enrich: email {len(pe['contacts']['work_emails'])}, "
                   f"тел {len(pe['contacts']['work_phones'])}"
                   + ("" if pe.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
         except Exception as e:
             print(f"    [{idx}] person_enrich пропущен: {str(e)[:80]}")
 
-    # Боль для слайда 3 one-pager'а ищется в процессном проходе — там она и живёт.
-    pain_findings = f.get("process") or f.get("roles") or ""
-
-    # --- писатель на Kimi -----------------------------------------------------------
-    # Ресёрч (движок + person_enrich) выше УЖЕ выполнен, поэтому писателю инструменты не
-    # нужны: Kimi возвращает JSON по тем же схемам, а .docx рендерят те же CRA._write_*.
-    # Ветка стоит здесь, а не выше, ровно чтобы находки и обогащение ЛПР были общими для
-    # обеих моделей — меняется автор текста, а не пайплайн.
+    # ============ ветка Kimi: инструментов нет -> движок гоняем ЗАРАНЕЕ ============
+    # Два прохода (RESEARCH_PASSES): свой добор под процессы и свой — под роли/контакты.
+    # Кэш раздельный (findings_<ключ>__<проход>.md): ретрай писателя и повторный прогон
+    # не гоняют (и не оплачивают) deep-research заново.
     if WK.is_kimi(model):
+        f = {}
+        for pass_, aspects in RESEARCH_PASSES:
+            hp = _handle(lead, aspects)
+            cached = _cached_findings(hp["company_name"], hp["inn"], ttl_h=ttl_h, pass_=pass_)
+            if cached:
+                print(f"    [{idx}] deep_research[{pass_}]: находки из кэша "
+                      f"(моложе {ttl_h:g} ч) — движок пропущен")
+                f[pass_] = cached
+                continue
+            print(f"    [{idx}] deep_research[{pass_}] (движок) ...")
+            try:
+                f[pass_] = await DRE.deep_research(hp["company_name"], hp["inn"], hp["aspects"])
+            except Exception as e:
+                print(f"    [{idx}] deep_research[{pass_}] engine error: {str(e)[:90]}")
+                f[pass_] = ""
+            cp = _findings_cache_path(hp["company_name"], hp["inn"], pass_)
+            if cp and f[pass_] and len(f[pass_]) > 200:
+                try:
+                    os.makedirs(os.path.dirname(cp), exist_ok=True)
+                    open(cp, "w", encoding="utf-8").write(f[pass_])
+                except OSError:
+                    pass
+        # Контакты ЛПР — в проход roles: карте процессов они не нужны.
+        if pe_block:
+            f["roles"] = (f.get("roles") or "") + "\n\n" + pe_block
         cost = await WK.write_two_docx(lead, idx, f.get("process", ""), f.get("roles", ""),
                                        d_tmp, s_tmp, model)
-        return cost, pain_findings
+        # Боль для one-pager'а живёт в процессном проходе.
+        return cost, (f.get("process") or f.get("roles") or "")
 
-    # Писатель на Claude — одна сессия на PRESALE_SYSTEM, поэтому оба прохода отдаём ей
-    # склеенными и помеченными, чтобы модель понимала, где чей материал.
-    findings = (f"=== НАХОДКИ: ПРОЦЕССЫ ===\n{f.get('process', '')}\n\n"
-                f"=== НАХОДКИ: РОЛИ И КОНТАКТЫ ===\n{f.get('roles', '')}")
+    # ============ ветка Claude: агент решает всё сам ============
+    # Движка здесь НЕТ — ни deep_research, ни коллекторов, ни discover_domains. Движок = зашитый
+    # список источников (site/ЕИС/суды-СМИ/hh/TAdviser) и ролецентричная схема llm_extract, где
+    # бизнес-процессов нет вовсе: он решал за агента И где искать, И что оттуда взять. Агенту
+    # даются только веб и его save-инструмент, а направляет его ТОЛЬКО системный промпт.
+    # Приятный побочный эффект: SDK-сессии внутри сессии больше нет — уходит и та причина,
+    # по которой движок когда-то вынесли в пред-запуск.
+    server = create_sdk_mcp_server(
+        name="research", version="6.0.0",
+        tools=[_save_process_map, _save_roles_contacts],
+    )
 
-    options = ClaudeAgentOptions(
-        model=model,
-        system_prompt=CRA.PRESALE_SYSTEM,
-        mcp_servers={"research": server},
-        allowed_tools=[
-            "mcp__research__save_process_map_docx",
-            "mcp__research__save_roles_contacts_docx",
-            "WebSearch", "WebFetch",
-        ],
-        disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
-        permission_mode="bypassPermissions",
-        setting_sources=[],
-        max_turns=80,
-    )
-    handoff = (
-        "deep_research УЖЕ ВЫПОЛНЕН отдельным движком — НЕ запускай его заново. Вот "
-        "собранные находки (у строк есть source URL):\n\n"
-        f"{findings}\n\n"
-        "ЗАДАЧА: на основе ЭТИХ находок (плюс точечные доверки WebSearch/WebFetch по ЛЮБЫМ "
-        "существенным пробелам — не ограничивайся ИТ/тендерным контактом: вертикаль принятия "
-        "решений (учредитель/ведомство/сестринские структуры/комиссии), раздел «Команда» на "
-        "сайте, свежие назначения в СМИ) заполни схемы и "
-        "СОХРАНИ ОБА документа: вызови save_process_map_docx И save_roles_contacts_docx. "
-        "В карту ролей ОБЯЗАТЕЛЬНО перенеси таблицу филиалов (директор+телефон), соцсети и "
-        "официальные контакты ИЗ находок — не пиши «не подтверждено» там, где данные есть. "
-        "Блок «Экосистема и вертикаль» из находок перенеси в ecosystem_table карты ролей. "
-        "Если в находках есть блок «ПРЯМЫЕ КОНТАКТЫ ЛПР» — перенеси прямой email/телефон ЛПР "
-        "в карту ролей с указанием источника и уровня доверия.\n"
-        f"  company_name = {h['company_name']!r}\n"
-        f"  inn          = {h['inn']!r}\n"
-        "ВАЖНО: работа НЕ выполнена, пока ты не вызвал ОБА инструмента save_*_docx. "
-        "Текстовый ответ результатом НЕ является."
-    )
+    # Вход агента — то, что известно про компанию из лида. Не метод, а данные: откуда копать
+    # дальше, решает он.
+    known = [f"  company_name = {h['company_name']!r}", f"  inn          = {h['inn']!r}"]
+    for field, label in (("_ogrn", "ogrn"), ("website", "сайт"), ("contact_person", "ЛПР"),
+                         ("phone", "телефон"), ("email", "email")):
+        if (lead.get(field) or "").strip():
+            known.append(f"  {label:12} = {lead[field]!r}")
+    if lead.get("_revenue"):
+        known.append(f"  выручка      = {lead['_revenue']:,} ₽".replace(",", " ")
+                     + (f" за {lead['_revenue_year']} г." if lead.get("_revenue_year") else ""))
+    known = "\n".join(known)
 
     cost = 0.0
 
-    async def _drive(msg):
-        nonlocal cost
-        await client.query(msg)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock):
-                        print(f"    [{idx}] → {getattr(block, 'name', '')}")
-            elif isinstance(message, ResultMessage):
-                if getattr(message, "total_cost_usd", None):
-                    cost += message.total_cost_usd
+    async def _session(system, save_tool, out_path, task, extra=""):
+        """Одна сессия = один документ = свой системный промпт + свой ЕДИНСТВЕННЫЙ
+        save-инструмент. Второй save не отдаём: агент физически не уедет в чужой документ.
+        Где искать и что брать — не навязываем ничем, кроме системного промпта."""
+        options = ClaudeAgentOptions(
+            model=model,
+            system_prompt=system,
+            mcp_servers={"research": server},
+            allowed_tools=[f"mcp__research__{save_tool}", "WebSearch", "WebFetch"],
+            disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
+            permission_mode="bypassPermissions",
+            setting_sources=[],
+            max_turns=120,          # ресёрч агент ведёт сам -> ходов нужно кратно больше
+        )
+        handoff = (
+            f"{task}\n"
+            "Что известно о компании (это ВХОДНЫЕ ДАННЫЕ, а не готовый ресёрч):\n"
+            f"{known}\n"
+            + (f"{extra}\n" if extra else "")
+            + f"Работа НЕ выполнена, пока не вызван {save_tool}: текстовый ответ результатом "
+              "не является."
+        )
 
-    async with ClaudeSDKClient(options=options) as client:
-        await _drive(handoff)
-        # нудж-ретрай: если какой-то документ не сохранён — потребовать сохранить
-        for _ in range(2):
-            missing = []
-            if not os.path.exists(d_tmp):
-                missing.append("save_process_map_docx (карта бизнес-процессов)")
-            if not os.path.exists(s_tmp):
-                missing.append("save_roles_contacts_docx (карта ролей и контактов)")
-            if not missing:
-                break
-            await _drive("Ты НЕ сохранил: " + "; ".join(missing) + ". Немедленно вызови "
-                         "недостающий инструмент save_*_docx с заполненными данными из "
-                         "находок. Больше ничего не делай.")
-    return cost, pain_findings
+        async def _drive(msg):
+            nonlocal cost
+            await client.query(msg)
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock):
+                            print(f"    [{idx}] → {getattr(block, 'name', '')}")
+                elif isinstance(message, ResultMessage):
+                    if getattr(message, "total_cost_usd", None):
+                        cost += message.total_cost_usd
+
+        async with ClaudeSDKClient(options=options) as client:
+            await _drive(handoff)
+            for _ in range(2):      # нудж-ретрай: документ не сохранён -> потребовать
+                if os.path.exists(out_path):
+                    break
+                await _drive(f"Ты НЕ вызвал {save_tool} — документ не сохранён. Немедленно "
+                             "вызови его с заполненными данными. Больше ничего не делай.")
+
+    await _session(
+        CRA.PROCESS_MAP_SYSTEM, "save_process_map_docx", d_tmp,
+        "Сделай КАРТУ БИЗНЕС-ПРОЦЕССОВ по компании.")
+    await _session(
+        CRA.ROLES_CONTACTS_SYSTEM, "save_roles_contacts_docx", s_tmp,
+        "Сделай КАРТУ РОЛЕЙ И КОНТАКТОВ · ПРЕСЕЙЛ по компании.",
+        extra=(("Прямые контакты ЛПР уже добыты детерминированно (легитимные источники) — "
+                f"перенеси их в документ с источником и уровнем доверия:\n{pe_block}")
+               if pe_block else ""))
+
+    # Находок движка тут нет по построению — агент ресёрчил сам, в своей сессии. Боль для
+    # one-pager'а стадия возьмёт из кэша движка (если он остался от Kimi-прогона), иначе
+    # сформулирует по отрасли — `_main_pain` пустую строку переживает.
+    return cost, ""
 
 
 def _presentation_prereqs():
