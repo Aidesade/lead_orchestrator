@@ -42,6 +42,7 @@ import sys
 import tempfile
 import time
 import warnings
+from typing import Annotated
 
 # Косметический RequestsDependencyWarning (chardet 7.x вне диапазона requests; ставится Crawl4AI,
 # на работу не влияет) — глушим ДО первого импорта requests. Фильтр по тексту, без импорта requests.
@@ -65,12 +66,17 @@ def _doc_names(dn):
             f"{dn}_презентация_Telepatt.pdf")
 
 
-# Инструменты ресёрч-агента: свой save на документ + веб. Движка (deep_research) в списке
+# Инструменты ресёрч-агента: свой save на документ + веб + веер субагентов ("Agent";
+# типы scout/critic/verifier объявлены в _research_one). Движка (deep_research) в списке
 # нет намеренно — см. _research_one: где искать, решает агент, а не зашитый конвейер.
+# ⚠️ Справочная константа: кодом НЕ используется — боевой allowlist собирается инлайном
+# в _session (по ОДНОМУ save-инструменту на сессию, а не оба сразу). Правя один список,
+# правь и второй.
 ALLOWED = [
     "mcp__research__save_process_map_docx",
     "mcp__research__save_roles_contacts_docx",
     "WebSearch", "WebFetch",
+    "Agent",
 ]
 
 # --- Стадия презентации (третий деливерабл: редакционный one-pager .pdf на Kimi) ---
@@ -98,6 +104,26 @@ KIMI_MODEL_DEFAULT = "kimi-k2.7-code"
 
 def _kimi_key():
     return (os.environ.get("KIMI_API_KEY") or os.environ.get("GPLLM_API_KEY") or "").strip()
+
+
+# --- Кап одновременных браузерных краулов (тул crawl_site у субагентов-разведчиков) ---
+# Каждый краул Crawl4AI поднимает СВОЙ chromium. Веер scout'ов множится на --workers, и
+# без капа прогон упирается в RAM (то самое 0xC0000409). Семафор ленивый и привязан к
+# текущему loop — как _sem в движке: у воркеров могут быть разные loop'ы.
+ORQ_CRAWL_CONCURRENCY = int(os.environ.get("ORQ_CRAWL_CONCURRENCY", "2"))
+ORQ_CRAWL_PAGE_CHARS = int(os.environ.get("ORQ_CRAWL_PAGE_CHARS", "4000"))
+_CRAWL_SEMS = {}
+
+
+def _crawl_sem():
+    try:
+        key = id(asyncio.get_running_loop())
+    except RuntimeError:
+        key = 0
+    s = _CRAWL_SEMS.get(key)
+    if s is None:
+        s = _CRAWL_SEMS[key] = asyncio.Semaphore(ORQ_CRAWL_CONCURRENCY)
+    return s
 
 
 # Белый список переменных, которые доезжают до подпроцесса стадии. Всё остальное — не доезжает.
@@ -196,8 +222,63 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     import deep_research_engine as DRE
     import writer_kimi as WK
     from claude_agent_sdk import (
-        tool, create_sdk_mcp_server, ClaudeAgentOptions, ClaudeSDKClient,
+        tool, create_sdk_mcp_server, AgentDefinition, ClaudeAgentOptions, ClaudeSDKClient,
         ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
+    )
+
+    # Субагент-разведчик: писатель раздаёт направления, scout'ы читают страницы каждый
+    # в СВОЁМ контексте и возвращают выжимку со ссылками. Инструменты — только веб:
+    # save_*_docx ему не дают, деливерабл делает писатель. Модель по умолчанию sonnet
+    # (как DR_EXTRACT_MODEL у движка): scout'ы дают основную массу токенов, а их работа —
+    # «прочитать и пересказать со ссылкой», а не выводы; opus держим на писателе.
+    SCOUT = AgentDefinition(
+        description=(
+            "OSINT-разведка по ОДНОМУ направлению о компании. Запускай нескольких "
+            "параллельно, по одному на независимое направление. Возвращает выжимку "
+            "находок со ссылками на реально открытые страницы; документы не сохраняет."
+        ),
+        prompt=CRA.SCOUT_SYSTEM,
+        # crawl_site — браузерный обход сайта поверх SiteCrawler движка. Даём его только
+        # scout'ам, не писателю: дампы страниц должны оседать в ИХ контекстах, ради чего
+        # веер и заводился.
+        tools=["WebSearch", "WebFetch", "mcp__research__crawl_site"],
+        mcpServers=["research"],
+        model=os.environ.get("ORQ_SCOUT_MODEL", "sonnet"),
+    )
+
+    # Критик полноты. Роль уехала вместе с движком (его completeness_critic) и ничем не
+    # заменилась: нудж-ретрай проверяет НАЛИЧИЕ файла, а не содержимое, и схема молчит о
+    # том, что автор чего-то не нашёл. Инструментов нет: он судит черновик, а не ищет —
+    # поэтому и дёшев. Follow-up'ы не формулирует (в отличие от прежнего): чем закрывать
+    # дыру, решает писатель, иначе критик снова начнёт диктовать источники.
+    CRITIC = AgentDefinition(
+        # description — это триггер вызова, а не описание: агент читает именно его,
+        # решая, звать ли. Поэтому здесь КОГДА, а не только ЧТО.
+        description=(
+            "Критик полноты документа. Зови ПЕРЕД save_*_docx, передав черновик: вернёт "
+            "список дыр — пустых ячеек под видом заполненных, утверждений без источника, "
+            "недатированных ролей, находок, не доехавших до документа. Где искать "
+            "недостающее, не подскажет — это твоё решение."
+        ),
+        prompt=CRA.CRITIC_SYSTEM,
+        tools=[],
+        model=os.environ.get("ORQ_CRITIC_MODEL", "sonnet"),
+    )
+
+    # Состязательный верификатор. ROLES_CONTACTS_SYSTEM требует два независимых источника
+    # и «однофамилец — не ЛПР», но обеспечивал это только сам писатель — который же и
+    # заинтересован закрыть поле. Этот играет за другую сторону: его задача — опровергнуть.
+    VERIFIER = AgentDefinition(
+        description=(
+            "Состязательная проверка ОДНОГО утверждения об ЛПР или спорном факте: "
+            "пытается его ОПРОВЕРГНУТЬ (однофамилец, устаревшая роль, подмена юрлица, "
+            "единственный источник). Зови параллельно — по одному на каждое лицо или "
+            "факт, который собираешься внести в документ."
+        ),
+        prompt=CRA.VERIFIER_SYSTEM,
+        tools=["WebSearch", "WebFetch", "mcp__research__crawl_site"],
+        mcpServers=["research"],
+        model=os.environ.get("ORQ_VERIFIER_MODEL", "sonnet"),
     )
 
     # Инструменты сохранения — замыкания на временные пути ЭТОЙ компании (потокобезопасно).
@@ -214,6 +295,46 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     async def _save_roles_contacts(args):
         await asyncio.to_thread(CRA._write_roles_contacts_docx, dict(args), s_tmp)
         return {"content": [{"type": "text", "text": "карта ролей и контактов сохранена"}]}
+
+    # Браузерный обход сайта для scout'ов — ОБЁРТКА над SiteCrawler движка (Crawl4AI
+    # BestFirst -> HTTP-фолбэк), а не второй краулер: краул живёт в deep_research_engine
+    # и правится там. Смысл — дать разведчику путь к тому, что WebFetch не отдаёт:
+    # JS-рендеринг и часть антибот-порталов (портал ведомства и т.п.).
+    @tool("crawl_site",
+          "Обойти САЙТ браузером (Crawl4AI/chromium) и вернуть текст страниц в markdown. "
+          "Берёт то, чего не отдаёт WebFetch: JS-рендеринг и часть антибот-порталов. "
+          "Обход ранжируется ТВОИМИ keywords — передавай слова своего направления. "
+          "Это обход домена, а не страницы: для одиночного URL бери WebFetch. Дорого "
+          "(поднимает браузер) — зови, когда WebFetch не справился либо нужен раздел целиком.",
+          {"domain": Annotated[str, "Домен или URL сайта, напр. 'citrt.ru'"],
+           "keywords": Annotated[list[str], "Слова твоего направления для ранжирования обхода"],
+           "max_pages": Annotated[int, "Сколько страниц взять, 1-15"]})
+    async def _crawl_site(args):
+        dom = str(args.get("domain") or "").strip()
+        if not dom:
+            return {"content": [{"type": "text", "text": "domain пуст — нечего обходить"}]}
+        cap = max(1, min(int(args.get("max_pages") or 8), 15))
+        try:
+            async with _crawl_sem():
+                pages = await DRE.SiteCrawler(
+                    max_pages=cap, keywords=args.get("keywords")).crawl_sections(dom)
+        except Exception as e:
+            # Сбой краула — не отказ инструмента: разведчик должен узнать причину и
+            # пойти другим путём (WebFetch, архив, зеркало), а не молча потерять домен.
+            return {"content": [{"type": "text",
+                                 "text": f"краул {dom} упал: {str(e)[:200]}. Попробуй WebFetch "
+                                         f"или архивную копию."}]}
+        if not pages:
+            return {"content": [{"type": "text",
+                                 "text": f"{dom}: не собрано ни одной страницы (сайт пуст, "
+                                         f"недоступен или целиком за антиботом)"}]}
+        print(f"    [{idx}] scout crawl_site: {dom} -> {len(pages)} стр.")
+        out = [f"Обход {dom}: {len(pages)} страниц (движок: {pages[0].get('source') or '?'}). "
+               f"Текст каждой страницы обрезан до {ORQ_CRAWL_PAGE_CHARS} символов."]
+        for p in pages:
+            out.append(f"\n--- {p.get('url') or ''}\n"
+                       f"{(p.get('markdown') or '')[:ORQ_CRAWL_PAGE_CHARS]}")
+        return {"content": [{"type": "text", "text": "\n".join(out)}]}
 
     h = _handle(lead)
     ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
@@ -283,8 +404,8 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     # Приятный побочный эффект: SDK-сессии внутри сессии больше нет — уходит и та причина,
     # по которой движок когда-то вынесли в пред-запуск.
     server = create_sdk_mcp_server(
-        name="research", version="6.0.0",
-        tools=[_save_process_map, _save_roles_contacts],
+        name="research", version="6.1.0",
+        tools=[_save_process_map, _save_roles_contacts, _crawl_site],
     )
 
     # Вход агента — то, что известно про компанию из лида. Не метод, а данные: откуда копать
@@ -309,11 +430,25 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
             model=model,
             system_prompt=system,
             mcp_servers={"research": server},
-            allowed_tools=[f"mcp__research__{save_tool}", "WebSearch", "WebFetch"],
+            # "Agent" — тул порождения субагентов. Имя именно такое: в CLI лежит таблица
+            # ренейма {Task: "Agent"}, т.е. "Task" — легаси-имя и наружу не уходит
+            # (докстринг claude_agent_sdk/types.py:1850 — «invokable via the Agent tool»;
+            # комментарий там же на :293 про «Task-spawned» просто не обновлён).
+            allowed_tools=[f"mcp__research__{save_tool}", "WebSearch", "WebFetch", "Agent"],
             disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit"],
             permission_mode="bypassPermissions",
             setting_sources=[],
-            max_turns=120,          # ресёрч агент ведёт сам -> ходов нужно кратно больше
+            # Три РОЛИ, а не три темы: разведать / оспорить / отревизовать. Тематических
+            # scout'ов (scout_it, scout_закупки) тут нет намеренно — это вернуло бы
+            # зашитые коллекторы site/ЕИС/суды/hh, ради ухода от которых движок и
+            # выносили. Направление scout получает в задании, а не в своём типе.
+            agents={"scout": SCOUT, "critic": CRITIC, "verifier": VERIFIER},
+            # max_turns НЕ задаём: дефолт SDK — None, и тогда --max-turns в CLI не
+            # уходит вовсе (types.py: max_turns: int|None = None; subprocess_cli:
+            # `if self._options.max_turns`). Стоял лимит 120, но одна только разведка
+            # по компании — это сотни вызовов, и агент упирался в потолок раньше, чем
+            # в исчерпанность темы. Ограничитель теперь не ходы, а веер scout'ов:
+            # тяжёлое чтение уходит в их контексты, писатель остаётся налегке.
         )
         handoff = (
             f"{task}\n"

@@ -1064,9 +1064,14 @@ async def discover_domain(name, inn, card, contacts, hint=""):
 class SiteCrawler:
     """Краул разделов сайта: Crawl4AI BestFirst (PRIMARY) -> HTTP-фолбэк."""
 
-    def __init__(self, max_pages=DR_MAX_PAGES, max_depth=2):
+    def __init__(self, max_pages=DR_MAX_PAGES, max_depth=2, keywords=None):
         self.max_pages = max_pages
         self.max_depth = max_depth
+        # Слова ранжирования BestFirst. Дефолт — общий KEYWORDS движка (ролецентричный:
+        # контакты/руководство/закупки/ИТ), на нём работает collect_site. Вызывающий может
+        # передать свои: субагент-разведчик ранжирует обход под СВОЁ направление, иначе
+        # BestFirst утащил бы его на страницы чужой темы.
+        self.keywords = [str(k) for k in keywords if str(k).strip()] if keywords else KEYWORDS
 
     async def crawl_sections(self, domain):
         if not domain:
@@ -1097,7 +1102,7 @@ class SiteCrawler:
         from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig
         from crawl4ai.deep_crawling import BestFirstCrawlingStrategy
         from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
-        scorer = KeywordRelevanceScorer(keywords=KEYWORDS, weight=0.8)
+        scorer = KeywordRelevanceScorer(keywords=self.keywords, weight=0.8)
         strategy = BestFirstCrawlingStrategy(
             max_depth=self.max_depth, max_pages=self.max_pages,
             include_external=False, url_scorer=scorer)
