@@ -324,7 +324,6 @@ class RusProfileSession:
             time.sleep(pause)
         return out
 
-
 def item_to_lead(it, cfg, industry):
     rev = it.get("finance_revenue")
     try:

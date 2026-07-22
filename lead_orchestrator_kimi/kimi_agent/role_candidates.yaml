@@ -1,0 +1,9 @@
+version: 1
+agent:
+  name: role-candidates
+  system_prompt_path: ./role_candidates.md
+  tools:
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:

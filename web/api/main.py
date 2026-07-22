@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,17 +60,13 @@ async def industries() -> List[Dict[str, Any]]:
 async def models() -> List[Dict[str, Any]]:
     """Модели ПИСАТЕЛЯ двух .docx (флаг --model).
 
-    `kimi` — псевдоним: конкретное имя модели берётся из KIMI_WRITER_MODEL/KIMI_MODEL_NAME.
+    `kimi` — псевдоним: конкретное имя модели берётся из единого KIMI_MODEL_NAME.
     У Kimi другой биллинг: цену за вызов шлюз наружу не отдаёт, поэтому вилку «$N–$2N»
     (она верна только для Claude-сессий) UI на нём не показывает.
     """
     import writer_kimi as _wk                  # лежит в пакете оркестратора (sys.path уже добавлен в leads.py)
-    return [
-        {"id": "kimi", "label": f"Kimi ({_wk.kimi_model('kimi')})",
-         "billing": "provider", "default": True},
-        {"id": "opus", "label": "Claude Opus (качество)", "billing": "claude"},
-        {"id": "sonnet", "label": "Claude Sonnet (дешевле)", "billing": "claude"},
-    ]
+    return [{"id": "kimi", "label": f"Kimi ({_wk.kimi_model('kimi')})",
+             "billing": "provider", "default": True}]
 
 
 @app.get("/api/regions")
@@ -162,7 +158,7 @@ class RunParams(BaseModel):
     min_revenue: float = 1e9
     regions: List[str] = Field(default_factory=list)
     exclude_regions: List[str] = Field(default_factory=list)
-    model: str = "kimi"
+    model: Literal["kimi"] = "kimi"
     workers: int = 2
     out: str = ""
     base: str = ""

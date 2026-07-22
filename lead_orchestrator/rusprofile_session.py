@@ -214,6 +214,35 @@ class RusProfileAuth:
             "website": site,
         }
 
+    def full_card_by_url(self, link):
+        """Карточка целиком: видимый текст, метаданные, ссылки и раскрытые контакты."""
+        url = link if link.startswith("http") else "https://www.rusprofile.ru" + link
+        html = self._card_html(url)
+        text = self.d.execute_script("return document.body.innerText") or ""
+        links = self.d.execute_script(r"""
+          return [...document.querySelectorAll('a[href]')].map(function(a){
+            return {text:(a.innerText||'').trim(), href:a.href};
+          }).filter(function(x){return x.text || /^(tel:|mailto:)/.test(x.href);});
+        """) or []
+        contacts = self.contacts_by_url(url)
+        def one(pattern):
+            m = re.search(pattern, text, re.I)
+            return m.group(1).strip() if m else ""
+        return {
+            "requested_url": url,
+            "url": self.d.current_url,
+            "title": self.d.title,
+            "name": (self.d.title.split(" - ")[0] if self.d.title else "").strip(),
+            "inn": one(r"ИНН\s+(\d{10,12})"),
+            "ogrn": one(r"ОГРН\s+(\d{13,15})"),
+            "kpp": one(r"КПП\s+(\d{9})"),
+            "okpo": one(r"ОКПО\s+(\d{8,10})"),
+            "contacts": contacts,
+            "links": links,
+            "text": text,
+            "contacts_unlocked": self.contacts_unlocked(html),
+        }
+
     def enrich_leads(self, leads, only_missing=True, log=log, checkpoint=None):
         """Заполнить лидам website/phone/email из карточки RusProfile (по _rusprofile_url).
         Контакты RusProfile бесплатны под твоим аккаунтом и БЕЗ суточного лимита.
@@ -277,9 +306,79 @@ def main():
     ap.add_argument("--login", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--timeout", type=int, default=420)
+    ap.add_argument("--urls-file", default=None,
+                    help="текстовый файл с URL карточек, по одному на строку")
+    ap.add_argument("--out", default="rusprofile_cards.json")
+    ap.add_argument("--playwright", action="store_true",
+                    help="использовать Chromium Playwright, если установленный Chrome несовместим с UC")
     a = ap.parse_args()
+    if a.urls_file and a.playwright:
+        from playwright.sync_api import sync_playwright
+        urls = [x.strip() for x in open(a.urls_file, encoding="utf-8") if x.strip()]
+        cookies = json.load(open(COOKIES_FILE, encoding="utf-8"))
+        normalized = []
+        for c in cookies:
+            item = {"name": c["name"], "value": c.get("value", ""),
+                    "domain": c.get("domain", ".rusprofile.ru"), "path": c.get("path", "/"),
+                    "httpOnly": bool(c.get("httpOnly")), "secure": bool(c.get("secure"))}
+            if c.get("expiry"): item["expires"] = float(c["expiry"])
+            same = str(c.get("sameSite") or "").capitalize()
+            if same in ("Strict", "Lax", "None"): item["sameSite"] = same
+            normalized.append(item)
+        rows = []
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=False)
+            context = browser.new_context(viewport={"width": 1320, "height": 950})
+            page = context.new_page()
+            page.goto(HOME, wait_until="domcontentloaded", timeout=45000)
+            context.add_cookies(normalized)
+            for i, url in enumerate(urls, 1):
+                log(f"[{i:02d}/{len(urls)}] {url}")
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(3000)
+                    text = page.locator("body").inner_text()
+                    contact = page.evaluate("() => {" + RusProfileAuth._JS_CONTACTS + "}") or {}
+                    def one(pattern):
+                        m = re.search(pattern, text, re.I)
+                        return m.group(1).strip() if m else ""
+                    title = page.title()
+                    title_inn = re.search(r"\(ИНН\s+(\d{10,12})\)", title, re.I)
+                    heading = page.locator("h1").first.inner_text().strip() if page.locator("h1").count() else ""
+                    manager = re.search(
+                        r"Руководитель\s*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)", text, re.I)
+                    revenue = re.search(
+                        r"Основные показатели[^\r\n]*\r?\n(?:[^\r\n]*\r?\n){0,3}?"
+                        r"Выручка\s*\r?\n\s*([^\r\n]+)", text, re.I)
+                    rows.append({
+                        "name": heading or (title.split(" - ")[0] if title else "").strip(),
+                        "inn": title_inn.group(1) if title_inn else one(r"ИНН\s+(\d{10,12})"),
+                        "revenue": revenue.group(1).strip() if revenue else "",
+                        "manager_role": manager.group(1).strip() if manager else "",
+                        "manager_name": manager.group(2).strip() if manager else "",
+                        "phones": list(dict.fromkeys(contact.get("phones") or [])),
+                        "emails": list(dict.fromkeys(x.lower() for x in (contact.get("emails") or []))),
+                        "website": contact.get("website") or "",
+                    })
+                except Exception as e:
+                    rows.append({"requested_url": url, "error": str(e).splitlines()[0][:300]})
+                json.dump(rows, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            browser.close()
+        log(f"Готово: {len(rows)} карточек -> {a.out}")
+        return
     with RusProfileAuth(headless=False) as s:
-        if a.login:
+        if a.urls_file:
+            urls = [x.strip() for x in open(a.urls_file, encoding="utf-8") if x.strip()]
+            rows = []
+            for i, url in enumerate(urls, 1):
+                log(f"[{i:02d}/{len(urls)}] {url}")
+                try:
+                    rows.append(s.full_card_by_url(url))
+                except Exception as e:
+                    rows.append({"requested_url": url, "error": str(e).splitlines()[0][:300]})
+                json.dump(rows, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            log(f"Готово: {len(rows)} карточек -> {a.out}")
+        elif a.login:
             s.login_and_wait(timeout=a.timeout)
         elif a.check:
             log("Контакты открыты под профилем: " + ("ДА" if s.contacts_unlocked() else "НЕТ"))

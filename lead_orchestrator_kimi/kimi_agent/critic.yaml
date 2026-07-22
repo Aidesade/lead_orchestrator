@@ -1,0 +1,6 @@
+version: 1
+agent:
+  name: leadgen-critic
+  system_prompt_path: ./critic.md
+  tools: []
+  subagents:

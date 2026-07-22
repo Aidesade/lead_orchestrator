@@ -74,23 +74,38 @@ COPY . /app
 RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache /data/orq_outbox \
     && python -m py_compile \
        lead_orchestrator/orchestrator.py \
+       lead_orchestrator/kimi_config.py \
+       lead_orchestrator/orchestrator_agent.py \
+       lead_orchestrator/writer_kimi.py \
+       lead_orchestrator/kimi_research_cli.py \
        lead_orchestrator/rusprofile_session.py \
        lead_orchestrator/deep_research_engine.py \
        lead_orchestrator/company_research_agent.py \
        lead_orchestrator_kimi/onepager_kimi.py \
+       lead_orchestrator_kimi/writer_kimi_agent.py \
+       lead_orchestrator_kimi/research_enrichment_agent.py \
+       lead_orchestrator_kimi/leadgen_tools.py \
        lead_orchestrator_kimi/html_to_pdf.py \
     && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
+    && python lead_orchestrator/test_kimi_only.py \
+    && python lead_orchestrator/test_kimi_agent_freedom.py \
+    && python lead_orchestrator/test_research_enrichment.py \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/patches/apply_patches.py --check \
+    && /opt/kimi-venv/bin/python lead_orchestrator_kimi/writer_kimi_agent.py --selftest \
+    && /opt/kimi-venv/bin/python lead_orchestrator_kimi/research_enrichment_agent.py --selftest \
+    && python lead_orchestrator/kimi_research_cli.py --selftest \
     && /opt/kimi-venv/bin/python -c "import sys; sys.path.insert(0, '/app/lead_orchestrator_kimi'); import onepager_kimi; assert onepager_kimi.build_user_content('Тест')"
 
 VOLUME ["/data"]
 # Дефолты именно ДЛЯ КОНТЕЙНЕРА (в конце — чтобы не инвалидировать дорогие слои apt/pip):
 #   LEAD_SOURCE=checko    — сбор ФАЗЫ 1 через Checko API (в образе нет Chrome под RusProfile);
 #   DR_LLM_PROVIDER=kimi  — LLM-экстракт движка ресёрча через Kimi -> весь пайплайн без Anthropic.
-# Локальный Windows-путь этим не затрагивается (там переменные не заданы, код по умолчанию
-# rusprofile/claude). Перекрыть можно через -e / docker-compose.
+# Те же Kimi-only дефолты действуют и локально; контейнер дополнительно переключает источник
+# лидов на Checko, потому что Chrome под RusProfile из образа удалён.
 ENV LEAD_SOURCE=checko \
-    DR_LLM_PROVIDER=kimi
+    DR_LLM_PROVIDER=kimi \
+    ORQ_KIMI_ONLY=1 \
+    KIMI_MODEL_NAME=kimi-k2.7-code
 # Без xvfb-run: виртуальный экран был нужен только headed-Chrome под RusProfile. Оставшиеся
 # браузеры (Crawl4AI, рендер PDF) работают headless и запускаются напрямую.
 ENTRYPOINT ["python", "/app/lead_orchestrator/orchestrator.py"]

@@ -28,6 +28,14 @@ docker-data/
 out.html
 raw.html
 
+# Локальные браузерные бинарники и операционные выгрузки лидов. Это не исходники:
+# архивы велики, а JSON/TXT могут содержать реальные компании и контакты.
+/.tools/
+/chromedriver-win64.zip
+/rusprofile_*.json
+/rusprofile_*.txt
+/lead_orchestrator/cit_lead.json
+
 # Мусор от случайных редиректов/ОС (пустые файлы «Яндекс» завелись в обеих папках)
 Яндекс
 Thumbs.db

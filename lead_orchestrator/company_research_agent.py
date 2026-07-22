@@ -51,14 +51,29 @@ import warnings
 warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
 
 import anyio
-from claude_agent_sdk import (
-    query,                 # async one-shot -> AsyncIterator[Message]
-    tool,                  # @tool — in-process MCP-инструмент
-    create_sdk_mcp_server, # in-process MCP-сервер (без subprocess)
-    ClaudeAgentOptions,    # опции (поля snake_case)
-    ClaudeSDKClient,       # многоходовый клиент (context manager)
-    AssistantMessage, TextBlock, ToolUseBlock, ResultMessage,
-)
+
+
+def tool(name, description, schema):
+    """Сохраняет MCP-метаданные без импорта Claude SDK.
+
+    DOCX-рендереры и схемы нужны Kimi-писателю, поэтому импорт этого модуля не должен
+    тянуть legacy SDK. Реальный @claude_agent_sdk.tool создаётся только в legacy-вызове.
+    """
+    def decorate(fn):
+        fn.__claude_tool_spec__ = (name, description, schema)
+        return fn
+    return decorate
+
+
+def _claude_sdk():
+    """Ленивая загрузка SDK исключительно для явного legacy-режима."""
+    from kimi_config import kimi_only
+    if kimi_only():
+        raise RuntimeError(
+            "Claude/Anthropic отключён режимом ORQ_KIMI_ONLY=1; "
+            "используй штатный Kimi-оркестратор")
+    import claude_agent_sdk
+    return claude_agent_sdk
 
 # консоль Windows = cp1251 и роняет вывод на ₽/кириллице -> принудительно utf-8
 try:
@@ -620,6 +635,46 @@ ROLES_CONTACTS_SCHEMA = {
                            "(учредитель/курирующее ведомство/сестринская структура/комиссия/холдинг)|"
                            "Ключевое лицо|Контакт|Почему важно для захода. Критично для госкомпаний; "
                            "заполняй, если данные есть в находках"},
+        "decision_centers_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"function": {"type": "string"}, "organization": {"type": "string"},
+                           "type": {"type": "string"}, "rationale": {"type": "string"},
+                           "status": {"type": "string"}, "source": {"type": "string"}}},
+            "description": "Машинно добавляемая таблица функциональных центров принятия решений"},
+        "corporate_graph_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"from": {"type": "string"}, "to": {"type": "string"},
+                           "relation": {"type": "string"}, "functions": {"type": "string"},
+                           "status": {"type": "string"}, "source": {"type": "string"}}},
+            "description": "Машинно добавляемые рёбра корпоративного графа"},
+        "role_candidates_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"fio": {"type": "string"}, "function": {"type": "string"},
+                           "reported_title": {"type": "string"}, "organization": {"type": "string"},
+                           "inn": {"type": "string"}, "evidence": {"type": "string"},
+                           "publication_dates": {"type": "string"},
+                           "observed_at": {"type": "string"},
+                           "evidence_status": {"type": "string"}, "current_role": {"type": "string"},
+                           "source": {"type": "string"}}},
+            "description": "Машинно добавляемые кандидаты на функциональные роли; не атрибуция текущей должности"},
+        "research_contacts_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"contact": {"type": "string"}, "type": {"type": "string"},
+                           "source_context": {"type": "string"}, "best_use": {"type": "string"},
+                           "outreach_policy": {"type": "string"},
+                           "candidate": {"type": "string"}, "function": {"type": "string"},
+                           "organization": {"type": "string"}, "status": {"type": "string"},
+                           "source": {"type": "string"}}},
+            "description": "Машинно добавляемые контактные каналы: Контакт|Тип|Контекст|Лучшее применение|Статус"},
+        "research_evidence_table": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"claim": {"type": "string"}, "level": {"type": "string"},
+                           "source_type": {"type": "string"}, "status": {"type": "string"},
+                           "confidence": {"type": "string"}, "publication_date": {"type": "string"},
+                           "observed_at": {"type": "string"},
+                           "evidence_text": {"type": "string"},
+                           "source": {"type": "string"}}},
+            "description": "Машинно добавляемый реестр официальных фактов и вторичных гипотез"},
         "official_contacts": {"type": "array", "items": {"type": "string"},
                               "description": "«4. Официальные контакты»: приёмная/общий тел., e-mail, закупки, соцсети, график"},
         "lpr_profile_title": {"type": "string", "description": "Заголовок профиля ЛПР, напр. «Руденко С.А. — публичный деловой профиль»"},
@@ -666,12 +721,39 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
         for b in payload["org_basics"]:
             _bullet(doc, Pt, b)
 
+    if payload.get("decision_centers_table"):
+        _h(doc, "Функциональные центры принятия решений", 1)
+        _table(doc, Pt, ["Функция", "Организация", "Тип центра", "Обоснование", "Статус", "Источник"],
+               [[r.get("function", ""), r.get("organization", ""), r.get("type", ""),
+                 r.get("rationale", ""), r.get("status", ""), r.get("source", "")]
+                for r in payload["decision_centers_table"]])
+
+    if payload.get("corporate_graph_table"):
+        _h(doc, "Корпоративный контур — граф организаций", 1)
+        _table(doc, Pt, ["От", "К", "Связь", "Функции", "Статус", "Источник"],
+               [[r.get("from", ""), r.get("to", ""), r.get("relation", ""),
+                 r.get("functions", ""), r.get("status", ""), r.get("source", "")]
+                for r in payload["corporate_graph_table"]])
+
     _h(doc, "1. Руководство центрального аппарата", 1)
     _table(doc, Pt, ["Должность", "ФИО", "Зона ответственности", "Статус / источник"],
            [[r.get("position", ""), r.get("fio", ""), r.get("responsibility", ""), r.get("status", "")]
             for r in (payload.get("leadership_table") or [])])
     if payload.get("leadership_note"):
         _para(doc, Pt, payload["leadership_note"])
+
+    if payload.get("role_candidates_table"):
+        _h(doc, "Кандидаты на функциональные роли", 2)
+        _table(doc, Pt, ["ФИО", "Функция", "Должность в источнике", "Организация / ИНН",
+                         "Доказательство / статус", "Текущая роль", "Опубликовано / проверено",
+                         "Источник"],
+               [[r.get("fio", ""), r.get("function", ""), r.get("reported_title", ""),
+                  " / ".join(x for x in (r.get("organization", ""), r.get("inn", "")) if x),
+                  "\n".join(x for x in (r.get("evidence", ""), r.get("evidence_status", "")) if x),
+                  r.get("current_role", ""),
+                  " / ".join(x for x in (r.get("publication_dates", ""), r.get("observed_at", "")) if x),
+                  r.get("source", "")]
+                for r in payload["role_candidates_table"]])
 
     _h(doc, "2. Профильные отделы — приоритет под внедрение ИИ", 1)
     _table(doc, Pt, ["Блок", "Контактное лицо / контакт", "Почему релевантен и через какую боль заходить"],
@@ -689,6 +771,17 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
                [[r.get("fio", ""), r.get("position", ""), r.get("block", ""),
                  r.get("role", ""), r.get("contact", ""), r.get("source", "")]
                 for r in payload["contacts_table"]])
+
+    if payload.get("research_contacts_table"):
+        _h(doc, "Контактные каналы и лучшее применение", 1)
+        _table(doc, Pt, ["Контакт", "Тип / контекст", "Лучшее применение", "Адресат / функция",
+                         "Организация", "Статус", "Источник"],
+               [[r.get("contact", ""),
+                 " / ".join(x for x in (r.get("type", ""), r.get("source_context", "")) if x),
+                  "\n".join(x for x in (r.get("outreach_policy", ""), r.get("best_use", "")) if x),
+                 " / ".join(x for x in (r.get("candidate", ""), r.get("function", "")) if x),
+                 r.get("organization", ""), r.get("status", ""), r.get("source", "")]
+                for r in payload["research_contacts_table"]])
 
     if payload.get("ecosystem_table"):
         _h(doc, "Экосистема и вертикаль принятия решений", 1)
@@ -710,6 +803,17 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
     _h(doc, "4. Официальные контакты компании", 1)
     for b in (payload.get("official_contacts") or []):
         _bullet(doc, Pt, b)
+
+    if payload.get("research_evidence_table"):
+        _h(doc, "Реестр доказательств и гипотез", 1)
+        _table(doc, Pt, ["Факт / гипотеза", "Доказательный фрагмент", "Уровень",
+                         "Тип источника", "Статус", "Confidence",
+                         "Опубликовано / проверено", "Источник"],
+               [[r.get("claim", ""), r.get("evidence_text", ""), r.get("level", ""),
+                  r.get("source_type", ""), r.get("status", ""), r.get("confidence", ""),
+                  " / ".join(x for x in (r.get("publication_date", ""), r.get("observed_at", "")) if x),
+                  r.get("source", "")]
+                for r in payload["research_evidence_table"]])
 
     if payload.get("lpr_profile") or payload.get("why_candidate") or payload.get("risk_compliance"):
         _h(doc, "Дополнительный контекст", 1)
@@ -773,10 +877,24 @@ async def save_roles_contacts_docx(args):
     return {"content": [{"type": "text", "text": f"Карта ролей и контактов сохранена: {path}"}]}
 
 
-research_server = create_sdk_mcp_server(
-    name="research", version="3.0.0",
-    tools=[deep_research, save_process_map_docx, save_roles_contacts_docx],
-)
+_RESEARCH_SERVER = None
+
+
+def _research_server():
+    """Собрать Claude MCP-сервер только когда запущен standalone legacy-agent."""
+    global _RESEARCH_SERVER
+    if _RESEARCH_SERVER is None:
+        sdk = _claude_sdk()
+
+        def wrapped(fn):
+            return sdk.tool(*fn.__claude_tool_spec__)(fn)
+
+        _RESEARCH_SERVER = sdk.create_sdk_mcp_server(
+            name="research", version="3.0.0",
+            tools=[wrapped(deep_research), wrapped(save_process_map_docx),
+                   wrapped(save_roles_contacts_docx)],
+        )
+    return _RESEARCH_SERVER
 
 
 # ===========================================================================
@@ -813,7 +931,8 @@ def _extract_json(text: str) -> dict:
 
 
 async def run_stage1_triage(raw_request: str) -> dict:
-    options = ClaudeAgentOptions(
+    sdk = _claude_sdk()
+    options = sdk.ClaudeAgentOptions(
         model=FAST_MODEL,
         system_prompt=STAGE1_SYSTEM,
         max_turns=1,
@@ -821,12 +940,12 @@ async def run_stage1_triage(raw_request: str) -> dict:
         setting_sources=[],
     )
     text = ""
-    async for message in query(prompt=raw_request, options=options):
-        if isinstance(message, AssistantMessage):
+    async for message in sdk.query(prompt=raw_request, options=options):
+        if isinstance(message, sdk.AssistantMessage):
             for block in message.content:
-                if isinstance(block, TextBlock):
+                if isinstance(block, sdk.TextBlock):
                     text += block.text
-        elif isinstance(message, ResultMessage):
+        elif isinstance(message, sdk.ResultMessage):
             if message.result:
                 text = message.result
 
@@ -1201,10 +1320,11 @@ async def _run_doc_session(handle: dict, system: str, save_tool: str,
     Второй save-инструмент не отдаём: агент физически не может уехать в чужой документ.
     Аспекты ресёрча НЕ навязываем — их формулирует сам агент под свою цель; из stage-1
     приходит только подсказка, если триаж что-то извлёк."""
-    options = ClaudeAgentOptions(
+    sdk = _claude_sdk()
+    options = sdk.ClaudeAgentOptions(
         model=MODEL,
         system_prompt=system,
-        mcp_servers={"research": research_server},
+        mcp_servers={"research": _research_server()},
         allowed_tools=[
             "mcp__research__deep_research",
             f"mcp__research__{save_tool}",
@@ -1228,16 +1348,16 @@ async def _run_doc_session(handle: dict, system: str, save_tool: str,
     )
 
     summary = ""
-    async with ClaudeSDKClient(options=options) as client:
+    async with sdk.ClaudeSDKClient(options=options) as client:
         await client.query(handoff)
         async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
+            if isinstance(message, sdk.AssistantMessage):
                 for block in message.content:
-                    if isinstance(block, TextBlock):
+                    if isinstance(block, sdk.TextBlock):
                         summary += block.text
-                    elif isinstance(block, ToolUseBlock):
+                    elif isinstance(block, sdk.ToolUseBlock):
                         print(f"  → {getattr(block, 'name', '')}")
-            elif isinstance(message, ResultMessage):
+            elif isinstance(message, sdk.ResultMessage):
                 if message.result:
                     summary = message.result
                 print(f"  [{label}] cost=${message.total_cost_usd} {message.subtype}")

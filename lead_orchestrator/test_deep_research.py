@@ -184,6 +184,78 @@ def test_domain_validation():
           and not E._text_belongs("газета «Автодорожник»", "АО Рязаньавтодор", ""))
 
 
+def test_public_url_guard():
+    print("\n[7] URL guard: file://, credentials и private/link-local адреса блокируются")
+    blocked = ("file:///etc/passwd", "http://127.0.0.1", "http://10.0.0.1",
+               "http://169.254.169.254/latest/meta-data", "http://224.0.0.1",
+               "http://239.255.255.250", "http://[ff02::1]",
+               "http://user:pass@example.com")
+    for url in blocked:
+        try:
+            E._validate_public_http_url(url, resolve=False)
+        except ValueError:
+            rejected = True
+        else:
+            rejected = False
+        check(f"заблокирован {url}", rejected)
+    check("публичный http(s)-адрес разрешён",
+          E._validate_public_http_url("https://8.8.8.8", resolve=False) == "https://8.8.8.8")
+
+
+def test_pinned_transport():
+    print("\n[8] HTTP transport: соединение идёт к уже проверенному IP, private redirect блокируется")
+    captured = {}
+
+    class FakeResponse:
+        status = 200
+
+        @staticmethod
+        def read(_limit):
+            return b"ok"
+
+        @staticmethod
+        def getheaders():
+            return [("Content-Type", "text/plain; charset=utf-8")]
+
+    class FakeConnection:
+        def __init__(self, host, port, pinned_ip, **_kwargs):
+            captured.update(host=host, port=port, pinned_ip=pinned_ip)
+
+        def request(self, method, path, headers=None):
+            captured.update(method=method, path=path, headers=headers)
+
+        @staticmethod
+        def getresponse():
+            return FakeResponse()
+
+        @staticmethod
+        def close():
+            pass
+
+    original_resolve = E._resolve_public_addresses
+    original_http = E._PinnedHTTPConnection
+    try:
+        E._resolve_public_addresses = lambda _host, _port: ["93.184.216.34"]
+        E._PinnedHTTPConnection = FakeConnection
+        status, _headers, body = E._pinned_response("http://example.com/a?q=1", 3)
+    finally:
+        E._resolve_public_addresses = original_resolve
+        E._PinnedHTTPConnection = original_http
+    check("transport использует vetted IP, сохраняя hostname",
+          status == 200 and body == b"ok" and captured.get("pinned_ip") == "93.184.216.34"
+          and captured.get("host") == "example.com")
+
+    original_response = E._pinned_response
+    try:
+        E._pinned_response = lambda _url, _timeout: (
+            302, {"location": "http://127.0.0.1/admin"}, b"")
+        final, text = E._fetch_sync("http://8.8.8.8/start")
+    finally:
+        E._pinned_response = original_response
+    check("redirect во внутреннюю сеть отклонён до соединения",
+          final == "http://8.8.8.8/start" and text == "")
+
+
 def main():
     print("=== ДЫМОВОЙ ТЕСТ ЛОГИКИ deep_research_engine (без сети, без LLM) ===")
     f = test_regex_extract()
@@ -192,6 +264,8 @@ def main():
     test_placeholder_detection()
     test_consolidate_renders()
     test_domain_validation()
+    test_public_url_guard()
+    test_pinned_transport()
     print("\n" + ("=" * 60))
     if _fails:
         print(f"ПРОВАЛЕНО проверок: {len(_fails)} -> {_fails}")

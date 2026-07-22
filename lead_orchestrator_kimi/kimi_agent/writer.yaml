@@ -1,0 +1,19 @@
+version: 1
+agent:
+  name: leadgen-writer
+  system_prompt_path: ./writer.md
+  tools:
+    - "kimi_cli.tools.multiagent:Task"
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:
+    scout:
+      path: ./scout.yaml
+      description: "OSINT-разведка по одному направлению: ищет и читает источники, возвращает сжатые находки со ссылками. Запускай несколько параллельно."
+    critic:
+      path: ./critic.yaml
+      description: "Критик полноты черновика без веб-инструментов. Зови после сборки чернового JSON и до финального ответа."
+    verifier:
+      path: ./verifier.yaml
+      description: "Состязательная проверка одного спорного факта или атрибуции ЛПР; пытается опровергнуть."

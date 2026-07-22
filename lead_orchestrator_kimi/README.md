@@ -1,10 +1,12 @@
-# lead_orchestrator_kimi — третий деливерабл на Kimi Agent SDK (one-pager HTML → PDF)
+# lead_orchestrator_kimi — Kimi-агенты Фазы 2 и one-pager
 
-Изолированная папка: **рабочий `lead_orchestrator/` не тронут.** Здесь — новая версия
-ТРЕТЬЕЙ стадии Фазы 2: вместо брендированной `.pptx` (Claude Agent SDK + скилл pptx)
-делается **редакционный one-pager**: модель по системному промпту выдаёт самодостаточный
-HTML, который рендерится в **PDF**. LLM — через **Kimi Agent SDK** (Kimi CLI ходит на
-OpenAI-совместимый `/v1`, поэтому кастомный провайдер — его родной режим, роутер не нужен).
+Изолированная папка со своим venv содержит две части Kimi-ветки pipeline:
+
+1. Во второй стадии после базового deep research запускаются пять специализированных ролей:
+   `official_sources → (corporate_contour + secondary_sources) → role_candidates → candidate_contacts`.
+2. Третий деливерабл — редакционный one-pager: Kimi выдаёт HTML, Playwright рендерит PDF.
+
+Kimi CLI ходит на OpenAI-совместимый `/v1`; основной и Kimi venv не смешиваются.
 
 ## Файлы
 
@@ -13,6 +15,10 @@ OpenAI-совместимый `/v1`, поэтому кастомный пров�
 | `onepager_system.py` | Системный промпт (VERBATIM) + токен фото спикера | — |
 | `html_to_pdf.py` | Извлечение листа из ответа модели, встраивание фото (data-URI), рендер PDF через Playwright | ✅ **проверено вживую** (PDF рендерится, стиль верный) |
 | `onepager_kimi.py` | Сборка контента из данных компании + вызов Kimi + склейка в PDF; CLI | сборка ✅ / Kimi API сверен вживую, импортится (после патча) — нужен endpoint |
+| `research_enrichment_agent.py` | Dependency-aware runner пяти ролей, schema v3 runtime validation и атомарный checkpoint с evidence trace | ✅ offline + spec selftest |
+| `kimi_agent/{official_sources,corporate_contour,secondary_sources,role_candidates,candidate_contacts}.{md,yaml}` | Контракты и tool-policy пяти ролей | ✅ загружаются Kimi CLI |
+| `leadgen_tools.py` | Read-only LeadSearch/LeadFetch/LeadCrawl через основной venv | ✅ URL guard/selftest |
+| `writer_kimi_agent.py` | Агентный писатель DOCX с динамическими scout/critic/verifier | ✅ selftest |
 | `requirements.txt` | Лок окружения: пара SDK 0.0.5 + kimi-cli 1.12.0 и всё транзитивное | ✅ ставится без конфликтов |
 | `patches/apply_patches.py` | Патчи `site-packages` — общий скрипт для Docker и локальной установки | ✅ идемпотентен, есть `--check` |
 | `README.md` | Этот файл | — |
@@ -30,6 +36,22 @@ OpenAI-совместимый `/v1`, поэтому кастомный пров�
   импортится в venv (после патча ниже). Нативного `system` в `prompt()` нет — системную
   инструкцию кладём префиксом в `user_input`. Для реального **прогона** не хватает только
   endpoint провайдера.
+- **Пять enrichment-ролей** — scheduler, контракты, cache invalidation, source hierarchy и
+  передача candidates→contacts проверены офлайн fake-SDK тестом. Каждый факт требует открытого
+  **точного** URL (поисковый сниппет и произвольный path crawled-домена не доказательство),
+  redirect хранит requested/final URL; `observed_at` ставит код. Schema v3 требует стабильные
+  gap ID, связный корпоративный граф, покрытие всех 17 функций и каждого кандидата. Контакт несёт
+  `contact_kind`, `source_context`, `best_use` и машинный `outreach_policy`; вакансии и агрегаторы
+  нельзя повысить до прямого cold outreach. Критические таблицы
+  корпоративного графа, кандидатов и каналов «Контакт / Тип / Лучшее применение» вставляются
+  в DOCX детерминированно, а не оставляются на усмотрение писателя.
+
+- **Аудит и безопасность инструментов** — per-role evidence trace входит в checkpoint и output hash,
+  cache hit повторно проверяет exact URL/provenance. TTL считается от неизменяемого времени создания
+  и не продлевается чтением. Kimi web tools работают только через HTTP crawler: соединение закреплено
+  за заранее проверенным публичным IP с сохранением Host/TLS SNI, каждый redirect проверяется заново;
+  browser crawl для model-controlled URL запрещён. Каждому параллельному Kimi-процессу выдаётся
+  отдельный `KIMI_SHARE_DIR`, чтобы SDK не портил общий metadata-файл.
 
 ## ⚠️ Версии: пара SDK + kimi-cli закреплена жёстко
 
@@ -87,7 +109,7 @@ py -m venv .venv_kimi
 # Kimi CLI — OpenAI-совместимый endpoint (кастомный провайдер — родной режим, роутер не нужен):
 set KIMI_API_KEY=<ключ провайдера>
 set KIMI_BASE_URL=<endpoint /v1>
-set KIMI_MODEL_NAME=<ID модели K2.7 у провайдера>
+set KIMI_MODEL_NAME=kimi-k2.7-code
 
 # разовый прогон (всё готово, кроме endpoint — задай KIMI_* выше):
 .venv_kimi\Scripts\python.exe onepager_kimi.py "АО «Рязаньавтодор»" \
@@ -100,14 +122,15 @@ set KIMI_MODEL_NAME=<ID модели K2.7 у провайдера>
 py html_to_pdf.py input.html output.pdf --photo ..\lead_orchestrator\assets\bulat_zamaliev.png
 ```
 
-## Как это встроить в полный пайплайн (следующий шаг)
+## Как это встроено в полный pipeline
 
-Стадия самодостаточна: `make_onepager(company_name, out_pdf, industry, pain, contacts)`.
-В боевом оркестраторе она заменит `_presentation_one`: на вход — `lead` + находки движка
-(боль через `_main_pain`), на выход — `.pdf` в папку компании (имя третьего файла:
-`<Компания>_презентация_Telepatt.pdf`), гард по размеру и заливка — как у остальных.
-Перенос ВСЕГО пайплайна (обёртка, писатель, движок) на Kimi Agent SDK — отдельная работа;
-здесь сделана только третья стадия.
+При `orchestrator.py --model kimi` функция `_research_one` выполняет два DRE-прохода, затем
+запускает `writer_kimi.run_research_subagents`, и только после полного валидного досье вызывает
+писатель двух DOCX. Checkpoint хранится как `orq_cache/enrichment_<ИНН>.json`; cache hit всё равно
+проходит проверку schema/prompt/input/dependency/output/evidence-trace hash и неизменяемого TTL.
+One-pager вызывается следующим
+подпроцессом через `make_onepager(...)`. Штатный CLI и веб теперь работают с
+`ORQ_KIMI_ONLY=1`; legacy-ветка Claude недоступна без явного аварийного opt-out.
 
 ## Что переиспользуется из рабочего пайплайна
 

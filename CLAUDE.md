@@ -9,6 +9,20 @@ LLM-платформу** (RAG-база знаний, автономные ИИ-�
 (`Dockerfile`/`docker-compose.yml`). Корень репозитория — **`D:\lead_gen`**. Основная платформа —
 Windows, Python 3.12, запуск через `py`; прод-цель — Docker в Linux. Комментарии в коде — на русском.
 
+## Приоритетный runtime: Kimi K2.7 (2026-07-21)
+
+Штатный режим всего агента — **Kimi-only**: NL-контроллер, deep-research extract,
+dependency-aware enrichment, писатель двух `.docx` и one-pager работают на одной модели
+`KIMI_MODEL_NAME=kimi-k2.7-code` через `KIMI_BASE_URL`. В Kimi-only режиме ID модели
+зафиксирован: другое значение вызывает fail-fast до первого запроса.
+Ключ берётся в порядке `KIMI_API_KEY` → `GPLLM_API_KEY`; на этой машине используется второй.
+`ORQ_KIMI_ONLY=1` и `DR_LLM_PROVIDER=kimi` выставляются лаунчерами, Docker и общей конфигурацией
+`lead_orchestrator/kimi_config.py`. Веб принимает только `model=kimi`.
+
+Старая ветка Claude сохранена в коде исключительно для аварийного отката и недоступна из
+штатных CLI/web/desktop-путей. Включить её можно только осознанно через `ORQ_KIMI_ONLY=0`;
+это не поддерживаемый рабочий дефолт.
+
 ## Что делает
 
 Полная цепочка в две фазы (детерминированный Python-оркестратор, НЕ LLM-оркестратор):
@@ -46,11 +60,11 @@ Windows, Python 3.12, запуск через `py`; прод-цель — Docker
 ## Запуск
 
 Ярлык на рабочем столе **`new_orchestrator`** → `lead_orchestrator/run_orchestrator.cmd` →
-`orchestrator_agent.py` → **`orchestrator.py`** (именно этот файл реально работает).
-Рядом `run_kimi_orchestrator.cmd` — то же самое, но заранее выставляет env провайдера Kimi
-(`KIMI_API_KEY`←`GPLLM_API_KEY`, `KIMI_BASE_URL`, `KIMI_MODEL_NAME`) и предупреждает, если ключа
-нет (тогда стадия one-pager молча пропускается). Оба .cmd — строго ASCII+CRLF: cmd.exe портит
-UTF-8/LF батники.
+`run_kimi_orchestrator.cmd` → Kimi-контроллер `orchestrator_agent.py` → **`orchestrator.py`**.
+`run_orchestrator.cmd` теперь только канонический делегат в Kimi-лаунчер. Лаунчер выставляет
+`KIMI_API_KEY`←`GPLLM_API_KEY`, `KIMI_BASE_URL`, `KIMI_MODEL_NAME`, `DR_LLM_PROVIDER=kimi` и
+`ORQ_KIMI_ONLY=1`; отсутствие ключа — жёсткая ошибка до запуска, а не тихий пропуск стадии.
+Оба `.cmd` — строго ASCII+CRLF: cmd.exe портит UTF-8/LF батники.
 
 ```
 # полная цепочка (сбор + ресёрч + 3 файла), ВСЯ отрасль (по умолчанию 200 компаний):
@@ -60,14 +74,15 @@ py orchestrator.py mining --count 10              # явно 10
 py orchestrator.py "D:\лиды\leads_mining.json"
 # без 3-й стадии (one-pager .pdf), только 2 .docx:
 py orchestrator.py mining --no-presentation
-# писатель двух .docx на Kimi вместо Claude (дёшево/без Anthropic; веб-UI так делает по умолчанию):
+# Kimi K2.7 выбирается автоматически; явный флаг эквивалентен дефолту:
 py orchestrator.py "D:\лиды\leads_mining.json" --model kimi
 # локально без заливки на Диск (файлы остаются в temp, путь печатается):
 py orchestrator.py "D:\лиды\leads_mining.json" --no-upload
 # дёшево проверить связку без LLM и без следов (заглушки обоих .docx; заглушка .pdf — если стоят предусловия стадии):
 py orchestrator.py "D:\лиды\leads_mining.json" --dry-run --no-upload
-# разовый ресёрч одной компании (оба .docx -> ~/Downloads):
-py company_research_agent.py "АО Рязаньавтодор ИНН 6234065445"
+# разовый Kimi-ресёрч одной компании из one-lead JSON (оба .docx + опциональный PDF):
+py orchestrator.py sample_ryazanavtodor.json --no-upload
+# только официальная база контактов — детерминированно, без LLM:
 py company_research_agent.py --contacts "АО Рязаньавтодор 6234065445"   # только официальная база, без ресёрча и .docx
 # разовый прямой контакт ЛПР (ФИО+ИНН -> рабочие email/телефоны, только легитимные источники).
 # ⚠️ standalone-дефолты ПРОТИВОПОЛОЖНЫ оркестраторным: SMTP-проба и соцпоиск ВКЛ (гасить --no-verify / --no-social):
@@ -87,13 +102,14 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
 
 Через ярлык/обёртку достаточно назвать **только отрасль** (`mining`, «добыча угля», «нефтегаз»…):
 `orchestrator_agent.py` соберёт **200** компаний (если не задано иное) и выдаст по каждой 3 файла;
-перед боевым прогоном называет оценку (~$3–4.5/компания) и просит короткое подтверждение.
+перед большим боевым прогоном показывает точный объём и просит короткое подтверждение.
 Полезные флаги `orchestrator.py`: `--count N` (ВСЕГО по всем отраслям, дефолт 200),
 `--per-industry N` (НА КАЖДУЮ отрасль — перекрывает `--count`: итог = N × число отраслей;
 в NL-обёртке это `count_per_industry` — «по 10 на отрасль»), `--min-revenue 1e9`, `--region "..."`
 (поддерживает ОТРИЦАНИЕ: `"НЕ Москва"` = вся РФ кроме Москвы; смешивание через запятую —
 `"Урал, НЕ Москва"`; также `!X`/`-X`/`кроме X`), `--workers N` (дефолт 2, авто→1 при <3 ГБ RAM —
-проверка только в боевом запуске, в dry-run её нет), `--model opus|sonnet`, `--no-presentation`,
+проверка только в боевом запуске, в dry-run её нет), `--model kimi` (единственный штатный вариант),
+`--no-presentation`,
 `--no-person-enrich`, `--show-browser`, `--out <json>` (дефолт `D:\лиды\leads_<отрасли>.json`;
 старый .xlsx-путь тоже примется — расширение заменится на .json),
 `--base` (корень Диска, дефолт `disk:/Лиды`), `--account`, `--redo` (ВЫКЛючить резюм — переделать
@@ -105,16 +121,17 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
 | Файл | Роль |
 |---|---|
 | `orchestrator.py` | **главный вход** ФАЗА 1+2 (asyncio). `_collect` = ФАЗА 1; `_research_one` = ресёрч+2 .docx; `_onepager_one` = 3-я стадия (one-pager .pdf: ПОДПРОЦЕСС venv-питона `../lead_orchestrator_kimi`); `_presentation_prereqs` = venv Kimi + фото + ключ; `_kimi_env` = KIMI_API_KEY (фолбэк `GPLLM_API_KEY`) / KIMI_BASE_URL / KIMI_MODEL_NAME; `_no_sleep` блокирует сон Windows на время прогона |
-| `orchestrator_agent.py` | SDK-обёртка (NL→запуск `orchestrator.py` подпроцессом); дефолт count=200, презентация по умолчанию; прокидывает не все флаги CLI |
-| `../lead_orchestrator_kimi/` | **3-я стадия целиком** (свой venv, Kimi Agent SDK): `onepager_kimi.py` (канон-константы + CLI), `onepager_system.py` (промпт), `html_to_pdf.py` (HTML→PDF), `requirements.txt` (лок: `kimi-agent-sdk==0.0.5` + `kimi-cli==1.12.0` + `playwright==1.60.0`), `patches/apply_patches.py` (один идемпотентный скрипт патчей venv, есть `--check`). Свой `CLAUDE.md` — читать перед правкой стадии |
+| `orchestrator_agent.py` | Kimi K2.7 NL-контроллер (OpenAI-compatible API → строгий JSON-план → валидация → запуск `orchestrator.py --model kimi` подпроцессом); дефолт count=200, one-pager по умолчанию |
+| `kimi_config.py` | единая конфигурация Kimi: ключ, endpoint, модель, child env и Kimi-only guard |
+| `../lead_orchestrator_kimi/` | **Изолированные Kimi-агенты Фазы 2 + 3-я стадия** (свой venv): dependency-aware enrichment из пяти ролей (`official → contour+secondary → roles → contacts`), агентный писатель и one-pager HTML→PDF. `research_enrichment_agent.py` валидирует schema v3, exact evidence URL/redirect, покрытие ролей/кандидатов и ведёт версионированный checkpoint с evidence trace; `requirements.txt` фиксирует `kimi-agent-sdk==0.0.5` + `kimi-cli==1.12.0`. Свой `CLAUDE.md` — читать перед правкой |
 | `web/` (корень репо) | **веб-интерфейс** (FastAPI + React/Vite). `web/api` спавнит `orchestrator.py` подпроцессом и парсит его stdout в SSE-события (структурированных событий у оркестратора нет); один активный прогон (второй → 409). Свой `README.md` |
 | `Dockerfile` / `docker-compose.yml` / `DEPLOY_TIMEWEB.md` (корень) | **контейнеризация под Timeweb Cloud (Москва)**. Два venv в образе (основной + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен (источник — Checko). Сборка = build-gate (`py_compile`, офлайн `test_deep_research.py`, `apply_patches.py --check`). `AUDIT_KIMI.md` — аудит стадии Kimi |
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк, PNG не нужен |
-| `company_research_agent.py` (CRA) | **формат документов и промпты**. С 2026-07-16 — ПО ПРОМПТУ НА ДОКУМЕНТ: `PROCESS_MAP_SYSTEM` / `ROLES_CONTACTS_SYSTEM` (задача заказчика дословно, метод отдан агенту) — их берёт Kimi-писатель; `PRESALE_SYSTEM` (один общий) остался только для ветки писателя на Claude; `STAGE1_SYSTEM` — триаж (не удалять: `run_stage1_triage` его зовёт → был NameError). Рендереры `_write_process_map_docx`/`_write_roles_contacts_docx`, схемы `PROCESS_MAP_SCHEMA` (`process_catalog` — полный каталог процессов, включая без точки внедрения ИИ, ОТДЕЛЬНО от `processes` = 8–14 детальных карточек: каталог отделён и ради лимита `KIMI_WRITER_MAX_TOKENS`, иначе JSON рвётся) / `ROLES_CONTACTS_SCHEMA` (`contacts_table` — сводная таблица контактов по корзинам; `ecosystem_table` — «Экосистема и вертикаль принятия решений»; писателю разрешена доверка по ЛЮБЫМ существенным пробелам, не только ИТ/тендер), тул `deep_research`; CLI-режим `--contacts`; standalone-модели захардкожены (писатель opus, триаж sonnet) — `--model` оркестратора на CRA-CLI не влияет |
-| `writer_kimi.py` | **альтернативный писатель двух .docx на Kimi** (`--model kimi`). НЕ агент: инструментов нет, ресёрч уже выполнен движком → модель HTTP-вызовом (OpenAI-совместимый `openai`, БЕЗ kimi-agent-sdk → тот же основной venv) возвращает JSON по ТЕМ ЖЕ схемам CRA, рендерят ТЕ ЖЕ `CRA._write_*_docx`. По вызову НА ДОКУМЕНТ: свой промпт (`CRA.PROCESS_MAP_SYSTEM`/`ROLES_CONTACTS_SYSTEM` + `SYSTEM_TAIL`) и свои находки (`write_two_docx(..., findings_process, findings_roles)`). `SYSTEM_TAIL` явно ОТМЕНЯЕТ требование звать `save_*_docx` — у Kimi инструментов нет, деливерабл там JSON. `is_kimi`/`kimi_model` зовёт `orchestrator` ещё на разборе флагов, поэтому CRA импортится лениво. Env: `KIMI_WRITER_MODEL`→`KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`), `KIMI_WRITER_MAX_TOKENS`/`_TIMEOUT`/`_ATTEMPTS`. Следствие: у Kimi-писателя НЕТ веб-инструментов — качество ограничено полнотой находок движка |
+| `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры**. `PROCESS_MAP_SYSTEM` / `ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля не загружает Claude SDK. Старый standalone LLM-agent доступен только при `ORQ_KIMI_ONLY=0`; штатно для одной компании используется one-lead JSON через `orchestrator.py`. В карту ролей детерминированно добавляются таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
+| `writer_kimi.py` | **штатный агентный писатель двух .docx на Kimi K2.7** и parent-мост пяти enrichment-ролей. Сначала отдельный Kimi-процесс выполняет `official → (contour + secondary) → role_candidates → candidate_contacts`; затем на документ запускается `writer_kimi_agent.py` с динамическими scout/critic/verifier. `apply_research_enrichment` машинно переносит критические таблицы в DOCX. URL-инструменты subprocess-мостом зовут `kimi_research_cli.py`; SDK не смешиваются. Legacy HTTP — только `KIMI_WRITER_AGENT=0` |
 | `source_checko.py` | **источник лидов через Checko API — замена RusProfile без браузера/антибота** (обычный HTTPS). Drop-in для `source_rusprofile.harvest()`; в `_collect` ПОДКЛЮЧЁН — включается `LEAD_SOURCE=checko` (`_collect_checko`), в Docker это дефолт. Плюс свой CLI → `leads.json` для ФАЗЫ 2. ОКВЭД матчится ТОЧНО (не префиксом) и не короче NN.NN, поэтому `usable_okved` разворачивает коды отраслей уровня NN/NN.N в подклассы через `okved2_codes.py` — работают все 21 отрасль (правка `INDUSTRY` руками не нужна). Регион — свой `resolve_region`: негатив разбирается ПО КАЖДОМУ элементу списка («Дагестан, не Москва» = вкл. Дагестан / искл. Москву), аббревиатуры (ХМАО/ЯНАО/СПб/МСК) — через `source_rusprofile.REGION_ALIASES`. Ключи ротируются на 403/лимите: `CHECKO_TOKEN`→`CHECKO_TOKEN_ALT`/`_2`/`_3` (общий `checko_keys()`, рабочий ключ запоминается). Выручки в /search нет → добор из ГИР БО + фильтр порогом в коде; ИП (`obj=org`) не попадают |
 | `okved2_codes.py` | справочник ОКВЭД-2 (ОК 029-2014): 623 подкласса NN.NN, снимок 2026-07-15 с github.com/carono/okvad2. Нужен ТОЛЬКО `source_checko` (разворачивает NN/NN.N в подклассы); RusProfile им не пользуется |
-| `deep_research_engine.py` | **настоящий deep-research**: supervisor — шаг-0 официальная база (`official_lookup`, блокирующе) + 4 параллельных коллектора (site/eis/courts_media/hh), Crawl4AI BestFirst (PRIMARY) → HTTP-фолбэк, петля целевого добора пустых ячеек, `completeness_critic` (в т.ч. ячейка «экосистема»: учредитель/ведомство/сёстры-структуры/комиссии — добавлено 2026-07-06), `consolidate` (у строк source URL); сбой supervisor'а пайплайн не роняет. Поиск — мульти-бэкенд brave→ddg→bing (ротация, кулдаун 90 с на 429). **Мульти-домен** (2026-07-06): `discover_domains` подтверждает до `DR_MAX_DOMAINS`=3 сайтов (у госструктур свой сайт + ведомственный портал), краулятся все (доп. — половинный кап страниц); дополнительные домены — строго по ИНН на странице либо по полной фразе названия в SERP-сниппете, когда портал не отдаётся HTTP (анти-бот; краул сделает Crawl4AI); карточки-каталоги режутся блок-листом `AGGREGATORS` и формой URL (глубокий путь/query = отказ). Валидация `_text_belongs` для «родовых» названий («Центр информационных технологий») требует ПОЛНУЮ фразу или ИНН — одиночное слово матчило и Центробанк (кейс cbr.ru); отличительные токены — по границе слова. Чужой ДОСТУПНЫЙ `website` из Фазы-1 отбрасывается, недоступный берётся как есть |
+| `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect, ответ ограничен `DR_FETCH_MAX_BYTES`. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
 | `source_rusprofile.py` | сбор RusProfile по ОКВЭД (uc, антибот); карта `INDUSTRY` (21 отрасль); строгий фильтр выручки; `parse_region_query` — регион-фильтр с отрицанием («НЕ Москва», списки через запятую) |
 | `rusprofile_session.py` | контакты с платного аккаунта (cookie; `--login`) |
 | `pipeline.py` | отбор `_select` + сохранение `_save`; его СОБСТВЕННАЯ полная цепочка `run()` (RusProfile→ГИР БО→Checko→site_verify) работает только при прямом `py pipeline.py` — оркестратор её не вызывает |
@@ -125,7 +142,7 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
 | `dadata_enrich.py` / `checko_enrich.py` | карточка ЕГРЮЛ (Dadata) / контакты (Checko) |
 | `person_enrich.py` | ЛПР: ФИО+ИНН → прямой РАБОЧИЙ контакт (Dadata/Checko → домен с валидацией → email по шаблону+MX, телефоны; соцпрофили — только подтверждённые ИНН-контекстом). Вызывается из `_research_one` ДО писателя, блок дописывается к находкам. «Пробив»/утечки конструктивно исключены (`DENY_SOURCES`) |
 | `email_finder.py`, `site_verify.py`, `harvest_inn_site.py`, `inn_util.py`, `webutil.py`, `browser_util.py` | утилиты |
-| `test_deep_research.py` | смоук-тест логики движка (без сети/LLM): `py test_deep_research.py` |
+| `test_deep_research.py` / `test_research_enrichment.py` | офлайн-тесты движка и реального scheduler/контрактов/cache/DOCX-adapter пяти ролей (без сети/LLM) |
 | `sample_ryazanavtodor.json` | готовый leads.json на одну компанию — для быстрых прогонов (`--dry-run --no-upload`) |
 
 ## Архитектура ФАЗЫ 2 (важно — не сломать)
@@ -148,15 +165,22 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
    ВКЛ по умолчанию (`--no-person-enrich` / `PERSON_ENRICH=0`); SMTP-проверка email
    (`PERSON_VERIFY_EMAIL=1`) и соцпоиск (`PERSON_SOCIAL=1`) по умолчанию ВЫКЛ — чтобы 200-прогон
    был быстрым и не долбил чужие серверы.
-3. **Писатель.** Развилка по `--model` (`writer_kimi.is_kimi`): **Claude** (`opus`/`sonnet`,
+3. **Пять специализированных enrichment-ролей (ветка Kimi).** После обоих DRE-проходов и до
+   писателя запускается граф `official_sources → (corporate_contour + secondary_sources) →
+   role_candidates → candidate_contacts`. Контактник не видит общий seed персоналий — только
+   структурированный список кандидатов. Ответы проходят enum/URL/date/confidence/source-policy
+   validation; сниппет без Fetch/Crawl не доказательство. Checkpoint атомарный и проверяет
+   schema/prompt/input/dependency hash + TTL, поэтому старые параллельные кэши не принимаются.
+4. **Писатель.** Развилка по `--model` (`writer_kimi.is_kimi`): **Claude** (`opus`/`sonnet`,
    `PRESALE_SYSTEM` — один общий промпт, ветка сохранена как есть) — агент с инструментами,
    получает находки и обязан вызвать ОБА `save_*_docx` (есть нудж-ретрай, если не сохранил);
-   либо **Kimi** (`--model kimi`, `writer_kimi.write_two_docx`) — не агент, по ОДНОМУ JSON-вызову
-   на документ, у каждого СВОЙ системный промпт (`CRA.PROCESS_MAP_SYSTEM` / `CRA.ROLES_CONTACTS_SYSTEM`
-   + `SYSTEM_TAIL`) и СВОИ находки со своего прохода → те же рендереры (см. карту кода).
+   либо **Kimi** (`--model kimi`, `writer_kimi.write_two_docx`) — агент в отдельном venv:
+   на каждый документ свой главный писатель со свободным read-only веб-поиском + динамический
+   веер `scout`/`verifier` + обязательный `critic`, свой системный промпт и свои находки-seed со
+   своего прохода → финальный JSON → те же рендереры (см. карту кода).
    CLI-дефолт — `opus`; веб-UI по умолчанию `kimi`. На Kimi долларовая вилка `[оценка]` не печатается (цену за
    вызов шлюз наружу не отдаёт → итог `$0`, это не баг).
-4. **Гард против болванок:** заливаются только реальные .docx (>5000 байт, проверка в `process()`);
+5. **Гард против болванок:** заливаются только реальные .docx (>5000 байт, проверка в `process()`);
    иначе компания = неуспех.
 
 **Третья стадия — `_onepager_one` (опц., по умолчанию ВКЛ).** НЕ агентная SDK-сессия и НЕ
@@ -193,7 +217,8 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   (`findings_<ИНН>.md` без суффикса) по умолчанию ВЫКЛЮЧЕН (`legacy_ok=False`): иначе оба прохода
   прочитали бы один файл и двухпроходность молча выродилась бы в старую схему. Легаси читается
   только как справка для боли на листе one-pager'а.
-- **Таймауты сессий** `ORQ_RESEARCH_TIMEOUT`=1800с / `ORQ_ONEPAGER_TIMEOUT`=900с на попытку:
+- **Таймауты сессий** `ORQ_RESEARCH_TIMEOUT`=0 для Kimi (без общего дедлайна), 1800с для Claude /
+  `ORQ_ONEPAGER_TIMEOUT`=900с на попытку:
   зависший claude CLI / подпроцесс Kimi обрывается в обычный ретрай (3×), а не вешает воркер навечно
   (при таймауте подпроцесс убивается — иначе висел бы осиротевший python+chromium).
 - **RAM-бэкпрешер** — перед тяжёлой стадией ожидание свободной RAM ≥ `ORQ_MIN_RAM_GB`=2.5 ГБ
@@ -210,7 +235,8 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
 
 ## Окружение / зависимости
 
-- Аутентификация моделей: `ANTHROPIC_API_KEY` **или** подписочный логин `claude` CLI.
+- Аутентификация штатного runtime: `KIMI_API_KEY`, с фолбэком на `GPLLM_API_KEY`.
+  Anthropic-аутентификация относится только к явно включённому legacy-rollback.
 - Зависимости: **`py -m pip install -r requirements.txt`** (pinned-lock рабочего окружения,
   снимок 2026-06-30) + `python -m playwright install chromium` (краул; ~300 МБ). Ключевые пакеты:
   `claude-agent-sdk`, `python-docx`, `crawl4ai`, `undetected-chromedriver`/`selenium` (RusProfile),
@@ -236,8 +262,9 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   пин НЕ снимать: без него резолвер ставил kimi-cli 1.12, а патч бил вслепую под 1.4x → `TypeError`),
   фото `lead_orchestrator/assets/bulat_zamaliev.png` и **ключ провайдера Kimi**: `KIMI_API_KEY`,
   а если его нет — `GPLLM_API_KEY` (так он задан на этой машине). `KIMI_BASE_URL`
-  (дефолт `https://gpllmkeeper.dtc.tatar/v1`) и `KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`)
-  перекрываются через env. Нет предусловий → стадия мягко пропускается (2 .docx делаются как обычно).
+  (дефолт `https://gpllmkeeper.dtc.tatar/v1`) можно перекрыть через env;
+  `KIMI_MODEL_NAME` в Kimi-only закреплён как `kimi-k2.7-code`. Другая модель или отсутствие
+  ключа останавливают агент до старта.
   `GEN_PRESENTATION=0` / `--no-presentation` отключают. LibreOffice/Poppler/node/скилл `pptx`
   этой стадии больше НЕ нужны (Poppler остаётся полезен для ручной проверки PDF: `pdfinfo`/`pdftoppm`).
 - Бренд — платформа **Telepatt** от **АО «ЦИТ РТ»** (госкомпания РТ, citrt.ru). ⚠️ Факты о людях,
@@ -246,10 +273,9 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   `VENDOR_SITE` в `onepager_kimi.py`) — модель их выдумывала. Эксперт «Булат Замалиев» публично подтверждается как «Уполномоченный по технологиям ИИ
   при Минцифры РТ»; связь с ЦИТ РТ как «руководителя направления» публично НЕ подтверждена — в
   one-pager стоит подтверждённая формулировка, не утверждать вторую как факт.
-- Тумблеры движка: `DR_LLM_PROVIDER` — провайдер LLM-экстракта: `claude` (дефолт, claude-agent-sdk)
-  либо `kimi` (тот же OpenAI-совместимый шлюз, что у писателя; `DR_KIMI_MAX_TOKENS`=8000).
-  `kimi` нужен, когда Claude недоступен (прод в РФ / Docker) — тогда **весь пайплайн работает
-  без Anthropic**; в Dockerfile это дефолт (`ENV DR_LLM_PROVIDER=kimi`). Далее:
+- Тумблеры движка: `DR_LLM_PROVIDER` — провайдер LLM-экстракта; штатный и кодовый дефолт —
+  `kimi` (тот же OpenAI-совместимый шлюз, что у писателя; `DR_KIMI_MAX_TOKENS`=8000).
+  Значение `claude` имеет смысл только вместе с `ORQ_KIMI_ONLY=0` для legacy-отката. Далее:
   `DR_USE_CRAWL4AI=0` (→ HTTP-фолбэк), `DR_USE_LLM=0` (regex-only, бесплатно),
   `DR_EXTRACT_MODEL=sonnet`, `DR_PAGE_CHARS` (9000), `DR_BREADTH`/`DR_DEPTH` (петля добора, 4/2),
   `DR_MAXPAGES` (кап страниц краула, 25), `DR_MAX_DOMAINS` (подтверждённых сайтов на компанию, 3),
@@ -265,19 +291,22 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   `ORQ_FINDINGS_TTL_H` (72). Служебные папки:
   `D:\orq_cache` (кэш находок движка), `D:\orq_outbox` (недолитые на Диск файлы — доливаются
   следующим прогоном), `D:\orq_tmp\run_*.log` (логи прогонов).
-- **Переключатели окружения (дефолты Windows ≠ дефолты Docker):** `LEAD_SOURCE`
+- **Переключатели окружения:** `LEAD_SOURCE`
   (`rusprofile` | `checko`), `DR_LLM_PROVIDER` (`claude` | `kimi`), `ORQ_STORE`
-  (`local` | `disk`). Первые два в образе перекрыты на `checko`/`kimi` (`Dockerfile`, блок ENV
-  в конце) — так контейнер живёт без Chrome и без Anthropic; на Windows переменные не заданы
-  и работают дефолты `rusprofile`/`claude`.
+  (`local` | `disk`). Источник на Windows по-прежнему `rusprofile`, в Docker — `checko`, но
+  LLM-провайдер на обеих платформах теперь `kimi`; `ORQ_KIMI_ONLY=1` не даёт случайно уйти в Claude.
 - **Портируемость путей (для Docker/Linux; на Windows работают дефолты):** `ORQ_DATA_ROOT`
   (корень служебных папок; в контейнере `/data`), `ORQ_LEADS_DIR` (дефолт `D:\лиды` / `/data/leads`),
   `RUSPROFILE_PROFILE_DIR` / `RUSPROFILE_COOKIES_FILE` (иначе — абсолютные пути с именем `abalb`
   внутри копии-скилла, см. «Подводные камни»), `KIMI_DIR` / `KIMI_PY` (папка и python-бинарь
   venv стадии Kimi). Веб-обвязка читает ещё `ORQ_REPO_ROOT` / `ORQ_PYTHON` / `ORQ_DISK_BASE`.
-- **Kimi-писатель (`--model kimi`):** ключ — тот же `KIMI_API_KEY`→`GPLLM_API_KEY`; модель —
-  `KIMI_WRITER_MODEL`→`KIMI_MODEL_NAME` (дефолт `kimi-k2.7-code`); плюс `KIMI_WRITER_MAX_TOKENS`
-  (16000), `KIMI_WRITER_TIMEOUT` (600), `KIMI_WRITER_ATTEMPTS` (3).
+- **Kimi-писатель:** ключ — тот же `KIMI_API_KEY`→`GPLLM_API_KEY`; модель едина для всех стадий —
+  `KIMI_MODEL_NAME=kimi-k2.7-code` (зафиксирована Kimi-only guard); агентный режим — дефолт,
+  `KIMI_WRITER_AGENT=0` включает прежний одиночный HTTP-режим. Агент: `KIMI_WRITER_MAX_STEPS`
+  (не задан = config Kimi CLI; на этой установке safety guard 1000, `0` тоже не переопределяет;
+  положительное значение задаёт операторский cap), `KIMI_WRITER_AGENT_TIMEOUT` (0 = без общего
+  таймаута), `ORQ_KIMI_TOOL_TIMEOUT` (180 на один сетевой/краул-вызов); legacy HTTP:
+  `KIMI_WRITER_MAX_TOKENS` (16000), `KIMI_WRITER_TIMEOUT` (600), `_ATTEMPTS` (3).
 - **`.env.example` в репо нет**, но де-факто список секретов — блок `x-orch-env` в
   `docker-compose.yml` (все `${...}` оттуда). Локальный `.env` в корне — gitignored, не коммитить
   (см. `DEPLOY_TIMEWEB.md`: права 600). Для Docker минимум: `KIMI_API_KEY` (или `GPLLM_API_KEY`),
@@ -287,8 +316,7 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
 ## Развёртывание и веб-интерфейс (добавлено 2026-07-14)
 
 - **Docker / Timeweb Cloud** (`Dockerfile`, `docker-compose.yml`, `DEPLOY_TIMEWEB.md`). Целевой
-  прод — сервер в Москве (все внешние сервисы российские; Россия вне supported-countries Anthropic
-  → на прод-сервере Claude не жилец, писатель переносится на Kimi). Образ x86-64-only
+  прод — сервер в Москве; весь модельный runtime уже переведён на Kimi. Образ x86-64-only
   (`google-chrome-stable` был amd64). Два venv (`/opt/venv` + `/opt/kimi-venv`), конфликт
   `pydantic-core` сохраняется. **Chrome/Xvfb из образа убраны** → `source_rusprofile` в контейнере
   неработоспособен; источник лидов там — `source_checko.py` (HTTPS, без антибота). Chromium в образе
@@ -351,13 +379,13 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   `FIRECRAWL_API_KEY`/browser-use.
 - **Консоль Windows = cp1251** и роняет вывод на кириллице/₽ → скрипты принудительно ставят UTF-8
   stdout; для дампа docx-текста выгружай в файл, а не в консоль.
-- **RAM:** каждый ресёрч = свой `claude` CLI (Node) + Playwright; при нехватке падает 0xC0000409 —
-  оркестратор авто-снижает `--workers` до 1. One-pager легче прежней .pptx (нет LibreOffice+node),
+- **RAM:** каждый боевой ресёрч запускает Kimi-агентов и веб-инструменты в отдельных процессах;
+  оркестратор авто-снижает `--workers` до 1 при нехватке памяти. One-pager легче прежней .pptx,
   но каждая его стадия — свой python + chromium: параллелизм ограничен `ORQ_ONEPAGER_CONCURRENCY`=2.
-- **Два несовместимых SDK в одном прогоне.** `kimi-agent-sdk` (стадия one-pager) и `claude-agent-sdk`
-  (ресёрч/писатель) конфликтуют по `pydantic-core` — ставить Kimi в ОСНОВНОЕ окружение НЕЛЬЗЯ, это
-  ломает рабочий пайплайн (уже случалось). Стадия зовётся подпроцессом venv-питона соседней папки;
-  правки стадии — только там, по её `CLAUDE.md` (в venv два обязательных патча, хрупких к upgrade).
+- **Изоляция SDK сохраняется.** Все Kimi Agent SDK-стадии выполняются подпроцессом из
+  `lead_orchestrator_kimi/.venv_kimi`; ставить `kimi-agent-sdk` в основное окружение нельзя из-за
+  конфликта `pydantic-core` с сохранёнными legacy-зависимостями. Это не означает вызов Claude:
+  штатный маршрут только запускает Kimi-процессы.
 - **Место на C::** системный диск тесный; temp вынесен на `D:\orq_tmp` и чистится по компаниям.
 
 ## Конвенции
@@ -367,8 +395,9 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   был внутри `lead_orchestrator/` — старые доки/докстринги ещё говорят так). Под git теперь ОБЕ папки
   (`lead_orchestrator/` + `lead_orchestrator_kimi/`), `web/` и docker/деплой-доки. Origin
   `github.com/Aidesade/lead_orchestrator`, рабочая ветка `kimi` (основная `master`); коммиты на русском.
-- Перед коммитом гонять `py -m py_compile` изменённых файлов. Тестов в репо всего два, оба —
-  обычные скрипты (не pytest), сеть/LLM не нужны:
+- Перед коммитом гонять `py -m py_compile` изменённых файлов. Офлайн script-тесты (не pytest):
+  `py test_kimi_only.py` — регрессия единого Kimi K2.7 runtime и запрет Claude в штатных entrypoint;
+  `py test_kimi_agent_freedom.py` — контракт свободного Kimi Agent loop;
   `py test_deep_research.py` — смоук движка (гонять при правках `deep_research_engine.py`);
   `py web/api/test_events.py [лог ...]` — парсер stdout оркестратора в SSE-события, проверяется
   по НАСТОЯЩИМ логам прошлых прогонов (`D:\orq_tmp\run_*.log`, по умолчанию берёт их сам).

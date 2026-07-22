@@ -1,0 +1,9 @@
+version: 1
+agent:
+  name: official-sources
+  system_prompt_path: ./official_sources.md
+  tools:
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:

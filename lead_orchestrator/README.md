@@ -9,16 +9,28 @@
 **Фаза 1 — сбор** (`orchestrator._collect`):
 `source_rusprofile.harvest` (поиск по ОКВЭД+выручке через undetected-chromedriver, обход Cloudflare) → `rusprofile_session.RusProfileAuth.enrich_leads` (контакты с карточек платного аккаунта; cookie в `.rp_cookies.json`, разовый `--login`) → `pipeline._select` (отбор) → `build_excel.build` (xlsx) → `disk_organize.organize_to_disk` (папки + заготовки .docx на Диске).
 
-**Фаза 2 — ресёрч** (детерминированный async, `asyncio.gather` + `Semaphore`):
-по каждой компании `company_research_agent` (Claude Agent SDK, opus/sonnet + WebSearch/WebFetch) собирает досье и стратегию, перезаписывает заготовки в тех же папках на Диске. Официальная база — `deep_research`: ГИР БО (`revenue_enrich.girbo_revenue`, бесплатно) + Dadata (`dadata_enrich`) + Checko (`checko_enrich`).
+**Фаза 2 — deep research + два DOCX** (`asyncio.gather` + `Semaphore`):
+в Kimi-ветке (`--model kimi`) после двух базовых DRE-проходов запускается граф пяти ролей
+`official_sources → (corporate_contour + secondary_sources) → role_candidates → candidate_contacts`.
+Результаты проходят машинную валидацию, checkpoint и детерминированно попадают в карту ролей:
+корпоративный граф, центры решений, кандидаты и таблица «Контакт / Тип / Лучшее применение».
+Контракт schema v3 требует точные фактически открытые URL, стабильные ID официальных пробелов,
+покрытие всех 17 функций и каждого кандидата; контакт отдельно несёт тип источника и разрешённую
+политику outreach. Evidence trace сохраняется вместе с checkpoint и повторно валидируется на cache hit.
+Штатный runtime — **Kimi-only** (`ORQ_KIMI_ONLY=1`): Claude/Anthropic не выбирается ни CLI,
+ни вебом. Старый код ветки сохранён только как аварийный rollback при явном `ORQ_KIMI_ONLY=0`.
 
 ## Файлы
 
 | Модуль | Роль |
 |---|---|
 | `orchestrator.py` | **точка входа CLI** — обе фазы одной командой |
-| `orchestrator_agent.py` | SDK-обёртка над `orchestrator.py` (NL-запрос → подпроцесс) |
-| `company_research_agent.py` | агент-досье по одной компании (фаза 2) |
+| `orchestrator_agent.py` | Kimi K2.7 NL-контроллер над `orchestrator.py` (JSON-план → подпроцесс) |
+| `kimi_config.py` | единый ключ, endpoint, модель и Kimi-only guard |
+| `company_research_agent.py` | общие схемы/промпты/DOCX-рендереры; старый standalone Claude-agent заблокирован при `ORQ_KIMI_ONLY=1` |
+| `writer_kimi.py` | Kimi-писатель + parent-мост пяти enrichment-ролей + DOCX-adapter |
+| `kimi_research_cli.py` | безопасные read-only LeadSearch/LeadFetch/LeadCrawl для Kimi |
+| `test_research_enrichment.py` | офлайн-тест scheduler, контрактов, кэша и DOCX-adapter |
 | `source_rusprofile.py` | поиск RusProfile по ОКВЭД+выручке (uc); карта отраслей `INDUSTRY` (21 отрасль) |
 | `rusprofile_session.py` | сессия платного аккаунта RusProfile, контакты с карточек |
 | `browser_util.py` | `chrome_major()` — подбор ChromeDriver под установленный Chrome |
@@ -35,21 +47,27 @@
 ## Запуск
 
 ```sh
-# сбор + ресёрч по отрасли (по умолчанию count=200; ~$1–2/компания)
+# сбор + ресёрч по отрасли (Kimi K2.7 — дефолт)
 py orchestrator.py --industries mining --count 10
 
 # только ресёрч по готовому JSON
 py orchestrator.py path/to/leads.json
 
-# через SDK-агента (естественный язык)
+# через Kimi K2.7 controller (естественный язык)
 py orchestrator_agent.py "собери 10 по mining, dry-run"
 ```
 
-Полезные флаги: `--min-revenue 1e9`, `--region "ХМАО"`, `--model opus|sonnet`, `--workers N`, `--dry-run`, `--no-upload`, `--show-browser`.
+Полезные флаги: `--min-revenue 1e9`, `--region "ХМАО"`, `--workers N`, `--dry-run`, `--no-upload`, `--show-browser`.
 
 ## Зависимости и окружение
 
-См. `requirements.txt`. Кроме pip-пакетов нужны: реальный Chrome, CLI `yacli` (Яндекс Диск, разовый `yacli login disk`), переменные `ANTHROPIC_API_KEY` (фаза research) и опционально `DADATA_TOKEN` / `CHECKO_TOKEN`.
+См. `requirements.txt`. Кроме pip-пакетов нужны: реальный Chrome, CLI `yacli` (Яндекс Диск,
+разовый `yacli login disk`), `KIMI_API_KEY` (либо текущий fallback `GPLLM_API_KEY`) и
+опционально `DADATA_TOKEN` / `CHECKO_TOKEN`.
+
+Единый и зафиксированный ID всех модельных стадий: `KIMI_MODEL_NAME=kimi-k2.7-code`.
+Попытка подменить его в Kimi-only режиме завершает запуск до API-вызова. Проверка маршрута без
+сети: `py test_kimi_only.py`.
 
 Регион у RusProfile фильтруется **только клиентски** (серверного фильтра нет). Сбор идёт в **headed offscreen** по умолчанию — true-headless не проходит антибот Cloudflare.
 

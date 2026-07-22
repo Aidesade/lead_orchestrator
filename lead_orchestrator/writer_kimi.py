@@ -1,52 +1,84 @@
 # -*- coding: utf-8 -*-
 """Писатель двух пресейл-.docx на Kimi.
 
-Чем отличается от писателя на Claude (orchestrator._research_one): тот — АГЕНТ с
-инструментами (in-process MCP + WebSearch/WebFetch, до 80 ходов), он сам решает, когда
-сохранить документ. Kimi здесь работает проще и детерминированнее: инструментов нет,
-ресёрч уже выполнен движком deep_research (и person_enrich), поэтому модель ОДНИМ вызовом
-возвращает JSON по ТОЙ ЖЕ схеме, а .docx рендерят ТЕ ЖЕ функции CRA._write_*_docx.
-Формат документов от смены модели не меняется — меняется только автор текста.
+Kimi по умолчанию тоже АГЕНТ: запускается подпроцессом из изолированного .venv_kimi,
+основной писатель вызывает нативным Task веер scout'ов, verifier'ов и critic. Scout/verifier
+получают read-only поиск/чтение/краул через subprocess-мост в основной venv. Финальный JSON
+возвращается сюда, а .docx рендерят ТЕ ЖЕ функции CRA._write_*_docx. Поэтому несовместимые
+kimi-agent-sdk и claude-agent-sdk не импортируются одним интерпретатором.
 
-У каждого документа СВОЙ системный промпт (CRA.PROCESS_MAP_SYSTEM / CRA.ROLES_CONTACTS_SYSTEM
-+ SYSTEM_TAIL) и СВОИ находки — со своего прохода движка (orchestrator.RESEARCH_PASSES).
+У каждого документа СВОЙ системный промпт (CRA.PROCESS_MAP_SYSTEM / CRA.ROLES_CONTACTS_SYSTEM)
+и СВОИ находки — со своего прохода движка (orchestrator.RESEARCH_PASSES).
 Раньше был один PRESALE_SYSTEM и одни общие находки на оба документа.
 
-Почему не kimi-agent-sdk: он конфликтует с claude-agent-sdk по pydantic-core и потому
-живёт в отдельном venv (см. комментарий в Dockerfile). Тащить его в основной процесс
-нельзя. Здесь обычный OpenAI-совместимый HTTP через `openai`, который и так закреплён
-в requirements.txt (openai==2.44.0) — новых зависимостей ноль.
-
-Следствие, которое надо знать: у писателя на Kimi НЕТ веб-инструментов, поэтому он не
-может добрать пробелы «на лету». Всё, что попадёт в документы, приходит из находок
-дипресёрча. На качество это влияет ровно настолько, насколько полон движок.
+Старый одиночный OpenAI-совместимый HTTP-писатель оставлен как явный аварийный режим
+`KIMI_WRITER_AGENT=0`; автоматически на него не откатываемся, иначе поломка субагентов
+молчаливо ухудшила бы качество документов.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+
+import kimi_config as KC
+
+KC.ensure_env()
 
 
 def _cra():
-    """company_research_agent тянет за собой claude-agent-sdk и python-docx. Импортируем
-    лениво: orchestrator зовёт is_kimi()/kimi_model() ещё на этапе разбора аргументов,
-    и платить за этот импорт там незачем."""
+    """Ленивый импорт общих схем и DOCX-рендереров (без загрузки legacy Claude SDK)."""
     import company_research_agent as CRA
     return CRA
 
 
-BASE_URL_DEFAULT = "https://gpllmkeeper.dtc.tatar/v1"
-MODEL_DEFAULT = "kimi-k2.7-code"
+BASE_URL_DEFAULT = KC.DEFAULT_BASE_URL
+MODEL_DEFAULT = KC.DEFAULT_MODEL
 
 MAX_TOKENS = int(os.environ.get("KIMI_WRITER_MAX_TOKENS", "16000"))
 TIMEOUT = float(os.environ.get("KIMI_WRITER_TIMEOUT", "600"))
 ATTEMPTS = int(os.environ.get("KIMI_WRITER_ATTEMPTS", "3"))
 
+HERE = pathlib.Path(__file__).resolve().parent
+KIMI_DIR = pathlib.Path(os.environ.get("KIMI_DIR") or (HERE.parent / "lead_orchestrator_kimi"))
+KIMI_PY = pathlib.Path(os.environ.get("KIMI_PY") or (
+    KIMI_DIR / ".venv_kimi" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+))
+KIMI_AGENT_CLI = KIMI_DIR / "writer_kimi_agent.py"
+KIMI_RESEARCH_CLI = KIMI_DIR / "research_enrichment_agent.py"
+RESEARCH_TOOL = HERE / "kimi_research_cli.py"
+# По умолчанию агенту не ставим общий дедлайн: реальный scout-ресёрч может быть долгим.
+# Положительное значение env возвращает опциональный предохранитель для оператора.
+AGENT_TIMEOUT = float(os.environ.get("KIMI_WRITER_AGENT_TIMEOUT", "0"))
+RESEARCH_SUBAGENTS_TIMEOUT = float(os.environ.get("KIMI_RESEARCH_SUBAGENTS_TIMEOUT", "2400"))
+RESEARCH_SUBAGENTS_SCHEMA_VERSION = 3
+RESEARCH_COMPANY_CONCURRENCY = int(os.environ.get("KIMI_RESEARCH_COMPANY_CONCURRENCY", "2"))
+_RESEARCH_SEMS = {}
+
+_AGENT_ENV_ALLOW = frozenset({
+    "PATH", "PYTHONIOENCODING", "PYTHONUTF8", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR",
+    "COMSPEC", "PATHEXT", "OS", "TEMP", "TMP", "TMPDIR", "USERPROFILE", "HOMEDRIVE",
+    "HOMEPATH", "APPDATA", "LOCALAPPDATA", "ALLUSERSPROFILE", "PROGRAMDATA",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "PUBLIC",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "HOME", "USER", "LANG", "LC_ALL",
+    "TZ", "XDG_RUNTIME_DIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    "PLAYWRIGHT_BROWSERS_PATH", "KIMI_API_KEY", "KIMI_BASE_URL", "KIMI_MODEL_NAME",
+    "KIMI_WRITER_MAX_STEPS", "KIMI_WRITER_THINKING", "ORQ_KIMI_TOOL_TIMEOUT",
+    "KIMI_RESEARCH_SUBAGENT_MAX_STEPS", "KIMI_RESEARCH_SUBAGENT_ATTEMPTS",
+    "KIMI_RESEARCH_CHECKPOINT_TTL_H", "KIMI_TOOL_LOG_DIR",
+})
+
 
 def kimi_key() -> str:
     """Ключ провайдера. Тот же порядок, что у стадии one-pager (orchestrator._kimi_key)."""
-    return (os.environ.get("KIMI_API_KEY") or os.environ.get("GPLLM_API_KEY") or "").strip()
+    return KC.api_key()
 
 
 def kimi_model(model: str | None = None) -> str:
@@ -55,23 +87,455 @@ def kimi_model(model: str | None = None) -> str:
     m = (model or "").strip()
     if m and m.lower() not in ("kimi", "kimi-writer"):
         return m                                   # явное имя модели передали как есть
-    return (os.environ.get("KIMI_WRITER_MODEL")
-            or os.environ.get("KIMI_MODEL_NAME")
-            or MODEL_DEFAULT)
+    return KC.model_name()
 
 
 def kimi_base_url() -> str:
-    return (os.environ.get("KIMI_BASE_URL") or BASE_URL_DEFAULT).strip()
+    return KC.base_url()
 
 
 def is_kimi(model: str | None) -> bool:
     return str(model or "").strip().lower().startswith("kimi")
 
 
-# Дополнение к системным промптам документов: они написаны под агента с инструментами
-# («зови deep_research, ищи WebSearch'ем, вызови save_*_docx» — и метод отдан агенту).
-# Для Kimi инструментов нет, поэтому режим переопределяем явно, иначе модель будет
-# просить инструменты, которых нет, и считать работу невыполненной без вызова save_*.
+def _agent_enabled() -> bool:
+    return os.environ.get("KIMI_WRITER_AGENT", "1").strip().lower() not in (
+        "0", "false", "no", "off", "нет",
+    )
+
+
+def _agent_env(api_model: str, share_dir: str) -> dict[str, str]:
+    """Минимальное окружение Kimi-процесса: без токенов Диска/Checko/Dadata/Anthropic."""
+    env = {k: v for k, v in os.environ.items() if k.upper() in _AGENT_ENV_ALLOW}
+    env["KIMI_API_KEY"] = kimi_key()
+    env["KIMI_BASE_URL"] = kimi_base_url()
+    env["KIMI_MODEL_NAME"] = api_model
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["ORQ_MAIN_PY"] = sys.executable
+    env["ORQ_RESEARCH_TOOL"] = str(RESEARCH_TOOL)
+    # kimi-cli пишет session metadata неатомарно; отдельная папка исключает гонку между
+    # параллельными company/writer-процессами и не даёт им портить общий ~/.kimi/kimi.json.
+    env["KIMI_SHARE_DIR"] = share_dir
+    return env
+
+
+async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
+    """Остановить Kimi writer вместе с Task-субагентами и браузерами."""
+    if proc.returncode is not None:
+        return
+    if os.name == "nt":
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill", "/PID", str(proc.pid), "/T", "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.wait()
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except (TimeoutError, ProcessLookupError):
+        pass
+
+
+def _research_stage_sem() -> asyncio.Semaphore:
+    """Ограничить число одновременных company-level enrichment-подпроцессов."""
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _RESEARCH_SEMS.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, RESEARCH_COMPANY_CONCURRENCY))
+        _RESEARCH_SEMS[key] = sem
+    return sem
+
+
+async def _ask_agent_json(system: str, user: str, api_model: str, idx: int,
+                          label: str, temp_parent: str, company: str = "",
+                          inn: str = "") -> tuple[dict, dict]:
+    """Один документ через Kimi Agent SDK + Task-субагентов в отдельном venv."""
+    if not kimi_key():
+        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
+    missing = [str(p) for p in (KIMI_PY, KIMI_AGENT_CLI, RESEARCH_TOOL) if not p.is_file()]
+    if missing:
+        raise RuntimeError("не готовы файлы Kimi Agent writer: " + ", ".join(missing))
+
+    with tempfile.TemporaryDirectory(prefix=f"kimi_{label}_", dir=temp_parent) as td:
+        share_dir = pathlib.Path(td) / "kimi_share"
+        share_dir.mkdir()
+        req = pathlib.Path(td) / "request.json"
+        result = pathlib.Path(td) / "result.json"
+        req.write_text(json.dumps({"system": system, "user": user, "model": api_model,
+                                   "company": company, "inn": inn, "label": label,
+                                   "index": idx},
+                                  ensure_ascii=False), encoding="utf-8")
+        spawn = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                 if os.name == "nt" else {"start_new_session": True})
+        proc = await asyncio.create_subprocess_exec(
+            str(KIMI_PY), str(KIMI_AGENT_CLI), str(req), str(result),
+            cwd=str(KIMI_DIR), env=_agent_env(api_model, str(share_dir)),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            **spawn,
+        )
+        try:
+            if AGENT_TIMEOUT > 0:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TIMEOUT)
+            else:
+                stdout, stderr = await proc.communicate()
+        except TimeoutError:
+            await _kill_tree(proc)
+            raise RuntimeError(
+                f"Kimi Agent writer превысил таймаут {AGENT_TIMEOUT:g} с ({label})"
+            ) from None
+        except asyncio.CancelledError:
+            await _kill_tree(proc)
+            raise
+        except BaseException:
+            await _kill_tree(proc)
+            raise
+        out = stdout.decode("utf-8", "replace").strip()
+        err = stderr.decode("utf-8", "replace").strip()
+        for line in out.splitlines():
+            if "[kimi-agent]" in line:
+                print(f"    [{idx}] {line}")
+        if proc.returncode or not result.is_file():
+            tail = (err or out or "нет вывода")[-1000:]
+            raise RuntimeError(f"Kimi Agent writer упал ({label}, code={proc.returncode}): {tail}")
+        data = json.loads(result.read_text(encoding="utf-8"))
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Kimi Agent writer вернул не объект ({label})")
+        return payload, data
+
+
+async def run_research_subagents(lead: dict, idx: int, seed,
+                                 temp_parent: str, model: str | None = None,
+                                 checkpoint: str = "", checkpoint_ttl_h: float = 72) -> dict:
+    """Запустить dependency-aware граф пяти enrichment-субагентов и вернуть JSON-досье."""
+    async with _research_stage_sem():
+        return await _run_research_subagents_unlocked(
+            lead, idx, seed, temp_parent, model, checkpoint, checkpoint_ttl_h)
+
+
+async def _run_research_subagents_unlocked(lead: dict, idx: int, seed,
+                                            temp_parent: str, model: str | None,
+                                            checkpoint: str, checkpoint_ttl_h: float) -> dict:
+    if not kimi_key():
+        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
+    missing = [str(p) for p in (KIMI_PY, KIMI_RESEARCH_CLI, RESEARCH_TOOL) if not p.is_file()]
+    if missing:
+        raise RuntimeError("не готовы файлы Kimi research-субагентов: " + ", ".join(missing))
+    api_model = kimi_model(model)
+    name = (lead.get("name") or "").strip()
+    inn = str(lead.get("_inn") or "").strip()
+    with tempfile.TemporaryDirectory(prefix="kimi_enrichment_", dir=temp_parent) as td:
+        share_dir = pathlib.Path(td) / "kimi_share"
+        share_dir.mkdir()
+        req = pathlib.Path(td) / "request.json"
+        result = pathlib.Path(td) / "result.json"
+        req.write_text(json.dumps({
+            "lead": lead, "company": name, "inn": inn, "seed": seed, "model": api_model,
+            "checkpoint": checkpoint, "checkpoint_ttl_h": checkpoint_ttl_h,
+        }, ensure_ascii=False), encoding="utf-8")
+        spawn = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                 if os.name == "nt" else {"start_new_session": True})
+        proc = await asyncio.create_subprocess_exec(
+            str(KIMI_PY), str(KIMI_RESEARCH_CLI), str(req), str(result),
+            cwd=str(KIMI_DIR), env=_agent_env(api_model, str(share_dir)),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **spawn,
+        )
+        try:
+            if RESEARCH_SUBAGENTS_TIMEOUT > 0:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=RESEARCH_SUBAGENTS_TIMEOUT)
+            else:
+                stdout, stderr = await proc.communicate()
+        except TimeoutError:
+            await _kill_tree(proc)
+            raise RuntimeError(
+                f"пять research-субагентов превысили таймаут {RESEARCH_SUBAGENTS_TIMEOUT:g} с"
+            ) from None
+        except asyncio.CancelledError:
+            await _kill_tree(proc)
+            raise
+        except BaseException:
+            await _kill_tree(proc)
+            raise
+        out = stdout.decode("utf-8", "replace").strip()
+        err = stderr.decode("utf-8", "replace").strip()
+        for line in out.splitlines():
+            if "[research-subagent]" in line:
+                print(f"    [{idx}] {line}")
+        if proc.returncode or not result.is_file():
+            tail = (err or out or "нет вывода")[-1500:]
+            raise RuntimeError(
+                f"research-субагенты упали (code={proc.returncode}): {tail}")
+        data = json.loads(result.read_text(encoding="utf-8"))
+        required = {"official_sources", "corporate_contour", "secondary_sources",
+                    "role_candidates", "candidate_contacts"}
+        if (data.get("schema_version") != RESEARCH_SUBAGENTS_SCHEMA_VERSION
+                or data.get("complete") is not True
+                or not isinstance(data.get("roles"), dict)
+                or not required <= set(data["roles"])):
+            raise RuntimeError("research-субагенты вернули некорректное JSON-досье")
+        return data
+
+
+_FUNCTION_LABELS = {
+    "ceo": "CEO / генеральный директор", "owner": "Собственник",
+    "technical": "Технический директор", "chief_engineer": "Главный инженер",
+    "cio_it": "CIO / IT", "automation": "Автоматизация", "digital": "Цифровизация",
+    "commercial": "Коммерция", "procurement": "Закупки", "supply": "Снабжение",
+    "finance": "Финансы", "legal": "Юридический блок", "hr": "HR",
+    "production": "Производство", "geology": "Геология", "hse": "HSE",
+    "branch_management": "Филиалы / региональное управление",
+}
+_CONTACT_KIND_LABELS = {
+    "personal_work": "персональный рабочий", "functional_inbox": "функциональный inbox",
+    "corporate_inbox": "общий корпоративный inbox", "reception_phone": "телефон приёмной",
+    "branch_address": "адрес филиала", "official_professional_profile": "официальный профиль",
+    "backup_channel": "резервный канал",
+}
+_SOURCE_CONTEXT_LABELS = {
+    "official_company_site": "официальный сайт компании",
+    "official_holding_site": "официальный сайт холдинга",
+    "government_registry": "государственный реестр", "official_tender": "тендер",
+    "vacancy": "вакансия", "business_media": "деловое СМИ",
+    "professional_profile": "профессиональный профиль", "social_media": "соцсеть",
+    "business_aggregator": "неподтверждённый агрегатор",
+    "other_public_source": "иной публичный источник",
+}
+_STATUS_LABELS = {
+    "confirmed": "подтверждено", "probable": "вероятно", "historical": "историческое",
+    "unverified": "не подтверждено", "conflicting": "противоречие",
+}
+_OUTREACH_POLICY_LABELS = {
+    "direct_allowed": "прямой outreach допустим", "routing_only": "только маршрутизация",
+    "internal_verification_only": "только внутренняя проверка",
+    "do_not_cold_outreach": "не использовать для cold outreach",
+}
+
+
+def _source_cell(row: dict) -> str:
+    url = row.get("source_url") or ""
+    published = row.get("publication_date") or ""
+    observed = str(row.get("observed_at") or "")[:10]
+    suffix = []
+    if published:
+        suffix.append(f"опубликовано {published}")
+    if observed:
+        suffix.append(f"проверено {observed}")
+    return url + (" · " + " · ".join(suffix) if suffix else "")
+
+
+def _status_cell(row: dict) -> str:
+    status = _STATUS_LABELS.get(row.get("status"), row.get("status") or "")
+    confidence = row.get("confidence")
+    return status + (f" · confidence {float(confidence):.2f}" if isinstance(confidence, (int, float)) else "")
+
+
+def _person_key(value: str) -> str:
+    return re.sub(r"[^a-zа-я0-9]+", " ", str(value or "").casefold().replace("ё", "е")).strip()
+
+
+def apply_research_enrichment(payload: dict, enrichment: dict | None) -> dict:
+    """Детерминированно перенести пять ролей в поля DOCX, не полагаясь на пересказ LLM."""
+    if not enrichment or enrichment.get("complete") is not True:
+        return payload
+    roles = enrichment.get("roles") or {}
+    official = roles.get("official_sources") or {}
+    contour = roles.get("corporate_contour") or {}
+    secondary = roles.get("secondary_sources") or {}
+    candidates = roles.get("role_candidates") or {}
+    contact_result = roles.get("candidate_contacts") or {}
+
+    payload["decision_centers_table"] = [{
+        "function": row.get("function") or "",
+        "organization": row.get("organization") or "",
+        "type": row.get("type") or "",
+        "rationale": row.get("rationale") or "",
+        "status": _status_cell(row),
+        "source": "\n".join(row.get("source_urls") or []),
+    } for row in contour.get("decision_centers") or []]
+
+    target = (contour.get("target_company") or {}).get("name") or payload.get("org_name") or "Целевая компания"
+    graph_rows = []
+    organizations = {
+        _person_key(row.get("name")): row for row in contour.get("organizations") or []}
+    for row in contour.get("edges") or []:
+        node = organizations.get(_person_key(row.get("to"))) or organizations.get(
+            _person_key(row.get("from"))) or {}
+        graph_rows.append({
+            "from": row.get("from") or "", "to": row.get("to") or "",
+            "relation": row.get("relation") or "",
+            "functions": "; ".join(node.get("functions") or []),
+            "status": _status_cell(row), "source": row.get("source_url") or "",
+        })
+    payload["corporate_graph_table"] = graph_rows
+
+    candidate_rows = [{
+        "fio": row.get("full_name") or "",
+        "function": _FUNCTION_LABELS.get(row.get("target_function"), row.get("target_function") or ""),
+        "reported_title": row.get("reported_title") or "",
+        "organization": row.get("organization") or "",
+        "inn": row.get("inn") or "",
+        "evidence_status": _status_cell(row),
+        "current_role": "не присвоена: это кандидат",
+        "evidence": row.get("evidence") or "",
+        "publication_dates": "; ".join(row.get("publication_dates") or []),
+        "observed_at": str(row.get("observed_at") or "")[:10],
+        "source": "\n".join(row.get("source_urls") or []),
+    } for row in candidates.get("candidates") or []]
+    for function in candidates.get("unfilled_functions") or []:
+        candidate_rows.append({
+            "fio": "не найден", "function": _FUNCTION_LABELS.get(function, function),
+            "reported_title": "", "organization": target,
+            "inn": "",
+            "evidence_status": "пробел исследования", "current_role": "не присвоена",
+            "evidence": "кандидат не найден после целевого поиска",
+            "publication_dates": "", "observed_at": "",
+            "source": "",
+        })
+    payload["role_candidates_table"] = candidate_rows
+
+    contact_rows = []
+    for row in contact_result.get("contacts") or []:
+        contact_rows.append({
+            "contact": row.get("value") or "",
+            "type": _CONTACT_KIND_LABELS.get(row.get("contact_kind"), row.get("contact_kind") or ""),
+            "source_context": _SOURCE_CONTEXT_LABELS.get(
+                row.get("source_context"), row.get("source_context") or ""),
+            "best_use": row.get("best_use") or "",
+            "outreach_policy": _OUTREACH_POLICY_LABELS.get(
+                row.get("outreach_policy"), row.get("outreach_policy") or ""),
+            "candidate": row.get("candidate_full_name") or "общий маршрут",
+            "function": _FUNCTION_LABELS.get(row.get("candidate_function"), row.get("candidate_function") or ""),
+            "organization": row.get("organization") or "",
+            "status": _status_cell(row),
+            "source": _source_cell(row),
+        })
+    for row in contact_result.get("routing_paths") or []:
+        contact_rows.append({
+            "contact": row.get("route") or "",
+            "type": _CONTACT_KIND_LABELS.get(row.get("contact_kind"), row.get("contact_kind") or ""),
+            "source_context": _SOURCE_CONTEXT_LABELS.get(
+                row.get("source_context"), row.get("source_context") or ""),
+            "best_use": row.get("best_use") or row.get("purpose") or "",
+            "outreach_policy": _OUTREACH_POLICY_LABELS.get(
+                row.get("outreach_policy"), row.get("outreach_policy") or ""),
+            "candidate": "общий маршрут", "function": row.get("purpose") or "",
+            "organization": row.get("organization") or target,
+            "status": _status_cell(row),
+            "source": _source_cell(row),
+        })
+    for row in contact_result.get("candidates_without_contacts") or []:
+        contact_rows.append({
+            "contact": "не найден", "type": "", "source_context": "",
+            "best_use": row.get("reason") or "уточнить ответственного через официальный маршрут",
+            "outreach_policy": "только маршрутизация",
+            "candidate": row.get("candidate_full_name") or "",
+            "function": _FUNCTION_LABELS.get(
+                row.get("candidate_function"), row.get("candidate_function") or ""),
+            "organization": row.get("organization") or target,
+            "status": "пробел исследования", "source": "",
+        })
+    payload["research_contacts_table"] = contact_rows
+
+    evidence_rows = []
+    for row in official.get("confirmed_facts") or []:
+        evidence_rows.append({
+            "claim": row.get("claim") or "", "level": "официальный",
+            "source_type": row.get("source_type") or "", "status": "подтверждено",
+            "confidence": f"{float(row.get('confidence') or 0):.2f}",
+            "publication_date": row.get("publication_date") or "",
+            "observed_at": str(row.get("observed_at") or "")[:10],
+            "evidence_text": row.get("evidence_text") or "",
+            "source": row.get("source_url") or "",
+        })
+    for row in secondary.get("findings") or []:
+        evidence_rows.append({
+            "claim": row.get("claim") or "", "level": "вторичный",
+            "source_type": row.get("source_type") or "",
+            "status": _STATUS_LABELS.get(row.get("status"), row.get("status") or ""),
+            "confidence": f"{float(row.get('confidence') or 0):.2f}",
+            "publication_date": row.get("publication_date") or "",
+            "observed_at": str(row.get("observed_at") or "")[:10],
+            "evidence_text": row.get("evidence_text") or "",
+            "source": row.get("source_url") or "",
+        })
+    for row in secondary.get("hypotheses_for_verification") or []:
+        evidence_rows.append({
+            "claim": row.get("hypothesis") or "", "level": "гипотеза",
+            "source_type": "вторичный источник", "status": "требует проверки",
+            "confidence": "", "publication_date": "", "observed_at": "",
+            "evidence_text": "Проверить: " + (row.get("verification_needed") or ""),
+            "source": "\n".join(row.get("source_urls") or []),
+        })
+    for gap in official.get("gaps") or []:
+        evidence_rows.append({
+            "claim": gap.get("description") or "", "level": "официальный пробел",
+            "source_type": gap.get("gap_id") or "",
+            "status": "не найдено", "confidence": "", "publication_date": "",
+            "observed_at": "", "evidence_text": "", "source": "",
+        })
+    for gap in contour.get("gaps") or []:
+        evidence_rows.append({
+            "claim": gap, "level": "пробел корпоративного контура", "source_type": "",
+            "status": "не найдено", "confidence": "", "publication_date": "",
+            "observed_at": "", "evidence_text": "", "source": "",
+        })
+    for level, source_group in (
+            ("проверка официального источника", official),
+            ("проверка вторичного источника", secondary)):
+        for row in source_group.get("checked_sources") or []:
+            evidence_rows.append({
+                "claim": "Проверен источник: " + (row.get("source_url") or ""),
+                "level": level, "source_type": row.get("source_type") or "",
+                "status": row.get("outcome") or "", "confidence": "",
+                "publication_date": "", "observed_at": str(row.get("observed_at") or "")[:10],
+                "evidence_text": "", "source": row.get("source_url") or "",
+            })
+    payload["research_evidence_table"] = evidence_rows
+
+    # JSON-досье доступно писателю, но его role_candidates не являются подтверждением текущей
+    # должности. Убираем возможное повышение кандидата из legacy-таблиц до детерминированного вывода.
+    candidate_keys = {_person_key(row.get("full_name")) for row in candidates.get("candidates") or []}
+    candidate_keys.discard("")
+    removed = 0
+    for field in ("leadership_table", "contacts_table"):
+        rows = payload.get(field) or []
+        kept = [row for row in rows if _person_key(row.get("fio")) not in candidate_keys]
+        removed += len(rows) - len(kept)
+        payload[field] = kept
+    lpr_text = " ".join((str(payload.get("lpr_profile_title") or ""),
+                         str(payload.get("lpr_profile") or "")))
+    if any(key and key in _person_key(lpr_text) for key in candidate_keys):
+        payload["lpr_profile_title"] = ""
+        payload["lpr_profile"] = ""
+        removed += 1
+
+    raw_disclaimers = payload.get("disclaimers") or []
+    disclaimers = list(raw_disclaimers) if isinstance(raw_disclaimers, list) else [str(raw_disclaimers)]
+    note = ("Специализированный агент ролей формирует кандидатов и не присваивает им текущую "
+            "должность; статусы и confidence приведены в отдельных таблицах.")
+    if note not in disclaimers:
+        disclaimers.append(note)
+    if removed:
+        disclaimers.append(
+            f"Из legacy-разделов удалено потенциальных атрибуций кандидатов как текущих ЛПР: {removed}.")
+    for conflict in candidates.get("conflicts") or []:
+        text = "Конфликт по кандидату: " + str(conflict)
+        if text not in disclaimers:
+            disclaimers.append(text)
+    payload["disclaimers"] = disclaimers
+    return payload
+
+
+# Дополнение к системным промптам для АВАРИЙНОГО legacy HTTP-режима
+# (`KIMI_WRITER_AGENT=0`). В агентном режиме этот хвост не используется: там имена
+# Task-субагентов и JSON-деливерабл переопределяет writer_kimi_agent.py.
 SYSTEM_TAIL = """
 
 --- РЕЖИМ РАБОТЫ (ПЕРЕОПРЕДЕЛЯЕТ ВСЁ ПРО ИНСТРУМЕНТЫ ВЫШЕ) ---
@@ -178,7 +642,8 @@ def _tokens(usage) -> int:
 
 
 async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_roles: str,
-                         d_tmp: str, s_tmp: str, model: str | None = None) -> float:
+                         d_tmp: str, s_tmp: str, model: str | None = None,
+                         enrichment: dict | None = None) -> float:
     """Сделать оба .docx на Kimi. Возвращает стоимость (0.0 — шлюз цену не отдаёт).
 
     У каждого документа СВОЙ системный промпт (PROCESS_MAP_SYSTEM / ROLES_CONTACTS_SYSTEM)
@@ -200,21 +665,41 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
          ROLES_EXTRA, findings_roles, CRA._write_roles_contacts_docx, s_tmp, "роли"),
     )
 
-    client = _client()
+    use_agent = _agent_enabled()
+    client = None if use_agent else _client()
     total_tokens = 0
     try:
         for system, title, schema, extra, findings, render, path, label in jobs:
-            payload, usage = await _ask_json(
-                client, api_model, system + SYSTEM_TAIL,
-                _user_prompt(title, schema, name, inn, findings, extra),
-                idx, label)
+            user = _user_prompt(title, schema, name, inn, findings, extra)
+            if use_agent:
+                payload, meta = await _ask_agent_json(
+                    system, user, api_model, idx, label, os.path.dirname(path), name, inn)
+                usage = None
+                sub = meta.get("subagents") or {}
+                print(f"    [{idx}] [kimi:{label}] субагенты: "
+                      f"scout={sub.get('scout', 0)}, critic={sub.get('critic', 0)}, "
+                      f"verifier={sub.get('verifier', 0)}")
+                web = meta.get("web_tools") or {}
+                print(f"    [{idx}] [kimi:{label}] прямой веб: "
+                      f"search={web.get('LeadSearch', 0)}, fetch={web.get('LeadFetch', 0)}, "
+                      f"crawl={web.get('LeadCrawl', 0)}")
+            else:
+                payload, usage = await _ask_json(
+                    client, api_model, system + SYSTEM_TAIL, user, idx, label)
             total_tokens += _tokens(usage)
             # Рендер ждёт org_name: модель иногда кладёт company/название в другое поле.
             payload.setdefault("org_name", name)
+            if label == "роли":
+                apply_research_enrichment(payload, enrichment)
             await asyncio.to_thread(render, dict(payload), path)
-            print(f"    [{idx}] → kimi:{label} сохранён ({api_model})")
+            mode = "agent" if use_agent else "legacy-http"
+            print(f"    [{idx}] → kimi:{label} сохранён ({api_model}, {mode})")
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
 
-    print(f"    [{idx}] [kimi] писатель: {total_tokens} токенов ({api_model})")
+    if use_agent:
+        print(f"    [{idx}] [kimi] агентный писатель завершён ({api_model})")
+    else:
+        print(f"    [{idx}] [kimi] legacy HTTP: {total_tokens} токенов ({api_model})")
     return 0.0          # gpllmkeeper цену за вызов не возвращает — считать нечего

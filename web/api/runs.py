@@ -198,7 +198,7 @@ def build_argv(p: Dict[str, Any]) -> List[str]:
         cmd += ["--region", ", ".join(tokens)]
     if (p.get("out") or "").strip():
         cmd += ["--out", p["out"].strip()]
-    cmd += ["--model", (p.get("model") or "opus").strip()]
+    cmd += ["--model", "kimi"]
     cmd += ["--workers", str(int(p.get("workers") or 2))]
     cmd += ["--base", (p.get("base") or config.DISK_BASE).strip()]
     if p.get("show_browser"):

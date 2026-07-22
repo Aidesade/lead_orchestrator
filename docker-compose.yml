@@ -7,7 +7,7 @@ x-orch-env: &orch-env
   RUSPROFILE_COOKIES_FILE: /data/rusprofile/cookies.json
   KIMI_DIR: /app/lead_orchestrator_kimi
   KIMI_PY: /opt/kimi-venv/bin/python
-  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  ORQ_KIMI_ONLY: "1"
   YANDEX_DISK_TOKEN: ${YANDEX_DISK_TOKEN:-}
   DADATA_TOKEN: ${DADATA_TOKEN:-}
   CHECKO_TOKEN: ${CHECKO_TOKEN:-}
@@ -16,6 +16,7 @@ x-orch-env: &orch-env
   GPLLM_API_KEY: ${GPLLM_API_KEY:-}
   KIMI_BASE_URL: ${KIMI_BASE_URL:-https://gpllmkeeper.dtc.tatar/v1}
   KIMI_MODEL_NAME: ${KIMI_MODEL_NAME:-kimi-k2.7-code}
+  DR_LLM_PROVIDER: kimi
   FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
 
 services:

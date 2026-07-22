@@ -30,7 +30,7 @@ deep_research_engine — НАСТОЯЩИЙ глубокий ресёрч-дви
 
 Бюджет/конкуренция (env-переопределяемо):
   DR_BREADTH=4  DR_DEPTH=2  DR_MAXPAGES=25  DR_LLM_CONCURRENCY=2  DR_CRAWL_CONCURRENCY=4
-  DR_EXTRACT_MODEL=sonnet   DR_USE_LLM=1   DR_PAGE_CHARS=9000   DR_MAX_DOMAINS=3
+  DR_LLM_PROVIDER=kimi     DR_USE_LLM=1   DR_PAGE_CHARS=9000   DR_MAX_DOMAINS=3
   FIRECRAWL_API_KEY=...     (опц.) — парсинг карточек ЕИС за ключом
 
 Мульти-домен: у компании (особенно госструктуры) часто 2-3 сайта — свой + страница на
@@ -39,17 +39,22 @@ deep_research_engine — НАСТОЯЩИЙ глубокий ресёрч-дви
 дополнительные — половинный). Критик полноты также следит за «экосистемой» — вертикалью
 принятия решений (учредитель, курирующее ведомство, сестринские структуры, комиссии).
 
-Зависимости: stdlib + (опц.) crawl4ai + claude-agent-sdk (для LLM-экстракта sonnet).
+Зависимости штатного пути: stdlib + openai + (опц.) crawl4ai. claude-agent-sdk нужен
+только для явно включённого legacy-отката (ORQ_KIMI_ONLY=0, DR_LLM_PROVIDER=claude).
 Чистая логика (regex_findings, completeness_critic, merge_findings, consolidate)
 работает БЕЗ сети и БЕЗ LLM — это страховка и предмет дымового теста.
 """
 import asyncio
 import gzip
+import http.client
+import ipaddress
 import io
 import json
 import os
 import random
 import re
+import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -65,6 +70,10 @@ SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
+import kimi_config as KC
+
+KC.ensure_env()
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -74,13 +83,12 @@ except Exception:
 DR_BREADTH = int(os.environ.get("DR_BREADTH", "4"))            # запросов добора за раунд
 DR_DEPTH = int(os.environ.get("DR_DEPTH", "2"))               # раундов целевого добора
 DR_MAX_PAGES = int(os.environ.get("DR_MAXPAGES", "25"))       # кап страниц на сайт-краул
-DR_LLM_CONCURRENCY = int(os.environ.get("DR_LLM_CONCURRENCY", "2"))   # параллельных sonnet CLI
+DR_LLM_CONCURRENCY = int(os.environ.get("DR_LLM_CONCURRENCY", "2"))   # параллельных Kimi-вызовов
 DR_CRAWL_CONCURRENCY = int(os.environ.get("DR_CRAWL_CONCURRENCY", "4"))  # параллельных HTTP-фетчей
 EXTRACT_MODEL = os.environ.get("DR_EXTRACT_MODEL", "sonnet")  # дешёвая модель для экстракта/критика
-# Провайдер LLM-экстракта: 'claude' (по умолч., claude-agent-sdk) или 'kimi' (OpenAI-совместимый
-# шлюз, тот же, что у писателя). 'kimi' нужен, когда Claude недоступен (прод в РФ / Docker) —
-# тогда ВЕСЬ пайплайн работает без Anthropic. Имя модели Kimi берётся из KIMI_MODEL_NAME.
-DR_LLM_PROVIDER = (os.environ.get("DR_LLM_PROVIDER", "claude") or "claude").strip().lower()
+# Провайдер LLM-экстракта: штатно Kimi через общий OpenAI-совместимый шлюз.
+# Claude разрешён только при явном аварийном opt-out ORQ_KIMI_ONLY=0.
+DR_LLM_PROVIDER = (os.environ.get("DR_LLM_PROVIDER", "kimi") or "kimi").strip().lower()
 DR_USE_LLM = os.environ.get("DR_USE_LLM", "1") not in ("0", "false", "no", "")
 DR_PAGE_CHARS = int(os.environ.get("DR_PAGE_CHARS", "9000"))  # кап текста страницы для LLM
 DR_MAX_DOMAINS = int(os.environ.get("DR_MAX_DOMAINS", "3"))   # подтверждённых сайтов на компанию
@@ -159,22 +167,159 @@ def _host_headers(url):
     return {"User-Agent": UA, "Accept-Language": lang, "Accept-Encoding": "gzip"}
 
 
-def _fetch_sync(url, timeout=12):
-    """GET -> (final_url, text) или (url, '') при ошибке. Прозрачно жмёт gzip."""
+_FETCH_MAX_BYTES = int(os.environ.get("DR_FETCH_MAX_BYTES", str(5 * 1024 * 1024)))
+
+
+def _is_public_ip(value):
     try:
-        req = urllib.request.Request(url, headers=_host_headers(url))
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read()
-            if r.headers.get("Content-Encoding") == "gzip":
-                raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
-            ct = r.headers.get("Content-Type", "")
+        ip = ipaddress.ip_address(str(value).split("%", 1)[0])
+    except ValueError:
+        return None
+    return bool(
+        ip.is_global
+        and not ip.is_multicast
+        and not ip.is_unspecified
+        and not ip.is_reserved
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_private
+    )
+
+
+def _resolve_public_addresses(host, port):
+    literal = _is_public_ip(host)
+    if literal is False:
+        raise ValueError("private/loopback/link-local/multicast IP запрещён")
+    if literal is True:
+        return [host.split("%", 1)[0]]
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"hostname не разрешается: {host}") from exc
+    addresses = []
+    for info in infos:
+        address = info[4][0].split("%", 1)[0]
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses or not all(_is_public_ip(address) is True for address in addresses):
+        raise ValueError("hostname ведёт в private/loopback/link-local/multicast сеть")
+    return addresses
+
+
+def _validate_public_http_url(url, *, resolve=True):
+    """Отклонить file://, credentials и private/loopback/link-local адреса (SSRF guard)."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL пуст")
+    try:
+        parsed = urlparse(url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("некорректный URL/порт") from exc
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise ValueError("разрешены только абсолютные http(s)-URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("credentials в URL запрещены")
+    host = parsed.hostname.lower().rstrip(".")
+    if host in ("localhost", "localhost.localdomain") or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError("локальный hostname запрещён")
+
+    literal = _is_public_ip(host)
+    if literal is False:
+        raise ValueError("private/loopback/link-local/multicast IP запрещён")
+    if literal is True or not resolve:
+        return url.strip()
+    _resolve_public_addresses(
+        host, port or (443 if parsed.scheme.lower() == "https" else 80))
+    return url.strip()
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, pinned_ip, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port=port, **kwargs)
+
+    def connect(self):
+        self.sock = self._create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, pinned_ip, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port=port, **kwargs)
+
+    def connect(self):
+        self.sock = self._create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+        server_hostname = self._tunnel_host or self.host
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+def _pinned_response(url, timeout):
+    """Один GET к уже проверенному IP, сохраняя исходный Host и TLS SNI."""
+    clean = _validate_public_http_url(url, resolve=False)
+    parsed = urlparse(clean)
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    addresses = _resolve_public_addresses(parsed.hostname.lower().rstrip("."), port)
+    path = parsed.path or "/"
+    if parsed.params:
+        path += ";" + parsed.params
+    if parsed.query:
+        path += "?" + parsed.query
+    last_error = None
+    for address in addresses:
+        connection = None
+        try:
+            cls = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+            kwargs = {"timeout": timeout}
+            if scheme == "https":
+                kwargs["context"] = ssl.create_default_context()
+            connection = cls(parsed.hostname, port, address, **kwargs)
+            connection.request("GET", path, headers=_host_headers(clean))
+            response = connection.getresponse()
+            raw = response.read(_FETCH_MAX_BYTES + 1)[:_FETCH_MAX_BYTES]
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            return response.status, headers, raw
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            if connection is not None:
+                connection.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("нет разрешённых IP для соединения")
+
+
+def _fetch_sync(url, timeout=12):
+    """GET с DNS pinning -> (final_url, text); каждый redirect проверяется заново."""
+    original = url
+    try:
+        current = _validate_public_http_url(url, resolve=False)
+        for _ in range(6):
+            status, headers, raw = _pinned_response(current, timeout)
+            if status in (301, 302, 303, 307, 308):
+                location = headers.get("location")
+                if not location:
+                    return current, ""
+                current = _validate_public_http_url(
+                    urllib.parse.urljoin(current, location), resolve=False)
+                continue
+            if status >= 400:
+                return current, ""
+            if headers.get("content-encoding", "").lower() == "gzip":
+                raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read(
+                    _FETCH_MAX_BYTES + 1)[:_FETCH_MAX_BYTES]
             enc = "utf-8"
-            m = re.search(r"charset=([\w\-]+)", ct)
+            m = re.search(r"charset=([\w\-]+)", headers.get("content-type", ""))
             if m:
                 enc = m.group(1)
-            return r.geturl(), raw.decode(enc, "replace")
+            return current, raw.decode(enc, "replace")
+        return current, ""
     except Exception:
-        return url, ""
+        return original, ""
 
 
 _LINK_KEEP = re.compile(
@@ -787,21 +932,20 @@ def _pages_blob(pages, max_total=24000):
 
 async def _kimi_extract(system, prompt):
     """LLM-экстракт через Kimi (OpenAI-совместимый шлюз, как у писателя). '' при сбое/без ключа.
-    Переиспользует env-хелперы writer_kimi (ключ/endpoint/модель) — единый источник настроек Kimi."""
+    Ключ/endpoint/модель берутся из единого kimi_config."""
     try:
-        import writer_kimi as WK
         from openai import AsyncOpenAI
     except Exception as e:                          # noqa: BLE001
         _note(f"Kimi недоступен для LLM-экстракта: {e}")
         return ""
-    key = WK.kimi_key()
+    key = KC.api_key()
     if not key:
         _note("нет ключа Kimi (KIMI_API_KEY/GPLLM_API_KEY) для LLM-экстракта")
         return ""
-    model = WK.kimi_model("kimi")
+    model = KC.model_name()
     timeout = float(os.environ.get("DR_LLM_TIMEOUT", "300"))
     max_tokens = int(os.environ.get("DR_KIMI_MAX_TOKENS", "8000"))
-    client = AsyncOpenAI(base_url=WK.kimi_base_url(), api_key=key, timeout=timeout, max_retries=0)
+    client = AsyncOpenAI(base_url=KC.base_url(), api_key=key, timeout=timeout, max_retries=0)
     try:
         async with _sem("llm", DR_LLM_CONCURRENCY):
             for attempt in (1, 2):                  # 2-я попытка — без response_format (шлюз мог не принять)
@@ -1078,6 +1222,7 @@ class SiteCrawler:
             return []
         if not domain.startswith("http"):
             domain = "http://" + domain
+        domain = _validate_public_http_url(domain)
         pages = []
         if os.environ.get("DR_USE_CRAWL4AI", "1") not in ("0", "false", "no"):
             try:
@@ -1096,7 +1241,14 @@ class SiteCrawler:
             r = await fetch_page(root)
             if r:
                 pages.insert(0, r)
-        return pages[: self.max_pages]
+        public_pages = []
+        for page in pages:
+            try:
+                _validate_public_http_url(page.get("url") or "")
+            except ValueError:
+                continue
+            public_pages.append(page)
+        return public_pages[: self.max_pages]
 
     async def _crawl4ai(self, domain):
         from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, BrowserConfig
@@ -1144,7 +1296,10 @@ class SiteCrawler:
                   f"{host} проектный институт структура"):
             for res in await web_search(q, 5):
                 u = res["url"]
-                if host in urlparse(u).netloc and u.rstrip("/") not in seen:
+                candidate_host = (urlparse(u).hostname or "").lower().rstrip(".")
+                root_host = (urlparse(domain).hostname or "").lower().rstrip(".")
+                same_site = candidate_host == root_host or candidate_host.endswith("." + root_host)
+                if same_site and u.rstrip("/") not in seen:
                     seen.add(u.rstrip("/"))
                     discovered.append(u)
         # типовые пути

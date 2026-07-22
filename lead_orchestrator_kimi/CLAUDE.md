@@ -2,22 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Изолированная **Kimi-версия ТРЕТЬЕЙ стадии** Фазы 2 лидген-пайплайна: вместо брендированной
-`.pptx`-презентации (её делает рабочий `../lead_orchestrator/` через Claude Agent SDK + скилл
-`pptx`) здесь генерится **редакционный one-pager**: модель Kimi по системному промпту выдаёт
-самодостаточный HTML → он рендерится в **PDF**. Python 3.12, LLM — через **Kimi Agent SDK**
-(Kimi CLI, OpenAI-совместимый `/v1`). Подробности для человека — в `README.md`; этот файл —
-про инварианты и подводные камни.
+Изолированные **Kimi-агенты Фазы 2** лидген-пайплайна. Папка начиналась с третьей стадии
+(редакционный one-pager: Kimi выдаёт самодостаточный HTML → Playwright рендерит PDF), а теперь
+также содержит dependency-aware enrichment и агентного писателя двух `.docx`. Python 3.12,
+LLM — через **Kimi Agent SDK** / Kimi CLI и OpenAI-совместимый `/v1`. Подробности для человека —
+в `README.md`; этот файл — про инварианты и подводные камни.
 
-**Статус: стадия проверена вживую end-to-end** (2026-07-13) — Kimi → HTML → PDF → Яндекс Диск.
+**Статус: Kimi включён end-to-end** (2026-07-21): controller → research extract → enrichment →
+два `.docx` → HTML/PDF. One-pager отдельно проверен вживую 2026-07-13.
 Пробный результат: `disk:/Лиды/_kimi_test/АО Рязаньавтодор/` (тестовая папка, вне боевого дерева лидов).
 
 ## Главные инварианты (НЕ сломать)
 
-1. **Рабочий `../lead_orchestrator/` не трогать** без явной просьбы. Эта папка — параллельная
-   замена одной стадии, а не форк всего пайплайна. Перенос обёртки/писателя/движка на Kimi здесь
-   НЕ сделан. (Исключение, сделанное осознанно 2026-07-13: переименование бренда Telepath→Telepatt
-   прошло по обеим папкам.)
+1. **Интеграционный контракт с `../lead_orchestrator/` уже боевой.** Основной оркестратор не
+   импортирует Kimi SDK напрямую: он вызывает скрипты этой папки её venv-питоном. Меняя CLI,
+   схемы JSON или коды возврата, одновременно проверять parent-мост и `test_kimi_only.py`.
 2. **Kimi ставится ТОЛЬКО в `.venv_kimi`, никогда не глобально.** Глобальная установка ломает
    рабочий пайплайн: `kimi-agent-sdk` тянет `pydantic-core 2.41.5`, а `claude-agent-sdk`/`anthropic`
    требуют `2.46.4` — конфликт версий. (Это уже случалось: глобальная установка снесла `anthropic`
@@ -26,8 +25,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    не видит `kimi_agent_sdk`; venv не видит рабочих модулей — это норма, окружения раздельны.
    ⚠️ Докстринги внутри `onepager_kimi.py` местами говорят `py onepager_kimi.py` — устарели,
    авторитет здесь.
-4. **ДВА патча в `.venv_kimi` обязательны и хрупки** (см. «Подводные камни»): `slashcmd.py` и
-   `_session.py`. Без них `import`/запуск падают. Оба не переживут `pip install --upgrade`.
+4. **Патчи `.venv_kimi` управляются только `patches/apply_patches.py`.** На текущем пине нужен
+   `slashcmd.py`; `_session.py` был нужен лишь для несовместимого kimi-cli 1.48. После любой
+   переустановки обязательны `apply_patches.py` и затем `--check`.
 5. **Канон блоков листа.** Блоки 1–3, 6, 8 (шапка, герой, 4 фичи, спикер, футер) — ОДИНАКОВЫ у всех
    заказчиков и передаются модели ДОСЛОВНО из констант `onepager_kimi.py`. Уникален только блок 4
    («Одна проблема — одно решение») + подписи метрик. Иначе модель каждый прогон переписывает шапку
@@ -40,9 +40,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `onepager_system.py` | Системный промпт one-pager (VERBATIM, прислан пользователем) + `SPEAKER_PHOTO_TOKEN` | не менять текст промпта осознанно |
 | `html_to_pdf.py` | Ответ модели → извлечь самодостаточный лист (баланс `<div>`), вшить фото data-URI, Playwright → PDF | ✅ проверено вживую |
 | `onepager_kimi.py` | Канон-константы + `build_user_content` + `generate_onepager_html` (вызов Kimi) + `make_onepager` (полная стадия) + CLI | ✅ проверено вживую |
-| `kimi_agent/onepager.yaml` + `system.md` | Агент Kimi **без тулов** (обязателен, см. ниже) | ✅ |
+| `kimi_agent/onepager.yaml` + `system.md` | Агент one-pager **без тулов** (обязателен, см. ниже) | ✅ |
+| `writer_kimi_agent.py` | Агентный писатель ОДНОГО JSON-документа; прямой read-only веб + нативный Task → динамические scout/critic/verifier | ✅ selftest |
+| `research_enrichment_agent.py` | Пять dependency-aware enrichment-субагентов Фазы 2: `official → (contour + secondary) → roles → contacts`; schema v3, exact-URL/redirect provenance, coverage/outreach contracts, persisted evidence trace, schema/prompt/input/dependency/output hashes и non-sliding TTL | ✅ офлайн-контракт + selftest |
+| `leadgen_tools.py` | Read-only мост LeadSearch/LeadFetch/LeadCrawl в основной venv; HTTP(S)-only, private/loopback/link-local URL и небезопасные redirect блокируются в `deep_research_engine` | ✅ selftest |
+| `kimi_agent/writer.yaml`, `scout.yaml`, `critic.yaml`, `verifier.yaml` | Фиксированные роли Kimi CLI 1.12 | ✅ selftest |
 | `README.md` | Человеко-документация: статус, установка, патчи | — |
-| `.venv_kimi/` | Изолированное окружение (kimi-agent-sdk 0.0.5 + kimi-cli 1.48 + playwright). Эта папка — не git-репозиторий (репозиторий только в `../lead_orchestrator/`). | — |
+| `.venv_kimi/` | Изолированное окружение (kimi-agent-sdk 0.0.5 + kimi-cli 1.12.0 + playwright). Пин 1.12.0 не снимать. | — |
 
 ## Реальный API Kimi (сверено вживую на 0.0.5)
 
@@ -75,9 +79,13 @@ set KIMI_MODEL_NAME=kimi-k2.7-code
 py html_to_pdf.py raw.html out.pdf --photo ..\lead_orchestrator\assets\bulat_zamaliev.png
 ```
 
-**Проверка** (тестов и линтера в папке нет): `py -m py_compile onepager_kimi.py html_to_pdf.py
-onepager_system.py` + прогон рендера на сохранённом `raw.html` (единственный end-to-end чек,
-доступный без endpoint). Число страниц PDF — `pdfinfo` из Poppler (`D:\Apps\poppler\poppler-*\Library\bin`).
+**Проверка:** `py -m py_compile onepager_kimi.py html_to_pdf.py onepager_system.py
+writer_kimi_agent.py research_enrichment_agent.py leadgen_tools.py` +
+`.venv_kimi\Scripts\python.exe writer_kimi_agent.py --selftest` +
+`.venv_kimi\Scripts\python.exe research_enrichment_agent.py --selftest` +
+`py ..\lead_orchestrator\test_research_enrichment.py` +
+`py ..\lead_orchestrator\test_kimi_only.py`. Для one-pager дополнительно
+прогон рендера на сохранённом `raw.html`; страницы PDF — `pdfinfo` из Poppler.
 
 ## Подводные камни
 
@@ -87,16 +95,15 @@ onepager_system.py` + прогон рендера на сохранённом `r
   а инстанцируется параметризованно `SlashCommand[F](...)` → `typing` пытается записать
   `__orig_class__` на frozen+slots-объект. Фикс в методе `_register`: `SlashCommand[F](` →
   `SlashCommand(`. Воспроизводится и на kimi-cli 1.12, и на 1.48.
-- **Патч 2 — `_session.py` (дрейф версий SDK↔CLI).** SDK 0.0.5 зовёт `KimiCLI.create(skills_dir=…)`,
-  а kimi-cli 1.48 ждёт `skills_dirs=[…]` (СПИСОК) → `TypeError: unexpected keyword argument`.
-  Фикс в `kimi_agent_sdk/_session.py` (2 места — `create` и `resume`):
-  `skills_dir=skills_dir` → `skills_dirs=[skills_dir] if skills_dir else None`.
-- ⚠️ Оба патча живут в `.venv_kimi\Lib\site-packages\` и **НЕ переживут `pip install --upgrade`** —
-  повторить руками.
-- **Агент без тулов обязателен.** Дефолтный агент kimi-cli тянет `kimi_cli.tools.web:SearchWeb` и
-  `FetchURL`; у кастомного провайдера они не грузятся → `InvalidToolError` ещё ДО вызова модели.
-  Стадия чисто текстовая, тулы ей не нужны: `generate_onepager_html` передаёт
-  `agent_file=kimi_agent/onepager.yaml` (`tools: []`). Не «упрощать», убрав agent_file — сломается.
+- **Патч 2 для `_session.py` при текущем пине НЕ нужен.** Он существовал только из-за ручной
+  установки kimi-cli 1.48 вне диапазона SDK. `apply_patches.py --check` обязан подтвердить
+  `skills_dir`; не поднимать kimi-cli отдельно от SDK.
+- ⚠️ Патч slashcmd живёт в `.venv_kimi\Lib\site-packages\` и **НЕ переживёт переустановку** —
+  после неё всегда запускать `patches/apply_patches.py`, не править site-packages руками.
+- **One-pager остаётся агентом без тулов.** Его `onepager.yaml` содержит `tools: []` намеренно.
+  Писатель документов использует другой `writer.yaml`: главный агент и scout/verifier имеют
+  read-only `LeadSearch`/`LeadFetch`/`LeadCrawl`, главный дополнительно имеет `Task`. Никаких
+  shell/file tools; список сайтов не зашит. Число scout выбирает модель, critic обязателен.
 - **kimi-agent-sdk на PyPI застыл на 0.0.5** (github-доки с 0.0.6 опережают релиз).
 - **Одна страница PDF — следить.** Высота листа дробная (напр. 1953.98 px), а размер страницы
   задаётся целым; при конвертации px→дюймы Chromium теряет доли, контент вылезает на микроскопическую
@@ -134,10 +141,11 @@ onepager_system.py` + прогон рендера на сохранённом `r
   `VENDOR_SITE` (ЦИТ РТ). Если при встраивании в оркестратор передать туда контакты лида из Фазы 1,
   заказчика позовут звонить самому себе (уже ловили).
 
-## Встроено в боевой пайплайн (2026-07-13) — ГОТОВО
+## Встроено в боевой пайплайн (обновлено 2026-07-21) — ГОТОВО
 
-Стадия **заменила** `.pptx`-презентацию в `../lead_orchestrator/` (код pptx, промпт
-`PRESENTATION_SYSTEM` и предусловия LibreOffice/node/скилл `pptx` оттуда удалены).
+Kimi-ветка заменила модельный runtime всей Фазы 2: enrichment, писатель двух `.docx` и
+one-pager. Прежняя `.pptx`-презентация также заменена PDF; её код, LibreOffice/node и скилл
+`pptx` из штатного маршрута удалены.
 
 Как именно сведены два SDK: оркестратор НЕ импортирует `kimi_agent_sdk`, а запускает
 **подпроцесс venv-питона этой папки** — `orchestrator._onepager_one()`:

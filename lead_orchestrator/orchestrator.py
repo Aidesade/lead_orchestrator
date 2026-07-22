@@ -28,8 +28,9 @@ r"""
 
 Chrome при сборе по умолчанию СКРЫТ (окно не открывается); показать — --show-browser.
 
-Зависимости боевого режима: claude-agent-sdk, python-docx, ANTHROPIC_API_KEY,
-доступ к Диску — env YANDEX_DISK_TOKEN (python-коннектор connectors/yadisk_client).
+Штатный боевой режим — Kimi-only: controller, deep-research extract, enrichment-роли,
+оба DOCX-писателя и one-pager используют KIMI_MODEL_NAME через KIMI_API_KEY
+(fallback GPLLM_API_KEY). Доступ к Диску — env YANDEX_DISK_TOKEN.
 dry-run не требует ничего сверх stdlib.
 """
 import argparse
@@ -51,7 +52,10 @@ warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
 
+import kimi_config as KC
 import disk_organize as DO  # пути на Диске + upload + заглушки (stdlib, без сети при импорте)
+
+KC.ensure_env()
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -98,12 +102,12 @@ KIMI_CLI = os.path.join(KIMI_DIR, "onepager_kimi.py")
 
 # Endpoint провайдера Kimi. Ключ — KIMI_API_KEY, иначе GPLLM_API_KEY (так он задан на этой машине).
 # base_url/модель имеют рабочие дефолты, любой из них перекрывается env.
-KIMI_BASE_URL_DEFAULT = "https://gpllmkeeper.dtc.tatar/v1"
-KIMI_MODEL_DEFAULT = "kimi-k2.7-code"
+KIMI_BASE_URL_DEFAULT = KC.DEFAULT_BASE_URL
+KIMI_MODEL_DEFAULT = KC.DEFAULT_MODEL
 
 
 def _kimi_key():
-    return (os.environ.get("KIMI_API_KEY") or os.environ.get("GPLLM_API_KEY") or "").strip()
+    return KC.api_key()
 
 
 # --- Кап одновременных браузерных краулов (тул crawl_site у субагентов-разведчиков) ---
@@ -163,8 +167,8 @@ def _kimi_env():
     http_proxy/https_proxy в нижнем регистре, сохраняя исходное написание ключа."""
     env = {k: v for k, v in os.environ.items() if k.upper() in _KIMI_ENV_ALLOW}
     env["KIMI_API_KEY"] = _kimi_key()
-    env.setdefault("KIMI_BASE_URL", KIMI_BASE_URL_DEFAULT)
-    env.setdefault("KIMI_MODEL_NAME", KIMI_MODEL_DEFAULT)
+    env["KIMI_BASE_URL"] = KC.base_url()
+    env["KIMI_MODEL_NAME"] = KC.model_name()
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -199,6 +203,99 @@ def _handle(lead, aspects=None):
     }
 
 
+async def _person_enrichment_block(lead, idx, enabled=True):
+    """Детерминированное обогащение ЛПР, общее для Kimi и legacy-ветки."""
+    if not (enabled and lead.get("contact_person") and lead.get("_inn")):
+        return ""
+    try:
+        import person_enrich as PEN
+        verify = os.environ.get("PERSON_VERIFY_EMAIL", "").strip().lower() in (
+            "1", "true", "yes", "on", "да")
+        social = os.environ.get("PERSON_SOCIAL", "").strip().lower() in (
+            "1", "true", "yes", "on", "да")
+        enriched = await asyncio.to_thread(
+            PEN.enrich_person, lead["contact_person"], lead["_inn"],
+            domain=lead.get("website"), verify_email=verify, social=social)
+        print(f"    [{idx}] person_enrich: email "
+              f"{len(enriched['contacts']['work_emails'])}, "
+              f"тел {len(enriched['contacts']['work_phones'])}"
+              + ("" if enriched.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
+        return PEN.format_findings_block(enriched)
+    except Exception as exc:
+        print(f"    [{idx}] person_enrich пропущен: {str(exc)[:80]}")
+        return ""
+
+
+async def _research_one_kimi(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
+    """Полный штатный research/write-маршрут без импорта Claude SDK."""
+    import deep_research_engine as DRE
+    import writer_kimi as WK
+
+    h = _handle(lead)
+    ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
+    pe_block = await _person_enrichment_block(lead, idx, person_enrich)
+    findings = {}
+    for pass_, aspects in RESEARCH_PASSES:
+        hp = _handle(lead, aspects)
+        cached = _cached_findings(hp["company_name"], hp["inn"], ttl_h=ttl_h, pass_=pass_)
+        if cached:
+            print(f"    [{idx}] deep_research[{pass_}]: находки из кэша "
+                  f"(моложе {ttl_h:g} ч) — движок пропущен")
+            findings[pass_] = cached
+            continue
+        print(f"    [{idx}] deep_research[{pass_}] (движок) ...")
+        try:
+            findings[pass_] = await DRE.deep_research(
+                hp["company_name"], hp["inn"], hp["aspects"])
+        except Exception as exc:
+            print(f"    [{idx}] deep_research[{pass_}] engine error: {str(exc)[:90]}")
+            findings[pass_] = ""
+        cache_path = _findings_cache_path(
+            hp["company_name"], hp["inn"], pass_)
+        if cache_path and findings[pass_] and len(findings[pass_]) > 200:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as fh:
+                    fh.write(findings[pass_])
+            except OSError:
+                pass
+
+    if pe_block:
+        findings["roles"] = (findings.get("roles") or "") + "\n\n" + pe_block
+
+    print(f"    [{idx}] research-субагенты: official → (contour + secondary) → roles → contacts")
+    enrichment_path = _enrichment_cache_path(h["company_name"], h["inn"])
+    seed = {
+        "process": findings.get("process", ""),
+        "roles": findings.get("roles", ""),
+    }
+    enrichment = await WK.run_research_subagents(
+        lead, idx, seed, os.path.dirname(d_tmp), model,
+        checkpoint=enrichment_path, checkpoint_ttl_h=ttl_h)
+
+    process_dossier = {
+        "schema_version": enrichment.get("schema_version"),
+        "roles": {
+            key: enrichment["roles"][key]
+            for key in ("official_sources", "corporate_contour")
+        },
+    }
+    process_block = (
+        "\n\n=== ДОПОЛНИТЕЛЬНОЕ ДОСЬЕ: OFFICIAL + CORPORATE CONTOUR ===\n"
+        + json.dumps(process_dossier, ensure_ascii=False, indent=2)
+    )
+    roles_block = (
+        "\n\n=== JSON-ДОСЬЕ ПЯТИ RESEARCH-СУБАГЕНТОВ ===\n"
+        + json.dumps(enrichment, ensure_ascii=False, indent=2)
+    )
+    findings["process"] = (findings.get("process") or "") + process_block
+    findings["roles"] = (findings.get("roles") or "") + roles_block
+    cost = await WK.write_two_docx(
+        lead, idx, findings.get("process", ""), findings.get("roles", ""),
+        d_tmp, s_tmp, model, enrichment=enrichment)
+    return cost, (findings.get("process") or findings.get("roles") or "")
+
+
 async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     """Один ресёрч-проход. Возвращает (стоимость, находки): находки нужны стадии
     презентации для формулировки боли заказчика. d_tmp = карта бизнес-процессов,
@@ -210,17 +307,27 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
       (PROCESS_MAP_SYSTEM / ROLES_CONTACTS_SYSTEM), инструменты — только WebSearch/WebFetch
       и свой save_*_docx. Движка тут НЕТ вообще: где искать и что брать, решает агент, а
       направляет его ТОЛЬКО системный промпт. На вход даются известные данные лида.
-    * Kimi — НЕ агент (инструментов нет), поэтому движок гоняется ЗАРАНЕЕ двумя проходами
-      (RESEARCH_PASSES), а модель получает готовые находки.
+    * Kimi — АГЕНТ в отдельном .venv_kimi: движок сначала гоняется двумя проходами
+      (RESEARCH_PASSES), затем писатель вызывает нативным Task scout/critic/verifier.
+      Scout/verifier могут точечно добирать веб через read-only subprocess-мост в движок;
+      JSON возвращается в основной venv, где его рендерят общие функции CRA.
 
     Почему движок убран из агентной ветки: он решал за агента И где искать (зашитые
     коллекторы site/ЕИС/суды-СМИ/hh/TAdviser), И что взять со страницы (схема llm_extract —
     ролецентричная, бизнес-процессов в ней нет вовсе). Заодно исчезла вложенная SDK-сессия
     (движок внутри сессии писателя) — та самая, из-за которой его когда-то и вынесли."""
-    import anyio  # noqa: F401  (нужен косвенно SDK/CRA)
+    import writer_kimi as WK
+    if KC.kimi_only() and not WK.is_kimi(model):
+        raise RuntimeError(
+            "Claude/Anthropic отключён: _research_one принимает только model='kimi'")
+    if WK.is_kimi(model):
+        return await _research_one_kimi(
+            lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
+
+    # Ни один импорт ниже этой точки не выполняется в штатном Kimi-only маршруте.
+    import anyio  # noqa: F401  (нужен косвенно legacy SDK/CRA)
     import company_research_agent as CRA
     import deep_research_engine as DRE
-    import writer_kimi as WK
     from claude_agent_sdk import (
         tool, create_sdk_mcp_server, AgentDefinition, ClaudeAgentOptions, ClaudeSDKClient,
         ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
@@ -337,64 +444,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
         return {"content": [{"type": "text", "text": "\n".join(out)}]}
 
     h = _handle(lead)
-    ttl_h = float(os.environ.get("ORQ_FINDINGS_TTL_H", "72"))
-
-    # Обогащение ЛПР прямыми контактами — детерминированно, БЕЗ вложенной SDK-сессии.
-    # Считается ДО развилки: нужно обеим веткам (Kimi получит блок в находках, агент — в
-    # задании). Легитимные источники (Dadata/Checko/сайт/MX/SMTP); «пробив»/утечки
-    # исключены в самом person_enrich (DENY_SOURCES). SMTP-проверка email и соц-поиск —
-    # под env (PERSON_VERIFY_EMAIL / PERSON_SOCIAL), по умолчанию выключены, чтобы
-    # 200-прогон был быстрым и не долбил чужие серверы.
-    pe_block = ""
-    if person_enrich and lead.get("contact_person") and lead.get("_inn"):
-        try:
-            import person_enrich as PEN
-            _pv = os.environ.get("PERSON_VERIFY_EMAIL", "").strip().lower() in ("1", "true", "yes", "on", "да")
-            _ps = os.environ.get("PERSON_SOCIAL", "").strip().lower() in ("1", "true", "yes", "on", "да")
-            pe = await asyncio.to_thread(
-                PEN.enrich_person, lead["contact_person"], lead["_inn"],
-                domain=lead.get("website"), verify_email=_pv, social=_ps)
-            pe_block = PEN.format_findings_block(pe)
-            print(f"    [{idx}] person_enrich: email {len(pe['contacts']['work_emails'])}, "
-                  f"тел {len(pe['contacts']['work_phones'])}"
-                  + ("" if pe.get("fio_confirmed") else " (ФИО ЛПР не подтв. ЕГРЮЛ)"))
-        except Exception as e:
-            print(f"    [{idx}] person_enrich пропущен: {str(e)[:80]}")
-
-    # ============ ветка Kimi: инструментов нет -> движок гоняем ЗАРАНЕЕ ============
-    # Два прохода (RESEARCH_PASSES): свой добор под процессы и свой — под роли/контакты.
-    # Кэш раздельный (findings_<ключ>__<проход>.md): ретрай писателя и повторный прогон
-    # не гоняют (и не оплачивают) deep-research заново.
-    if WK.is_kimi(model):
-        f = {}
-        for pass_, aspects in RESEARCH_PASSES:
-            hp = _handle(lead, aspects)
-            cached = _cached_findings(hp["company_name"], hp["inn"], ttl_h=ttl_h, pass_=pass_)
-            if cached:
-                print(f"    [{idx}] deep_research[{pass_}]: находки из кэша "
-                      f"(моложе {ttl_h:g} ч) — движок пропущен")
-                f[pass_] = cached
-                continue
-            print(f"    [{idx}] deep_research[{pass_}] (движок) ...")
-            try:
-                f[pass_] = await DRE.deep_research(hp["company_name"], hp["inn"], hp["aspects"])
-            except Exception as e:
-                print(f"    [{idx}] deep_research[{pass_}] engine error: {str(e)[:90]}")
-                f[pass_] = ""
-            cp = _findings_cache_path(hp["company_name"], hp["inn"], pass_)
-            if cp and f[pass_] and len(f[pass_]) > 200:
-                try:
-                    os.makedirs(os.path.dirname(cp), exist_ok=True)
-                    open(cp, "w", encoding="utf-8").write(f[pass_])
-                except OSError:
-                    pass
-        # Контакты ЛПР — в проход roles: карте процессов они не нужны.
-        if pe_block:
-            f["roles"] = (f.get("roles") or "") + "\n\n" + pe_block
-        cost = await WK.write_two_docx(lead, idx, f.get("process", ""), f.get("roles", ""),
-                                       d_tmp, s_tmp, model)
-        # Боль для one-pager'а живёт в процессном проходе.
-        return cost, (f.get("process") or f.get("roles") or "")
+    pe_block = await _person_enrichment_block(lead, idx, person_enrich)
 
     # ============ ветка Claude: агент решает всё сам ============
     # Движка здесь НЕТ — ни deep_research, ни коллекторов, ни discover_domains. Движок = зашитый
@@ -732,8 +782,10 @@ async def _attempt(coro, timeout, tag):
     """Одна попытка тяжёлой SDK-стадии под таймаутом. Успех -> результат корутины
     (кортеж (стоимость, ...)); НЕсмертельный сбой/таймаут -> печатает причину и отдаёт
     None; смертельное (Ctrl+C/выход, в т.ч. в BaseExceptionGroup от anyio при крахе
-    CLI) — пробрасывает."""
+    CLI) — пробрасывает. timeout <= 0 означает ожидание без общего дедлайна."""
     try:
+        if timeout <= 0:
+            return await coro
         return await asyncio.wait_for(coro, timeout=timeout)
     except BaseException as e:
         if _fatal_exc(e):
@@ -793,7 +845,8 @@ def _store_mode():
 def _store_root():
     """Корень ЛОКАЛЬНОГО хранилища деливераблов: ORQ_DATA_ROOT/deliverables (или D:\\deliverables).
     Тот же путь читает веб (web/api/config.DELIVERABLES_DIR) и отдаёт файлы на скачивание."""
-    return _work_base("deliverables")
+    explicit = os.environ.get("ORQ_DELIVERABLES_DIR", "").strip()
+    return explicit or _work_base("deliverables")
 
 
 class _Tee:
@@ -827,6 +880,12 @@ def _findings_cache_path(name, inn, pass_=""):
         return ""
     suffix = f"__{pass_}" if pass_ else ""
     return os.path.join(_work_base("orq_cache"), f"findings_{key}{suffix}.md")
+
+
+def _enrichment_cache_path(name, inn):
+    """JSON-кеш пяти специализированных research-субагентов."""
+    key = str(inn or "").strip() or DO._safe(name)[:60].replace(" ", "_")
+    return os.path.join(_work_base("orq_cache"), f"enrichment_{key}.json") if key else ""
 
 
 def _cached_findings(name, inn, ttl_h=None, pass_="", legacy_ok=False):
@@ -1007,10 +1066,9 @@ async def main():
     ap.add_argument("--base", default="disk:/Лиды")
     ap.add_argument("--account", default=None)
     ap.add_argument("--workers", type=int, default=2,
-                    help="параллельных ресёрч-агентов (claude CLI). При нехватке RAM авто-снижается до 1")
-    ap.add_argument("--model", default="opus",
-                    help="писатель двух .docx: kimi | opus (качество) | sonnet (дешевле). "
-                         "kimi — псевдоним, конкретную модель берём из KIMI_WRITER_MODEL/"
+                    help="параллельных Kimi-ресёрчей; при нехватке RAM авто-снижается до 1")
+    ap.add_argument("--model", default="kimi",
+                    help="писатель двух .docx: штатно только kimi; точный ID берётся из "
                          "KIMI_MODEL_NAME (дефолт kimi-k2.7-code)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
@@ -1035,6 +1093,14 @@ async def main():
     ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
                     help="не обогащать ЛПР прямыми контактами")
     a = ap.parse_args()
+    if KC.kimi_only():
+        if not str(a.model or "").strip().lower().startswith("kimi"):
+            raise SystemExit(
+                "Kimi-only режим: Claude/Anthropic отключён. Используй --model kimi "
+                "или явно задай ORQ_KIMI_ONLY=0 для аварийного legacy-отката.")
+        a.model = "kimi"
+        KC.ensure_env(require_key=not a.dry_run)
+        print(f"[LLM] Kimi-only: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
     # Копия ВСЕГО вывода (stdout+stderr, включая трейсбеки) в файл: диагноз упавшего
     # прогона не должен зависеть от того, сохранил ли кто-то консоль.
     try:
@@ -1106,10 +1172,10 @@ async def main():
             _tail = " (one-pager — отдельный счёт Kimi)" if a.presentation else ""
             print(f"[оценка] {len(sel)} компаний = ~${_lo}–${_hi} ({a.model}, {_what} "
                   f"на компанию){_tail}. Число = --count (по умолч. 200).")
-        free = _free_ram_gb()                         # каждый ресёрч = свой claude CLI (Node, сотни МБ)
+        free = _free_ram_gb()                         # Kimi-процессы + browser crawl требуют RAM
         if free is not None and free < 3.0 and a.workers > 1:
             print(f"[ОЗУ] свободно ~{free:.1f} ГБ — снижаю параллелизм ресёрча до 1 "
-                  "(несколько claude CLI при нехватке памяти падают 0xC0000409). "
+                  "(параллельные Kimi-процессы и Chromium могут исчерпать память). "
                   "Освободи RAM или задай --workers вручную.")
             a.workers = 1
 
@@ -1153,7 +1219,10 @@ async def main():
     # поэтому не сериализуем его намертво, но и не даём разойтись: каждая стадия = свой chromium.
     pdf_sem = asyncio.Semaphore(max(1, int(os.environ.get("ORQ_ONEPAGER_CONCURRENCY", "2"))))
     min_ram = float(os.environ.get("ORQ_MIN_RAM_GB", "2.5"))
-    research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", "1800"))  # сек на попытку ресёрча
+    # Kimi writer с веером Task-субагентов может работать дольше 30 минут; по умолчанию
+    # не обрываем его внешним дедлайном. Для Claude сохраняем прежний предохранитель.
+    default_research_timeout = "0" if WK.is_kimi(a.model) else "1800"
+    research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", default_research_timeout))
     pdf_timeout = float(os.environ.get("ORQ_ONEPAGER_TIMEOUT", "900"))        # сек на попытку one-pager
 
     async def process(idx, lead):

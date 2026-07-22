@@ -1,0 +1,9 @@
+version: 1
+agent:
+  name: corporate-contour
+  system_prompt_path: ./corporate_contour.md
+  tools:
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:

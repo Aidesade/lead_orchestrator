@@ -1,368 +1,382 @@
 # -*- coding: utf-8 -*-
-r"""
-Claude Agent SDK-обёртка ПОЛНОЙ ЦЕПОЧКИ (оркестратора).
+r"""Kimi K2.7 NL-обёртка полной цепочки лидогенерации.
 
-NL-запрос -> агент подбирает параметры -> инструмент run_full_chain ЗАПУСКАЕТ
-orchestrator.py: ФАЗА 1 сбор лидов (RusProfile, выручка>порога) + ФАЗА 2 ресёрч
-по каждой компании (досье + стратегия .docx) -> папки Яндекс Диска.
-
-Почему обёртка ЗАПУСКАЕТ orchestrator.py ПОДПРОЦЕССОМ, а не зовёт его функции
-in-process: фаза 2 оркестратора сама поднимает по ClaudeSDKClient на компанию.
-Поднимать SDK-агентов ВНУТРИ обработчика инструмента ДРУГОГО SDK-агента — лишний
-риск (вложенные клиенты/циклы). Подпроцесс изолирует их в дочернем процессе и
-переиспользует уже проверенный CLI оркестратора. stdout наследуется -> прогресс
-оркестратора (включая строку [ГОТОВО]) виден в консоли вживую; stderr копим для
-отчёта об ошибке.
-
-Chrome при сборе по умолчанию БЕЗ окна (headless). Показать окно — show_browser=true.
+Запрос на русском языке -> Kimi K2.7 возвращает строгий JSON-план -> детерминированный
+Python проверяет отрасли и объём -> subprocess запускает orchestrator.py. Любой LLM-вызов
+штатного пути использует один KIMI_API_KEY (с fallback GPLLM_API_KEY), KIMI_BASE_URL и
+KIMI_MODEL_NAME. Claude/Anthropic в этой обёртке не импортируется и не вызывается.
 
 Запуск:
-  py C:/Users/abalb/.claude/skills/lead-finder/scripts/orchestrator_agent.py
-  py .../orchestrator_agent.py "собери 10 по майнингу, dry-run"
-Зависимости: pip install claude-agent-sdk (+ всё, что нужно orchestrator.py).
-Платный аккаунт RusProfile нужен для сбора — один раз:
-  py .../rusprofile_session.py --login
+  py orchestrator_agent.py
+  py orchestrator_agent.py "собери по 10 компаний в нефтегазе, dry-run"
+  py orchestrator_agent.py --selftest
 """
+from __future__ import annotations
+
+import asyncio
+import json
 import os
+import re
 import subprocess
 import sys
 import warnings
 
-# Глушим косметический RequestsDependencyWarning (chardet 7.x вне диапазона requests) ДО импорта requests.
 warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
 
-import anyio
-from claude_agent_sdk import (
-    tool,
-    create_sdk_mcp_server,
-    ClaudeAgentOptions,
-    ClaudeSDKClient,
-    AssistantMessage,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    TextBlock,
-    ToolUseBlock,
-)
 
-try:                                   # рамка меню и ₽ ломаются в cp1251-консоли
+try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
-import source_rusprofile as RP  # noqa: E402  -> карта отраслей INDUSTRY
+
+import kimi_config as KC  # noqa: E402
+import source_rusprofile as RP  # noqa: E402
+
 
 ORCH = os.path.join(SCRIPTS, "orchestrator.py")
 VALID = sorted(RP.INDUSTRY)
-# карта «ключ — название» для модели: сопоставить запрос ('добыча угля') с ключом ('mining')
 INDUSTRY_HINT = "; ".join(f"{k} — {RP.INDUSTRY[k]['label']}" for k in VALID)
-
-# имя тула для can_use_tool: mcp__<ключ сервера>__<имя инструмента>
-TOOL_NAME = "mcp__orchestrator__run_full_chain"
-COUNT_CHOICES = (5, 10, 200)      # пункты меню «лидов НА КАЖДУЮ отрасль»
-DEFAULT_PER_INDUSTRY = 200        # прод-дефолт (вся отрасль), если пользователь не назвал число
-USD_PER_COMPANY = 4               # ~$3–4.5 за компанию: ресёрч (2 .docx) + презентация
-BIG_RUN_COMPANIES = 50            # выше — боевой прогон переспрашивается отдельно
+COUNT_CHOICES = (5, 10, 200)
+DEFAULT_PER_INDUSTRY = 200
+BIG_RUN_COMPANIES = 50
 
 
-def _txt(t):
-    return {"content": [{"type": "text", "text": t}]}
+SYSTEM_PROMPT = """\
+Ты — Kimi-контроллер полного B2B lead-gen pipeline. Твоя единственная задача —
+преобразовать запрос пользователя в ОДИН JSON-план. Сам pipeline запускает Python после
+проверки плана; не пиши команды, не имитируй запуск и не добавляй текст вне JSON.
+
+Pipeline делает: сбор компаний по отрасли -> deep research -> два DOCX -> one-pager PDF.
+Все модельные стадии уже закреплены за Kimi K2.7; поля выбора модели в плане НЕТ.
+
+Доступные отрасли (верни только ключи слева):
+__INDUSTRIES__
+
+Правила:
+- industries — ключи через запятую. Подбери по смыслу русской формулировки.
+- Если дан готовый leads.json, положи путь в leads_json, industries оставь пустым.
+- count_per_industry — число компаний НА КАЖДУЮ отрасль. Если пользователь сказал
+  «30 по трём отраслям», верни 10. Если число не названо — null (Python предложит 200).
+- region передавай как есть. Исключение: «кроме Москвы» -> «НЕ Москва».
+- min_revenue в рублях: «2 млрд» -> 2000000000. Если не названо — null.
+- dry_run=true только по явной просьбе. В dry-run тяжёлые LLM-стадии не вызываются.
+- one-pager включён по умолчанию; no_presentation=true только по явной просьбе.
+- workers обычно 2, при просьбе экономить RAM — 1.
+- action=clarify используй только если нельзя определить ни отрасль, ни путь JSON.
+
+Верни объект ровно этого вида:
+{
+  "action": "run|clarify",
+  "message": "короткий вопрос при clarify, иначе пустая строка",
+  "industries": "mining,oil28 или пустая строка",
+  "leads_json": "путь или пустая строка",
+  "count_per_industry": 10,
+  "min_revenue": 1000000000,
+  "region": "",
+  "show_browser": false,
+  "dry_run": false,
+  "no_upload": false,
+  "no_presentation": false,
+  "workers": 2
+}
+""".replace("__INDUSTRIES__", INDUSTRY_HINT)
 
 
-def parse_industries(raw):
-    """'opk, Mining; water' -> ['opk','mining','water'] — только валидные ключи, без дублей."""
-    out = []
-    for s in str(raw or "").replace(";", ",").split(","):
-        k = s.strip().lower()
-        if k in RP.INDUSTRY and k not in out:
-            out.append(k)
+def parse_industries(raw) -> list[str]:
+    """Оставить только реальные ключи карты отраслей, без дублей."""
+    values = raw if isinstance(raw, list) else str(raw or "").replace(";", ",").split(",")
+    out: list[str] = []
+    for value in values:
+        key = str(value).strip().lower()
+        if key in RP.INDUSTRY and key not in out:
+            out.append(key)
     return out
 
 
-def per_industry(args):
-    """Сколько лидов на КАЖДУЮ отрасль (>=1). Не задано -> вся отрасль."""
+def _bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on", "да")
+
+
+def _positive_int(value, default: int) -> int:
     try:
-        n = int(args.get("count_per_industry") or DEFAULT_PER_INDUSTRY)
+        return max(1, int(value))
     except (TypeError, ValueError):
-        n = DEFAULT_PER_INDUSTRY
-    return max(1, n)
+        return default
 
 
-def _build_cmd(args):
-    """Собрать argv для orchestrator.py из параметров инструмента.
-    Возвращает (cmd|None, error_text|None). Чистая функция — тестируется без запуска."""
-    industries = (args.get("industries") or "").strip()
-    leads_json = (args.get("leads_json") or "").strip()
+def _extract_json(text: str) -> dict:
+    text = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.I | re.S)
+    if fenced:
+        text = fenced.group(1)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            raise ValueError("Kimi не вернул JSON-план") from None
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    if not isinstance(value, dict):
+        raise ValueError("JSON-план Kimi должен быть объектом")
+    return value
+
+
+def _normalise_plan(raw: dict) -> dict:
+    """Недоверенный ответ модели -> узкий безопасный контракт запуска."""
+    industries = parse_industries(raw.get("industries"))
+    leads_json = str(raw.get("leads_json") or "").strip().strip('"')
+    action = str(raw.get("action") or "run").strip().lower()
+    if action not in ("run", "clarify"):
+        action = "clarify"
+    if industries and leads_json:
+        action = "clarify"
+        message = "Укажи либо отрасли для нового сбора, либо готовый leads.json — не оба сразу."
+    else:
+        message = str(raw.get("message") or "").strip()
+    if action == "run" and not industries and not leads_json:
+        action = "clarify"
+        message = message or "Какую отрасль собрать или какой путь к leads.json использовать?"
+
+    revenue = raw.get("min_revenue")
+    try:
+        revenue = float(revenue) if revenue not in (None, "") else None
+    except (TypeError, ValueError):
+        revenue = None
+    count = raw.get("count_per_industry")
+    count = None if count in (None, "") else _positive_int(count, DEFAULT_PER_INDUSTRY)
+    workers = min(2, _positive_int(raw.get("workers"), 2))
+    return {
+        "action": action,
+        "message": message,
+        "industries": ",".join(industries),
+        "leads_json": leads_json,
+        "count_per_industry": count,
+        "min_revenue": revenue,
+        "region": str(raw.get("region") or "").strip(),
+        "show_browser": _bool(raw.get("show_browser")),
+        "dry_run": _bool(raw.get("dry_run")),
+        "no_upload": _bool(raw.get("no_upload")),
+        "no_presentation": _bool(raw.get("no_presentation")),
+        "workers": workers,
+    }
+
+
+async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
+    """Один короткий вызов Kimi K2.7: NL -> JSON-план. Без tool calls и shell."""
+    KC.ensure_env(require_key=True)
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        base_url=KC.base_url(), api_key=KC.api_key(), timeout=180, max_retries=1)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend((history or [])[-6:])
+    messages.append({"role": "user", "content": prompt})
+    last_error: Exception | None = None
+    try:
+        for structured in (True, False):
+            kwargs = {
+                "model": KC.model_name(), "messages": messages,
+                "max_tokens": 1800, "temperature": 0.0,
+            }
+            if structured:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                response = await client.chat.completions.create(**kwargs)
+                text = response.choices[0].message.content or ""
+                return _normalise_plan(_extract_json(text)), text
+            except Exception as exc:  # шлюз может не поддержать response_format
+                last_error = exc
+                if not structured:
+                    raise
+    finally:
+        await client.close()
+    raise RuntimeError(f"Kimi controller не вернул план: {last_error}")
+
+
+def per_industry(plan: dict) -> int:
+    value = plan.get("count_per_industry")
+    return _positive_int(value, DEFAULT_PER_INDUSTRY)
+
+
+def _build_cmd(plan: dict) -> tuple[list[str] | None, str | None]:
+    industries = parse_industries(plan.get("industries"))
+    leads_json = str(plan.get("leads_json") or "").strip()
+    if industries and leads_json:
+        return None, "Нельзя одновременно собирать отрасли и читать готовый leads.json."
     if not industries and not leads_json:
-        return None, ("Нужно указать industries (отрасли через запятую) ИЛИ "
-                      "leads_json (путь к готовому JSON). Отрасли: " + ", ".join(VALID))
+        return None, "Нужна отрасль или путь к готовому leads.json."
 
     cmd = [sys.executable, ORCH]
     if leads_json:
-        cmd.append(leads_json)                       # позиционный аргумент: ТОЛЬКО ресёрч
+        cmd.append(leads_json)
     if industries:
-        inds = parse_industries(industries)
-        if not inds:
-            return None, "Не распознаны отрасли. Доступно: " + ", ".join(VALID)
-        cmd += ["--industries", ",".join(inds)]
-        # Объём ВСЕГДА «N на КАЖДУЮ отрасль». --count (ВСЕГО по всем отраслям) здесь
-        # сознательно не используется: orchestrator.py делит его как ceil(count/K), и
-        # «10 на отрасль» по трём отраслям молча превращалось в 4 на отрасль (и в 8/8/8/6
-        # после _select). Флаг --count остался только для ручного запуска CLI.
-        cmd += ["--per-industry", str(per_industry(args))]
-    if args.get("min_revenue"):
-        cmd += ["--min-revenue", str(float(args["min_revenue"]))]
-    region = (args.get("region") or "").strip()
-    if region:
-        cmd += ["--region", region]
-    cmd += ["--model", (args.get("model") or "opus").strip()]
-    cmd += ["--workers", str(int(args.get("workers") or 2))]
-    if args.get("show_browser"):
-        cmd.append("--show-browser")                 # иначе Chrome скрыт (по умолчанию)
-    if args.get("dry_run"):
+        cmd += ["--industries", ",".join(industries),
+                "--per-industry", str(per_industry(plan))]
+    if plan.get("min_revenue"):
+        cmd += ["--min-revenue", str(float(plan["min_revenue"]))]
+    if str(plan.get("region") or "").strip():
+        cmd += ["--region", str(plan["region"]).strip()]
+    cmd += ["--model", "kimi", "--workers", str(min(2, _positive_int(plan.get("workers"), 2)))]
+    if _bool(plan.get("show_browser")):
+        cmd.append("--show-browser")
+    if _bool(plan.get("dry_run")):
         cmd.append("--dry-run")
-    if args.get("no_upload"):
+    if _bool(plan.get("no_upload")):
         cmd.append("--no-upload")
-    if args.get("no_presentation"):
-        cmd.append("--no-presentation")              # 3-я стадия (one-pager .pdf) иначе ВКЛ по умолчанию
+    if _bool(plan.get("no_presentation")):
+        cmd.append("--no-presentation")
     return cmd, None
 
 
-async def _do_full_chain(args):
-    """Чистая реализация инструмента (тестируется напрямую, без LLM)."""
-    cmd, err = _build_cmd(args)
-    if cmd is None:
-        return _txt(err)
-
-    env = dict(os.environ)
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
-
-    def _run():
-        # stdout НАСЛЕДУЕТСЯ -> прогресс оркестратора виден вживую; stderr копим
-        p = subprocess.run(cmd, stderr=subprocess.PIPE, text=True,
-                           encoding="utf-8", errors="replace", env=env)
-        return p.returncode, (p.stderr or "")
-
-    rc, errout = await anyio.to_thread.run_sync(_run)
-    shown = "orchestrator.py " + " ".join(cmd[2:])    # без python и без пути к скрипту
-    if rc == 0:
-        return _txt(f"Готово (rc=0). Запускал: {shown}\n"
-                    "Прогресс и итоговая строка [ГОТОВО] — выше в консоли.")
-    return _txt(f"Оркестратор завершился с ошибкой (rc={rc}). Команда: {shown}\n"
-                f"stderr (хвост):\n{(errout.strip() or '(пусто)')[-1200:]}")
-
-
-@tool(
-    "run_full_chain",
-    "ПОЛНАЯ ЦЕПОЧКА (по умолчанию ВСЁ): собрать B2B-лиды по отрасли (RusProfile, выручка выше "
-    "порога) и по КАЖДОЙ компании сделать 3 файла — карту бизнес-процессов + карту ролей и "
-    "контактов (.docx) + one-pager Telepatt (.pdf) — в папки Яндекс Диска. Боевой "
-    "режим дорог (~$1–2 за компанию: ресёрч; one-pager считает провайдер Kimi отдельно). "
-    "Chrome при сборе скрыт. "
-    "Доступные отрасли: " + ", ".join(VALID),
-    {
-        "industries": str,    # отрасли через запятую (или пусто, если задан leads_json)
-        "leads_json": str,    # путь к готовому JSON -> ТОЛЬКО ресёрч ("" = собрать заново)
-        # ЕДИНСТВЕННАЯ мера объёма: сколько компаний НА КАЖДУЮ отрасль (итог = N × число отраслей).
-        # Режима «N всего по всем отраслям» у обёртки нет. Значение — лишь ПРЕДЛОЖЕНИЕ:
-        # перед запуском оно выносится пользователю в меню (can_use_tool) и может быть заменено.
-        "count_per_industry": int,  # «по 10 на отрасль» -> 10; не задано -> 200 (вся отрасль)
-        "min_revenue": float, # порог выручки в рублях (по умолч. 1e9 = 1 млрд)
-        "region": str,        # регион названием/аббревиатурой ("" = вся РФ); "НЕ <регион>" = исключить (напр. "НЕ Москва")
-        "model": str,         # opus (качество) | sonnet (дешевле)
-        "show_browser": bool, # True = показать окно Chrome (по умолч. скрыт/headless)
-        "dry_run": bool,      # True = без LLM и без трат (только заготовки)
-        "no_upload": bool,    # True = не грузить результат на Яндекс Диск
-        "no_presentation": bool,  # True = НЕ делать one-pager .pdf (по умолчанию ДЕЛАЕТСЯ)
-        "workers": int,       # параллелизм ресёрча (по умолч. 2; при нехватке RAM авто-снижается до 1)
-    },
-)
-async def run_full_chain(args):
-    return await _do_full_chain(args)
-
-
-# In-process MCP-сервер из нашего инструмента (без отдельного процесса)
-server = create_sdk_mcp_server(name="orchestrator", version="1.0.0",
-                               tools=[run_full_chain])
-
-
-# ===========================================================================
-# ГЕЙТ ОБЪЁМА (can_use_tool) — SDK-аналог AskUserQuestion.
-#   Колбэк перехватывает вызов run_full_chain ДО запуска и возвращает либо
-#   PermissionResultAllow(updated_input=...) с ПЕРЕПИСАННЫМИ аргументами, либо
-#   PermissionResultDeny. Молчаливая подмена объёма становится невозможной:
-#   что бы модель ни предложила, «N на отрасль» подтверждает человек.
-#   Требует streaming-режим — ClaudeSDKClient.connect(None) его и даёт.
-# ===========================================================================
-def _box(title, lines, pad=1):
-    """Рамка с заголовком. Кириллица моноширинная -> len() = ширина."""
-    w = max([len(title) + 4] + [len(s) + pad * 2 for s in lines])
-    out = ["┌" + ("─ " + title + " ").ljust(w, "─") + "┐"]
-    out += ["│" + (" " * pad + s).ljust(w) + "│" for s in lines]
-    out.append("└" + "─" * w + "┘")
+def _box(title: str, lines: list[str], pad: int = 1) -> str:
+    width = max([len(title) + 4] + [len(line) + pad * 2 for line in lines])
+    out = ["┌" + ("─ " + title + " ").ljust(width, "─") + "┐"]
+    out += ["│" + (" " * pad + line).ljust(width) + "│" for line in lines]
+    out.append("└" + "─" * width + "┘")
     return "\n".join(out)
 
 
-def _volume_lines(inds, choices, proposed, dry_run):
-    lines = [f"Отрасли: {', '.join(inds)}",
-             "Режим:   N на КАЖДУЮ отрасль", ""]
-    for i, n in enumerate(choices, 1):
-        total = n * len(inds)
-        cost = "бесплатно (dry-run)" if dry_run else f"~${total * USD_PER_COMPANY}"
-        mark = "  ←" if n == proposed else ""
-        lines.append(f"{i}) {n:>3} на отрасль = {total:>4} комп., {cost}{mark}")
-    lines += ["и) изменить отрасли", "0) отмена"]
-    return lines
+async def _confirm_volume(plan: dict) -> dict | None:
+    industries = parse_industries(plan.get("industries"))
+    if not industries:
+        return plan
+    proposed = per_industry(plan)
+    if not sys.stdin.isatty():
+        print(f"[объём] неинтерактивно: {proposed} на отрасль")
+        plan["count_per_industry"] = proposed
+        return plan
 
-
-async def _confirm_total(inds, n, dry_run):
-    """Страховка на дорогую сторону: цифры 1..3 — это НОМЕРА пунктов, и опечатка «3»
-    вместо «3 компании» даёт 200 на отрасль. Крупный боевой прогон переспрашиваем."""
-    total = n * len(inds)
-    if dry_run or total <= BIG_RUN_COMPANIES:
-        return True
-    try:
-        raw = await anyio.to_thread.run_sync(
-            input, f"Боевой прогон: {total} компаний, ~${total * USD_PER_COMPANY}. Продолжить? [y/N]: ")
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return raw.strip().lower() in ("y", "yes", "д", "да")
-
-
-async def _ask_volume(inds, proposed, dry_run):
-    """Меню в консоли. -> (отрасли, N на отрасль) либо None, если пользователь отменил.
-    input() блокирующий -> уводим в поток, чтобы не вешать событийный цикл."""
     while True:
         choices = sorted(set(COUNT_CHOICES) | {proposed})
-        print("\n" + _box("Подтверди объём", _volume_lines(inds, choices, proposed, dry_run)))
+        lines = [f"Отрасли: {', '.join(industries)}", "Режим: N на КАЖДУЮ отрасль", ""]
+        for index, number in enumerate(choices, 1):
+            total = number * len(industries)
+            mark = "  ←" if number == proposed else ""
+            mode = "dry-run" if plan.get("dry_run") else "боевой Kimi-прогон"
+            lines.append(f"{index}) {number:>3} на отрасль = {total:>4} комп., {mode}{mark}")
+        lines += ["0) отмена"]
+        print("\n" + _box("Подтверди объём", lines))
         default = choices.index(proposed) + 1
         try:
-            raw = (await anyio.to_thread.run_sync(input, f"Выбор [{default}]: ")).strip().lower()
+            answer = (await asyncio.to_thread(input, f"Выбор [{default}]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return None
-        if raw in ("0", "отмена", "n", "нет"):
+        if answer in ("0", "отмена", "n", "нет"):
             return None
-        if raw in ("и", "i", "отрасли"):
+        if not answer:
+            chosen = proposed
+        elif answer.isdigit() and 1 <= int(answer) <= len(choices):
+            chosen = choices[int(answer) - 1]
+        elif answer.isdigit():
+            chosen = max(1, int(answer))
+        else:
+            print("Не понял выбор.")
+            continue
+        total = chosen * len(industries)
+        if not plan.get("dry_run") and total > BIG_RUN_COMPANIES:
             try:
-                got = await anyio.to_thread.run_sync(
-                    input, f"Отрасли через запятую ({', '.join(VALID)}): ")
+                confirm = (await asyncio.to_thread(
+                    input, f"Боевой Kimi-прогон: {total} компаний. Продолжить? [y/N]: ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return None
-            new_inds = parse_industries(got)
-            if new_inds:
-                inds = new_inds
-            else:
-                print("  не распознал ни одной отрасли — оставляю прежние")
-            continue
-
-        if not raw:                                        # Enter — предложение модели
-            chosen = proposed
-        elif raw.isdigit() and 1 <= int(raw) <= len(choices):
-            chosen = choices[int(raw) - 1]                 # номер пункта меню
-        elif raw.isdigit() and int(raw) > len(choices):    # своё число: «50»
-            chosen = int(raw)
-        else:
-            print(f"  не понял — введи номер пункта (1–{len(choices)}), "
-                  f"своё число больше {len(choices)}, «и» или 0")
-            continue
-
-        if await _confirm_total(inds, chosen, dry_run):
-            return inds, chosen
-        print("  отменил — выбери объём заново")
+            if confirm not in ("y", "yes", "д", "да"):
+                continue
+        plan["count_per_industry"] = chosen
+        print(f"[объём] {chosen} × {len(industries)} = {total} компаний")
+        return plan
 
 
-async def _volume_gate(tool_name, input_data, ctx):
-    """can_use_tool: объём подтверждает пользователь, а не модель."""
-    if tool_name != TOOL_NAME:
-        return PermissionResultAllow()
-    args = dict(input_data)
-    inds = parse_industries(args.get("industries"))
-    if not inds:
-        return PermissionResultAllow()   # только ресёрч по leads_json (объёма нет) либо ошибка в _build_cmd
-    proposed = per_industry(args)
-    if not sys.stdin.isatty():           # неинтерактивный запуск: не на чем спрашивать
-        print(f"[объём] не интерактивно — беру {proposed} на отрасль без подтверждения")
-        return PermissionResultAllow()
-    decision = await _ask_volume(inds, proposed, bool(args.get("dry_run")))
-    if decision is None:
-        return PermissionResultDeny(message="Пользователь отменил запуск.", interrupt=True)
-    inds, n = decision
-    args["industries"] = ",".join(inds)
-    args["count_per_industry"] = n
-    print(f"[объём] {n} на отрасль × {len(inds)} отрасл. = {n * len(inds)} компаний")
-    return PermissionResultAllow(updated_input=args)
+async def _execute(plan: dict) -> int:
+    confirmed = await _confirm_volume(dict(plan))
+    if confirmed is None:
+        print("Запуск отменён.")
+        return 2
+    cmd, error = _build_cmd(confirmed)
+    if cmd is None:
+        print(error)
+        return 2
+    try:
+        env = KC.child_env(require_key=not bool(confirmed.get("dry_run")))
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        return 5
+    shown = "orchestrator.py " + subprocess.list2cmdline(cmd[2:])
+    print(f"[controller] Kimi {KC.model_name()} -> {shown}")
+
+    def run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", env=env)
+
+    result = await asyncio.to_thread(run)
+    if result.returncode:
+        print(f"Оркестратор завершился с ошибкой rc={result.returncode}.\n"
+              f"{(result.stderr or '').strip()[-1500:]}")
+    return result.returncode
 
 
-SYSTEM_PROMPT = (
-    "Ты — оператор полной цепочки лидогенерации. Инструмент run_full_chain делает ВСЁ за один "
-    "вызов: собирает компании по отрасли (RusProfile, выручка выше порога) и по КАЖДОЙ компании "
-    "готовит 3 файла — карту бизнес-процессов + карту ролей и контактов (.docx) + "
-    "one-pager Telepatt (.pdf) — в папки Яндекс Диска. Все три файла делаются ПО УМОЛЧАНИЮ.\n"
-    "Подбери ОДИН ключ-отрасль (или несколько через запятую) под запрос из списка "
-    "«ключ — название»: " + INDUSTRY_HINT + ". Достаточно, чтобы пользователь назвал ТОЛЬКО отрасль. "
-    "Регион, если назван, передавай в параметр region КАК ЕСТЬ — названием/аббревиатурой "
-    "('ХМАО', 'Югра', 'Татарстан'), НЕ кодом. Если регион нужно ИСКЛЮЧИТЬ — передавай с приставкой "
-    "'НЕ' ('НЕ Москва' = вся РФ кроме Москвы); можно смешивать через запятую ('Урал, НЕ Москва').\n"
-    "ОБЪЁМ: единственная мера — count_per_industry, лидов НА КАЖДУЮ отрасль (итог = N × число "
-    "отраслей). Режима «N всего по всем отраслям» у инструмента НЕТ. «по 10 на отрасль» => 10; "
-    "«30 лидов по трём отраслям» => 10; число не названо — поле не задавай (возьмётся вся отрасль). "
-    "Твоё значение — лишь ПРЕДЛОЖЕНИЕ: перед запуском объём и отрасли подтверждает пользователь "
-    "в меню. Не спрашивай число текстом и не считай арифметику в чате — это делает меню.\n"
-    "ДЕНЬГИ: боевой прогон ~$3–4.5 за компанию (ресёрч + презентация на opus), 200 компаний ≈ ~$800 и "
-    "несколько часов. Подтверждение объёма и стоимости берёт на себя меню — НЕ спрашивай «да?» в чате "
-    "и не жди ответа, просто вызывай инструмент. Если пользователь отменит в меню, вызов вернёт отказ: "
-    "сообщи об этом и НЕ повторяй вызов. dry_run=true — бесплатная проверка связки.\n"
-    "One-pager (.pdf) делаем ПО УМОЛЧАНИЮ; ставь no_presentation=true только если пользователь "
-    "явно просит без презентации.\n"
-    "Chrome при сборе по умолчанию СКРЫТ. show_browser=true — только если просят видеть браузер.\n"
-    "ПАРАЛЛЕЛИЗМ: workers держи низким (1–2) — каждый ресёрч/презентация поднимает claude CLI + "
-    "LibreOffice (сотни МБ); при нехватке RAM падает 0xC0000409, оркестратор сам снизит до 1. НЕ "
-    "поднимай workers без явной просьбы.\n"
-    "Если пользователь дал путь к готовому JSON лидов — клади его в leads_json (тогда сбор "
-    "пропускается, только ресёрч+презентация). После завершения коротко отчитайся по результату."
-)
+def _selftest() -> int:
+    plan = _normalise_plan({
+        "action": "run", "industries": ["mining"], "count_per_industry": 10,
+        "dry_run": True, "workers": 9,
+    })
+    cmd, error = _build_cmd(plan)
+    assert error is None and cmd is not None
+    assert cmd[cmd.index("--model") + 1] == "kimi"
+    assert cmd[cmd.index("--workers") + 1] == "2"
+    assert os.path.basename(cmd[1]).lower() == "orchestrator.py"
+    assert KC.model_name().startswith("kimi-k2.7")
+    source = open(__file__, encoding="utf-8").read()
+    forbidden = "claude" + "_agent_sdk"
+    assert f"from {forbidden}" not in source
+    assert f"\nimport {forbidden}" not in source
+    print(f"selftest passed: NL controller -> Kimi-only {KC.model_name()}")
+    return 0
 
 
-async def _ask(client, prompt):
-    """Отправить запрос и напечатать ответ агента человекочитаемо."""
-    await client.query(prompt)
-    async for msg in client.receive_response():
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    print(block.text)
-                elif isinstance(block, ToolUseBlock):
-                    print(f"  → запускаю {getattr(block, 'name', 'инструмент')} …")
-
-
-async def main():
-    options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
-        mcp_servers={"orchestrator": server},
-        allowed_tools=[TOOL_NAME],
-        # объём (отрасли + N на отрасль) утверждает пользователь, а не модель
-        can_use_tool=_volume_gate,
-    )
-    # запрос из аргументов: py orchestrator_agent.py "собери 10 по майнингу, dry-run"
+async def main() -> int:
+    if sys.argv[1:] == ["--selftest"]:
+        return _selftest()
+    KC.ensure_env(require_key=True)
     cli_prompt = " ".join(sys.argv[1:]).strip()
-    async with ClaudeSDKClient(options=options) as client:
-        if cli_prompt:                               # одноразовый режим
-            await _ask(client, cli_prompt)
-            return
-        # интерактивный режим: несколько запросов в одной сессии (контекст копится)
-        print("Оркестратор-агент (сбор + ресёрч → Яндекс Диск). "
-              "Chrome при сборе скрыт. Пустая строка или 'exit' — выход.")
-        while True:
-            try:
-                prompt = input("\n> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not prompt or prompt.lower() in ("exit", "quit", "выход"):
-                break
-            await _ask(client, prompt)
+    if cli_prompt:
+        print(f"[controller] разбираю запрос на {KC.model_name()} ...")
+        plan, _ = await _kimi_plan(cli_prompt)
+        if plan["action"] == "clarify":
+            print(plan["message"])
+            return 2
+        return await _execute(plan)
+
+    print(f"Kimi Lead Orchestrator ({KC.model_name()}). Пустая строка или 'exit' — выход.")
+    history: list[dict] = []
+    while True:
+        try:
+            prompt = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not prompt or prompt.lower() in ("exit", "quit", "выход"):
+            break
+        try:
+            plan, raw = await _kimi_plan(prompt, history)
+        except Exception as exc:
+            print(f"Kimi controller недоступен: {exc}")
+            continue
+        history += [{"role": "user", "content": prompt},
+                    {"role": "assistant", "content": raw}]
+        if plan["action"] == "clarify":
+            print(plan["message"])
+            continue
+        rc = await _execute(plan)
+        history.clear()
+        print("Готово." if rc == 0 else f"Завершено с кодом {rc}.")
+    return 0
 
 
 if __name__ == "__main__":
-    anyio.run(main)
+    raise SystemExit(asyncio.run(main()))

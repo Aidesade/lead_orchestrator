@@ -114,6 +114,8 @@ def deliverables_subdir(lead):
     """Ключ компании в ЛОКАЛЬНОМ хранилище деливераблов (ORQ_DATA_ROOT/deliverables/<ключ>/).
     ЕДИНЫЙ источник для пайплайна (orchestrator) и веба (web/api/leads): карточка ищет по ИНН,
     поэтому ключ = ИНН; фолбэк — безопасное имя. Не менять без синхронной правки веба."""
+    if (os.environ.get("ORQ_DELIVERABLE_KEY") or "").strip().lower() == "name":
+        return _safe(lead.get("name"))
     inn = str(lead.get("_inn") or "").strip()
     return inn or _safe(lead.get("name"))
 
