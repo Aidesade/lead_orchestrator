@@ -85,8 +85,10 @@ def test_enrichment_is_cached_and_given_to_both_documents() -> None:
     orchestrator = _text(ROOT / "orchestrator.py")
     assert "enrichment_{key}.json" in orchestrator
     assert "checkpoint=enrichment_path, checkpoint_ttl_h=ttl_h" in orchestrator
-    assert 'findings["process"] = (findings.get("process") or "") + process_block' in orchestrator
-    assert 'findings["roles"] = (findings.get("roles") or "") + roles_block' in orchestrator
+    assert 'findings["process"] = (findings.get("process") or "") + (' in orchestrator
+    assert 'findings["roles"] = (findings.get("roles") or "") + (' in orchestrator
+    assert "ДОПОЛНИТЕЛЬНОЕ ДОСЬЕ: OFFICIAL + CORPORATE CONTOUR" in orchestrator
+    assert "JSON-ДОСЬЕ RESEARCH-СУБАГЕНТОВ" in orchestrator
     assert "enrichment=enrichment" in orchestrator
 
 

@@ -274,27 +274,29 @@ async def _research_one_kimi(lead, idx, d_tmp, s_tmp, model, person_enrich=True)
         "process": findings.get("process", ""),
         "roles": findings.get("roles", ""),
     }
-    enrichment = await WK.run_research_subagents(
-        lead, idx, seed, os.path.dirname(d_tmp), model,
-        checkpoint=enrichment_path, checkpoint_ttl_h=ttl_h)
+    # Обогащение НЕ должно ронять компанию: даже если граф ролей упал целиком, писатель обязан
+    # запуститься по находкам движка + person_enrich (гард на пустые .docx остаётся в process()).
+    try:
+        enrichment = await WK.run_research_subagents(
+            lead, idx, seed, os.path.dirname(d_tmp), model,
+            checkpoint=enrichment_path, checkpoint_ttl_h=ttl_h)
+    except Exception as exc:                       # noqa: BLE001 — краш/таймаут подпроцесса ролей
+        print(f"    [{idx}] research-субагенты недоступны ({str(exc)[:160]}); "
+              f"писатель работает по находкам движка")
+        enrichment = {"schema_version": None, "complete": False, "roles": {}, "roles_failed": {}}
 
-    process_dossier = {
-        "schema_version": enrichment.get("schema_version"),
-        "roles": {
-            key: enrichment["roles"][key]
-            for key in ("official_sources", "corporate_contour")
-        },
-    }
-    process_block = (
-        "\n\n=== ДОПОЛНИТЕЛЬНОЕ ДОСЬЕ: OFFICIAL + CORPORATE CONTOUR ===\n"
-        + json.dumps(process_dossier, ensure_ascii=False, indent=2)
-    )
-    roles_block = (
-        "\n\n=== JSON-ДОСЬЕ ПЯТИ RESEARCH-СУБАГЕНТОВ ===\n"
-        + json.dumps(enrichment, ensure_ascii=False, indent=2)
-    )
-    findings["process"] = (findings.get("process") or "") + process_block
-    findings["roles"] = (findings.get("roles") or "") + roles_block
+    roles_present = enrichment.get("roles") or {}
+    process_roles = {key: roles_present[key]
+                     for key in ("official_sources", "corporate_contour") if key in roles_present}
+    if process_roles:
+        process_dossier = {"schema_version": enrichment.get("schema_version"), "roles": process_roles}
+        findings["process"] = (findings.get("process") or "") + (
+            "\n\n=== ДОПОЛНИТЕЛЬНОЕ ДОСЬЕ: OFFICIAL + CORPORATE CONTOUR ===\n"
+            + json.dumps(process_dossier, ensure_ascii=False, indent=2))
+    if roles_present:
+        findings["roles"] = (findings.get("roles") or "") + (
+            "\n\n=== JSON-ДОСЬЕ RESEARCH-СУБАГЕНТОВ ===\n"
+            + json.dumps(enrichment, ensure_ascii=False, indent=2))
     cost = await WK.write_two_docx(
         lead, idx, findings.get("process", ""), findings.get("roles", ""),
         d_tmp, s_tmp, model, enrichment=enrichment)

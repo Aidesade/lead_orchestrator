@@ -155,6 +155,23 @@ class FakePrompt:
         self.events.append(("finish", role))
 
 
+class FailingPrompt(FakePrompt):
+    """Как FakePrompt, но заданная роль всегда падает — для проверки мягкой деградации графа."""
+
+    def __init__(self, fixtures, fail_role):
+        super().__init__(fixtures)
+        self.fail_role = fail_role
+
+    async def __call__(self, user_input, **kwargs):
+        role = pathlib.Path(kwargs["agent_file"]).stem
+        if role == self.fail_role:
+            self.started.append(role)
+            raise RuntimeError(f"смоделированный сбой роли {role}")
+            yield  # pragma: no cover — оператор yield делает функцию async-генератором
+        async for message in super().__call__(user_input, **kwargs):
+            yield message
+
+
 def test_dependency_graph_and_cache():
     fixtures = _fixtures()
     with tempfile.TemporaryDirectory(prefix="enrichment_test_") as temp:
@@ -488,8 +505,42 @@ def test_docx_adapter():
         assert "director@company.test" in xml
 
 
+def test_partial_degradation():
+    """Мягкая деградация: падение роли даёт частичное досье (complete=False), а не исключение."""
+    fixtures = _fixtures()
+
+    def _request(checkpoint):
+        return {
+            "lead": {"name": "АО Тест", "_inn": "1234567890", "_ogrn": "123",
+                     "website": "https://company.test", "contact_person": "Иванов Иван Иванович"},
+            "company": "АО Тест", "inn": "1234567890", "model": "test-model",
+            "seed": {"process": "PROCESS_SEED", "roles": "Петров Пётр Петрович"},
+            "checkpoint": str(checkpoint), "checkpoint_ttl_h": 72,
+        }
+
+    # 1) Падает лист графа (candidate_contacts): остальные 4 роли сохраняются, run() НЕ бросает.
+    with tempfile.TemporaryDirectory(prefix="enrichment_degrade1_") as temp:
+        checkpoint = pathlib.Path(temp) / "checkpoint.json"
+        result = asyncio.run(R.run(_request(checkpoint),
+                                   prompt_fn=FailingPrompt(fixtures, "candidate_contacts")))
+        assert result["complete"] is False
+        assert set(result["roles_failed"]) == {"candidate_contacts"}
+        assert set(result["roles"]) == set(R.ROLE_ORDER) - {"candidate_contacts"}
+        assert checkpoint.is_file(), "частичный чекпойнт должен быть записан"
+
+    # 2) Падает корень (official_sources): всё downstream помечается пропущенным, но run() НЕ бросает.
+    with tempfile.TemporaryDirectory(prefix="enrichment_degrade2_") as temp:
+        checkpoint = pathlib.Path(temp) / "checkpoint.json"
+        result = asyncio.run(R.run(_request(checkpoint),
+                                   prompt_fn=FailingPrompt(fixtures, "official_sources")))
+        assert result["complete"] is False
+        assert result["roles"] == {}
+        assert set(result["roles_failed"]) == set(R.ROLE_ORDER)
+
+
 def main():
-    tests = (test_dependency_graph_and_cache, test_contract_guards, test_docx_adapter)
+    tests = (test_dependency_graph_and_cache, test_contract_guards, test_docx_adapter,
+             test_partial_degradation)
     for test in tests:
         test()
         print(f"PASS {test.__name__}")

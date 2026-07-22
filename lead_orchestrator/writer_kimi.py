@@ -268,18 +268,33 @@ async def _run_research_subagents_unlocked(lead: dict, idx: int, seed,
         for line in out.splitlines():
             if "[research-subagent]" in line:
                 print(f"    [{idx}] {line}")
-        if proc.returncode or not result.is_file():
-            tail = (err or out or "нет вывода")[-1500:]
-            raise RuntimeError(
-                f"research-субагенты упали (code={proc.returncode}): {tail}")
-        data = json.loads(result.read_text(encoding="utf-8"))
+        data = None
+        if result.is_file():
+            try:
+                data = json.loads(result.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+        # Досье пригодно ДАЖЕ частичным (мягкая деградация ролей): писателю нужен хоть какой-то
+        # структурированный контекст, а недостающие роли он доберёт из находок движка. Раньше тут
+        # требовались result.json + complete=True + все 5 ролей, и любой сбой ронял писателя.
+        if (not isinstance(data, dict)
+                or data.get("schema_version") != RESEARCH_SUBAGENTS_SCHEMA_VERSION
+                or not isinstance(data.get("roles"), dict)):
+            # Пригодного JSON-досье нет — поднимаем НАСТОЯЩУЮ причину. Субагент печатает её в
+            # stdout ("[research-subagent] ошибка: ..."), а НЕ в stderr, где висит шум
+            # authlib.jose DeprecationWarning (раньше в лог попадал именно он, а не причина).
+            err_lines = [ln.strip() for ln in out.splitlines()
+                         if "[research-subagent] ошибка" in ln or "ContractError" in ln]
+            reason = " | ".join(err_lines) or (err or out or "нет вывода")[-800:]
+            raise RuntimeError(f"research-субагенты упали (code={proc.returncode}): {reason}")
         required = {"official_sources", "corporate_contour", "secondary_sources",
                     "role_candidates", "candidate_contacts"}
-        if (data.get("schema_version") != RESEARCH_SUBAGENTS_SCHEMA_VERSION
-                or data.get("complete") is not True
-                or not isinstance(data.get("roles"), dict)
-                or not required <= set(data["roles"])):
-            raise RuntimeError("research-субагенты вернули некорректное JSON-досье")
+        missing = sorted(required - set(data.get("roles") or {}))
+        if missing or data.get("complete") is not True:
+            failed = data.get("roles_failed") or {}
+            print(f"    [{idx}] research-субагенты: частичное досье "
+                  f"(нет ролей: {', '.join(missing) or '—'}; "
+                  f"провалено: {', '.join(sorted(failed)) or '—'}) — пишем из того, что есть")
         return data
 
 

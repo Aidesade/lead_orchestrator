@@ -26,8 +26,15 @@ import os
 import pathlib
 import re
 import sys
+import warnings
 from datetime import date, datetime, timezone
 from urllib.parse import urlsplit
+
+# fastmcp тянет authlib.jose, который на каждый импорт шлёт AuthlibDeprecationWarning в stderr
+# (сам authlib форсит simplefilter("always")). Это НЕ фатально, но раньше шум забивал хвост
+# stderr и маскировал настоящую причину падения в родительском сообщении. Настоящая причина
+# теперь берётся из stdout (см. writer_kimi.run_research_subagents); здесь глушим по мере сил.
+warnings.filterwarnings("ignore", message=r".*authlib\.jose.*")
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -449,6 +456,12 @@ def _linked_hosts(text: str) -> set[str]:
     return {host for value in values if (host := _host(value.rstrip(".,;:")))}
 
 
+def _email_domain(value: str) -> str:
+    """Домен рабочей почты лида из Фазы 1 (kgmk@kolagmk.ru -> kolagmk.ru); '' если адреса нет."""
+    first = str(value or "").split(",")[0].strip()
+    return first.split("@", 1)[1].strip() if "@" in first else ""
+
+
 def _trusted_official_hosts(result: dict, request: dict, trace: dict) -> set[str]:
     """Подтвердить заявленные домены цепочкой от известного официального источника.
 
@@ -459,10 +472,16 @@ def _trusted_official_hosts(result: dict, request: dict, trace: dict) -> set[str
     """
     declared = {_host(value) for value in (result.get("official_domains") or [])}
     declared.discard("")
-    website = _host((request.get("lead") or {}).get("website") or "")
-    trusted = set()
-    if website and not _is_non_official_host(website):
-        trusted.add(website)
+    lead = request.get("lead") or {}
+    # Корни доверия из ДЕТЕРМИНИРОВАННЫХ данных Фазы 1: сайт лида И домен его рабочей почты
+    # (kgmk@kolagmk.ru -> kolagmk.ru). Их подтвердил сбор, а не LLM, поэтому валидатор не должен
+    # требовать от модели заново доказывать уже известный домен ссылкой с доверенной страницы.
+    lead_roots = set()
+    for raw in (lead.get("website"), _email_domain(lead.get("email"))):
+        host = _host(raw or "")
+        if host and not _is_non_official_host(host):
+            lead_roots.add(host)
+    trusted = set(lead_roots)
     trusted.update(host for host in declared if _host_has_marker(host, KNOWN_OFFICIAL_HOST_MARKERS))
 
     pages = trace.get("opened_pages") or []
@@ -495,8 +514,8 @@ def _trusted_official_hosts(result: dict, request: dict, trace: dict) -> set[str
         ), "")
         if _host_has_marker(candidate, KNOWN_OFFICIAL_HOST_MARKERS):
             basis, linked_from = "known_official_policy", ""
-        elif website and _host_in(candidate, {website}):
-            basis, linked_from = "lead_website", ""
+        elif _host_in(candidate, lead_roots):
+            basis, linked_from = "lead_registered_domain", ""
         else:
             basis, linked_from = "linked_from_trusted_page", link_proofs.get(candidate, "")
         proofs.append({
@@ -1272,7 +1291,7 @@ def _latest_observed_at(completed: dict, fallback: str) -> str:
 
 def _snapshot(request: dict, completed: dict, role_hashes: dict, role_traces: dict, *,
               input_hash: str, prompt_hash: str, complete: bool,
-              checkpoint_created_at: str) -> dict:
+              checkpoint_created_at: str, failed_roles: dict | None = None) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
@@ -1293,6 +1312,7 @@ def _snapshot(request: dict, completed: dict, role_hashes: dict, role_traces: di
         "evidence_traces": {
             role: role_traces[role] for role in ROLE_ORDER if role in role_traces},
         "roles": {role: completed[role] for role in ROLE_ORDER if role in completed},
+        "roles_failed": dict(failed_roles or {}),
     }
 
 
@@ -1404,8 +1424,22 @@ async def run(request: dict, *, prompt_fn=None) -> dict:
             print(f"[research-subagent] checkpoint: {role}", flush=True)
 
     changed = False
+    # Мягкая деградация (2026-07-22): падение роли НЕ роняет всю компанию. Упавшая роль и роли,
+    # чьи зависимости не выполнены, помечаются в failed_roles; наружу уходит частичное досье
+    # (complete=False), а писатель добирает недостающее из находок движка. Раньше любая ошибка
+    # роли бросала RuntimeError → exit 1 → writer вообще не запускался (orchestrator._research_one_kimi).
+    failed_roles: dict[str, str] = {}
     for wave in EXECUTION_WAVES:
-        pending = [role for role in wave if role not in completed]
+        pending = []
+        for role in wave:
+            if role in completed:
+                continue
+            missing = [dep for dep in ROLE_DEPENDENCIES[role] if dep not in completed]
+            if missing:
+                failed_roles.setdefault(
+                    role, "пропущена: не выполнены зависимости " + ", ".join(missing))
+                continue
+            pending.append(role)
         if not pending:
             continue
         baseline = dict(completed)
@@ -1420,11 +1454,10 @@ async def run(request: dict, *, prompt_fn=None) -> dict:
                 return role, None, None, exc
 
         tasks = [asyncio.create_task(execute(role), name=f"research-{role}") for role in pending]
-        failures: list[tuple[str, Exception]] = []
         for finished in asyncio.as_completed(tasks):
             role, result, evidence_trace, error = await finished
             if error is not None:
-                failures.append((role, error))
+                failed_roles[role] = str(error)[:300]
                 print(f"[research-subagent] ошибка: {role}: {str(error)[:200]}", flush=True)
                 continue
             assert result is not None
@@ -1438,20 +1471,20 @@ async def run(request: dict, *, prompt_fn=None) -> dict:
                 _snapshot(
                     request, completed, role_hashes, role_traces, input_hash=input_hash,
                     prompt_hash=prompt_hash, complete=len(completed) == len(ROLE_ORDER),
-                    checkpoint_created_at=checkpoint_created_at,
+                    checkpoint_created_at=checkpoint_created_at, failed_roles=failed_roles,
                 ),
             )
-        if failures:
-            details = "; ".join(f"{role}: {str(error)[:160]}" for role, error in failures)
-            raise RuntimeError("не завершены research-субагенты: " + details)
 
     result = _snapshot(
         request, completed, role_hashes, role_traces, input_hash=input_hash,
-        prompt_hash=prompt_hash, complete=True,
-        checkpoint_created_at=checkpoint_created_at,
+        prompt_hash=prompt_hash, complete=len(completed) == len(ROLE_ORDER),
+        checkpoint_created_at=checkpoint_created_at, failed_roles=failed_roles,
     )
-    if changed:
+    if changed or failed_roles:
         _write_checkpoint(checkpoint, result)
+    if failed_roles:
+        print("[research-subagent] частичное досье: не выполнены "
+              + ", ".join(sorted(failed_roles)), flush=True)
     return result
 
 
