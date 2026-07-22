@@ -26,9 +26,10 @@ ENV PYTHONUNBUFFERED=1 \
 # дипресёрча и рендерит PDF стадия one-pager. Headless-браузеру виртуальный экран не нужен,
 # поэтому xvfb-run убран и из ENTRYPOINT.
 #
-# ⚠️ СЛЕДСТВИЕ: source_rusprofile в КОНТЕЙНЕРЕ НЕРАБОТОСПОСОБЕН (нет бинаря Chrome). Пакет
-# undetected-chromedriver в requirements оставлен намеренно — он импортируется и без браузера,
-# и локальный RusProfile-путь на Windows продолжает работать. В Docker источник — OfData.
+# ⚠️ СЛЕДСТВИЕ: контейнерный дефолт остаётся OfData: в контейнер не передаётся cookie
+# платного RusProfile, а headed/offscreen anti-bot режим там не поддерживается. Новый
+# Playwright-модуль компилируется и тестируется в образе, но RusProfile — desktop-дефолт.
+# undetected-chromedriver оставлен только для явного локального rollback.
 #
 # Шрифты нужны chromium'у: без них кириллица в PDF one-pager рендерится квадратами.
 RUN apt-get update \
@@ -78,6 +79,8 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator/orchestrator_agent.py \
        lead_orchestrator/project_env.py \
        lead_orchestrator/source_ofdata.py \
+       lead_orchestrator/source_rusprofile.py \
+       lead_orchestrator/rusprofile_playwright.py \
        lead_orchestrator/writer_kimi.py \
        lead_orchestrator/kimi_research_cli.py \
        lead_orchestrator/rusprofile_session.py \
@@ -90,6 +93,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator_kimi/html_to_pdf.py \
     && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
     && python lead_orchestrator/test_source_ofdata.py \
+    && python lead_orchestrator/test_rusprofile_playwright.py \
     && python lead_orchestrator/test_kimi_only.py \
     && python lead_orchestrator/test_kimi_agent_freedom.py \
     && python lead_orchestrator/test_research_enrichment.py \

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 import undetected_chromedriver as uc
 
@@ -35,13 +36,22 @@ try:
 except Exception:
     pass
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_COOKIES_FILE = PROJECT_ROOT / "env" / "rusprofile_cookies.json"
+LEGACY_COOKIES_FILE = Path(
+    r"C:\Users\abalb\.claude\skills\lead-finder\.rp_cookies.json")
+
 PROFILE_DIR = os.environ.get(
     "RUSPROFILE_PROFILE_DIR",
     r"C:\Users\abalb\.claude\skills\lead-finder\.rp_profile",
 )
 COOKIES_FILE = os.environ.get(
     "RUSPROFILE_COOKIES_FILE",
-    r"C:\Users\abalb\.claude\skills\lead-finder\.rp_cookies.json",
+    str(
+        PROJECT_COOKIES_FILE
+        if PROJECT_COOKIES_FILE.exists() or not LEGACY_COOKIES_FILE.exists()
+        else LEGACY_COOKIES_FILE
+    ),
 )
 HOME = "https://www.rusprofile.ru/"
 TEST_CARD = "https://www.rusprofile.ru/id/4464622"  # любая карточка для проверки масок
@@ -95,6 +105,7 @@ class RusProfileAuth:
         for c in cookies:
             if not c.get("expiry"):
                 c["expiry"] = far
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         json.dump(cookies, open(path, "w", encoding="utf-8"), ensure_ascii=False)
         log(f"[cookies] сохранено {len(cookies)} cookie -> {path}")
 
@@ -313,57 +324,17 @@ def main():
                     help="использовать Chromium Playwright, если установленный Chrome несовместим с UC")
     a = ap.parse_args()
     if a.urls_file and a.playwright:
-        from playwright.sync_api import sync_playwright
+        from rusprofile_playwright import RusProfilePlaywrightSession
         urls = [x.strip() for x in open(a.urls_file, encoding="utf-8") if x.strip()]
-        cookies = json.load(open(COOKIES_FILE, encoding="utf-8"))
-        normalized = []
-        for c in cookies:
-            item = {"name": c["name"], "value": c.get("value", ""),
-                    "domain": c.get("domain", ".rusprofile.ru"), "path": c.get("path", "/"),
-                    "httpOnly": bool(c.get("httpOnly")), "secure": bool(c.get("secure"))}
-            if c.get("expiry"): item["expires"] = float(c["expiry"])
-            same = str(c.get("sameSite") or "").capitalize()
-            if same in ("Strict", "Lax", "None"): item["sameSite"] = same
-            normalized.append(item)
         rows = []
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
-            context = browser.new_context(viewport={"width": 1320, "height": 950})
-            page = context.new_page()
-            page.goto(HOME, wait_until="domcontentloaded", timeout=45000)
-            context.add_cookies(normalized)
+        with RusProfilePlaywrightSession(headless=False) as session:
             for i, url in enumerate(urls, 1):
                 log(f"[{i:02d}/{len(urls)}] {url}")
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    page.wait_for_timeout(3000)
-                    text = page.locator("body").inner_text()
-                    contact = page.evaluate("() => {" + RusProfileAuth._JS_CONTACTS + "}") or {}
-                    def one(pattern):
-                        m = re.search(pattern, text, re.I)
-                        return m.group(1).strip() if m else ""
-                    title = page.title()
-                    title_inn = re.search(r"\(ИНН\s+(\d{10,12})\)", title, re.I)
-                    heading = page.locator("h1").first.inner_text().strip() if page.locator("h1").count() else ""
-                    manager = re.search(
-                        r"Руководитель\s*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)", text, re.I)
-                    revenue = re.search(
-                        r"Основные показатели[^\r\n]*\r?\n(?:[^\r\n]*\r?\n){0,3}?"
-                        r"Выручка\s*\r?\n\s*([^\r\n]+)", text, re.I)
-                    rows.append({
-                        "name": heading or (title.split(" - ")[0] if title else "").strip(),
-                        "inn": title_inn.group(1) if title_inn else one(r"ИНН\s+(\d{10,12})"),
-                        "revenue": revenue.group(1).strip() if revenue else "",
-                        "manager_role": manager.group(1).strip() if manager else "",
-                        "manager_name": manager.group(2).strip() if manager else "",
-                        "phones": list(dict.fromkeys(contact.get("phones") or [])),
-                        "emails": list(dict.fromkeys(x.lower() for x in (contact.get("emails") or []))),
-                        "website": contact.get("website") or "",
-                    })
+                    rows.append(session.company_by_url(url))
                 except Exception as e:
                     rows.append({"requested_url": url, "error": str(e).splitlines()[0][:300]})
                 json.dump(rows, open(a.out, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-            browser.close()
         log(f"Готово: {len(rows)} карточек -> {a.out}")
         return
     with RusProfileAuth(headless=False) as s:

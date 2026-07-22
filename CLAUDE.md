@@ -27,11 +27,12 @@ dependency-aware enrichment, писатель двух `.docx` и one-pager ра
 
 Полная цепочка в две фазы (детерминированный Python-оркестратор, НЕ LLM-оркестратор):
 
-- **ФАЗА 1 — сбор.** Штатный и кодовый дефолт `LEAD_SOURCE=ofdata`: OfData `/search`
-  выбирает действующие юрлица по основному ОКВЭД и региону, `/finances` даёт строку 2110,
-  затем код применяет строгий нижний порог **выручка ≥ 1 млрд ₽** (переданное меньшее значение
-  автоматически поднимается). Только прошедшие фильтр карточки обогащаются через `/company`.
-  `LEAD_SOURCE=checko` и `LEAD_SOURCE=rusprofile` сохранены как явные пути отката.
+- **ФАЗА 1 — сбор.** Локальный/desktop и кодовый дефолт `LEAD_SOURCE=rusprofile`:
+  Playwright загружает cookie из игнорируемого `env/rusprofile_cookies.json`, внутри страницы
+  вызывает advanced-search по ОКВЭД с серверным `finance_revenue_from`, не ниже
+  **1 млрд ₽**, забирает доступные страницы и явно сортирует их по выручке по убыванию.
+  Только после сортировки открывается ровно по одной карточке для выбранных N компаний.
+  `LEAD_SOURCE=ofdata` и `LEAD_SOURCE=checko` сохранены как явные API-пути отката.
   Дальше → отбор → `D:\лиды\leads_<отрасли>.json`
   (флаг `--out`; .xlsx из боевой ФАЗЫ 1 убран 2026-07-06) → дерево на Яндекс Диске `<--base>/<отрасль>/<категория полноты контактов>/<компания>/`
   (дефолт корня `disk:/Лиды`; категория — по наличию email/телефона/сайта/ЛПР, `category_for`)
@@ -90,8 +91,10 @@ py person_enrich.py "Руденко Сергей Александрович" 623
 # движок deep_research отдельно, БЕСПЛАТНО (regex-only, без LLM):
 DR_USE_LLM=0 py deep_research_engine.py --company "АО Рязаньавтодор" --inn 6234065445 --site https://avtodor-rzn.ru
 py deep_research_engine.py --crawl avtodor-rzn.ru # отладка: только краул сайта (SiteCrawler)
-# разовый логин RusProfile (cookie в .rp_cookies.json):
+# разовый логин RusProfile (cookie в игнорируемом env/rusprofile_cookies.json):
 py rusprofile_session.py --login
+# штатный локальный сбор RusProfile/Playwright:
+py source_rusprofile.py --industries processing --min-revenue 1e9 --per-industry 10 --out leads.json
 # сбор лидов через Checko API (без браузера/антибота; годится для Docker/Linux) -> leads.json:
 py source_checko.py --industries processing --min-revenue 1e9 --region Татарстан --out leads.json
 # штатный сбор через OfData API; на бесплатном тарифе выручка автоматически берётся из ГИР БО:
@@ -131,13 +134,15 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк, PNG не нужен |
 | `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры**. `PROCESS_MAP_SYSTEM` / `ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля не загружает Claude SDK. Старый standalone LLM-agent доступен только при `ORQ_KIMI_ONLY=0`; штатно для одной компании используется one-lead JSON через `orchestrator.py`. В карту ролей детерминированно добавляются таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
 | `writer_kimi.py` | **штатный агентный писатель двух .docx на Kimi K2.7** и parent-мост пяти enrichment-ролей. Сначала отдельный Kimi-процесс выполняет `official → (contour + secondary) → role_candidates → candidate_contacts`; затем на документ запускается `writer_kimi_agent.py` с динамическими scout/critic/verifier. `apply_research_enrichment` машинно переносит критические таблицы в DOCX. URL-инструменты subprocess-мостом зовут `kimi_research_cli.py`; SDK не смешиваются. Legacy HTTP — только `KIMI_WRITER_AGENT=0` |
-| `source_ofdata.py` | **штатный источник Фазы 1 через OfData API**. Переиспользует проверенные `usable_okved`/`resolve_region` и `extract_company_contacts` Checko: `/search` → выручка (`/finances`, а при бесплатном тарифе balance=0 автоматический fallback на ГИР БО ФНС) → обязательный порог ≥1 млрд → `/company` только для прошедших. Ключ только `OFDATA_API_KEY`, POST form-urlencoded (ключ не в URL/логах), ретраи 429/5xx, счётчики запросов/баланса. `OFDATA_REVENUE_SOURCE=auto|ofdata|girbo`; капы: `OFDATA_MAX_CANDIDATES` (3000), `OFDATA_MAX_PAGES_PER_CODE` (50), `OFDATA_CONTACTS_CAP` (0 = все) |
+| `source_ofdata.py` | API-путь отката Фазы 1 (`LEAD_SOURCE=ofdata`). Переиспользует проверенные `usable_okved`/`resolve_region` и `extract_company_contacts` Checko: `/search` → выручка (`/finances`, а при бесплатном тарифе balance=0 автоматический fallback на ГИР БО ФНС) → обязательный порог ≥1 млрд → `/company` только для прошедших. Ключ только `OFDATA_API_KEY`, POST form-urlencoded (ключ не в URL/логах), ретраи 429/5xx, счётчики запросов/баланса. `OFDATA_REVENUE_SOURCE=auto|ofdata|girbo`; капы: `OFDATA_MAX_CANDIDATES` (3000), `OFDATA_MAX_PAGES_PER_CODE` (50), `OFDATA_CONTACTS_CAP` (0 = все) |
 | `test_source_ofdata.py` | полностью офлайн проверяет формы `/finances`, включительный порог ровно 1 млрд, отсев ниже порога/без строки 2110, `/company`, раскрытие короткого ОКВЭД и отсутствие ключа в URL/ошибке |
 | `source_checko.py` | API-путь отката (`LEAD_SOURCE=checko`). Drop-in для `source_rusprofile.harvest()`: `/search`, выручка из ГИР БО, контакты `/company`; ключи `CHECKO_TOKEN` + запасные |
 | `okved2_codes.py` | справочник ОКВЭД-2 (ОК 029-2014): 623 подкласса NN.NN, снимок 2026-07-15 с github.com/carono/okvad2. Нужен `source_checko` и через его helpers — `source_ofdata`; RusProfile им не пользуется |
 | `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect, ответ ограничен `DR_FETCH_MAX_BYTES`. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
-| `source_rusprofile.py` | сбор RusProfile по ОКВЭД (uc, антибот); карта `INDUSTRY` (21 отрасль); строгий фильтр выручки; `parse_region_query` — регион-фильтр с отрицанием («НЕ Москва», списки через запятую) |
-| `rusprofile_session.py` | контакты с платного аккаунта (cookie; `--login`) |
+| `source_rusprofile.py` | **штатный локальный источник Фазы 1**: RusProfile advanced-search по ОКВЭД, серверный порог ≥1 млрд, полный клиентский revenue-sort; карта `INDUSTRY` (21 отрасль); регион-фильтр с отрицанием |
+| `rusprofile_playwright.py` | единая Playwright-context для поиска и ровно одного открытия каждой отобранной карточки; безопасная загрузка cookie без печати значений |
+| `rusprofile_session.py` | создание/обновление cookie платного аккаунта (`--login`); UC оставлен как `RUSPROFILE_BROWSER=uc` rollback |
+| `test_rusprofile_playwright.py` | офлайн-регрессия cookie-нормализации, минимального порога 1 млрд и сортировки по убыванию |
 | `pipeline.py` | отбор `_select` + сохранение `_save`; его СОБСТВЕННАЯ полная цепочка `run()` (RusProfile→ГИР БО→Checko→site_verify) работает только при прямом `py pipeline.py` — оркестратор её не вызывает |
 | `build_excel.py` | выгрузка .xlsx — из боевой ФАЗЫ 1 УБРАНА (2026-07-06, только JSON); используется лишь standalone-цепочкой `pipeline.run()` |
 | `disk_organize.py` | пути/папки на Диске поверх `connectors/yadisk_client` (`_mkdir`/`_upload` с ретраями на 423 и транзиентные сетевые сбои — `_is_locked`/`_is_transient`), заглушки .docx/.pdf (`generate_presentation`, `_make_pdf` — голый PDF без зависимостей; текст транслитерирован, т.к. базовые шрифты PDF кириллицу не несут) |
@@ -352,23 +357,26 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   правь её. Копия-скилл `C:\Users\abalb\.claude\skills\lead-finder\scripts` — **старого поколения**
   (`DOSSIER_SYSTEM`/`save_dossier_docx`, один документ — НЕ текущая пресейл-архитектура из 2 .docx),
   а НЕ «отличается только CRLF/LF». Синхронизируй копию-скилл только осознанно, не автоматически.
-  ⚠️ Cookie и Chrome-профиль платного RusProfile захардкожены В ПАПКЕ КОПИИ-СКИЛЛА
-  (`rusprofile_session.py:38-39` → `~\.claude\skills\lead-finder\.rp_profile` / `.rp_cookies.json`) —
-  снести её = потерять логин RusProfile. `lead_orchestrator/README.md` тоже местами старого
+  Cookie рабочего проекта лежат в исключённом из Git `env/rusprofile_cookies.json`;
+  прежний `~\.claude\skills\lead-finder\.rp_cookies.json` читается только как legacy fallback.
+  Chrome-профиль ручного логина всё ещё хранится в копии-скилле, поэтому удалять её без
+  резервной копии нельзя. `lead_orchestrator/README.md` тоже местами старого
   поколения («досье и стратегия», $1–2/компания), как и внутренние докстринги живого кода (шапки
   `orchestrator_agent.py`/`run_orchestrator.cmd`, «yacli-фолбэк» в `yadisk_client.py`, «2 файла»
   в `disk_organize.py`, yacli в `pipeline.py`) — при расхождениях авторитет этот CLAUDE.md.
 - **Порог выручки строгий:** компании без подтверждённой выручки или ниже порога отсекаются
   (`source_rusprofile.py`, серверный фильтр `finance_revenue_from` + клиентская перепроверка).
+  Порядок ответа API не считается сортировкой: до отбора N читается до 20 доступных страниц,
+  затем применяется явная сортировка `finance_revenue` по убыванию.
   Регион, в отличие от выручки, фильтруется ТОЛЬКО клиентски (серверного фильтра нет).
   Отрицание региона («НЕ Москва») убирает город фед. значения, но НЕ трогает одноимённую
   область («Московская область» остаётся) — см. `region_excluded()`. У ВКЛЮЧАЮЩЕГО фильтра
   асимметрия обратная: `--region "Москва"` захватывает и Московскую область
   (в `region_included()` такой защиты нет).
-- **Сбор RusProfile — headed-Chrome «за экраном» (offscreen)** по умолчанию: настоящий headless
+- **Сбор RusProfile — headed Playwright Chromium «за экраном» (offscreen)** по умолчанию: headless
   может не пройти антибот Cloudflare. `--show-browser` — видимое окно; `--headless` оставлен
   скрытым флагом для совместимости. Offscreen-дефолт и скрытие `--headless` — уровень
-  `orchestrator.py`; прямой запуск `source_rusprofile.py`/`pipeline.py` открывает ВИДИМОЕ окно.
+  `orchestrator.py`; `RUSPROFILE_BROWSER=uc` включает прежний undetected-chromedriver fallback.
 - **⚠️ Яндекс Диск молча врёт об успехе заливки (найдено 2026-07-13).** Наблюдались ДВА режима:
   (1) клиент вернул «✓ Загружено», а файла на Диске нет вовсе (прямой GET → 404);
   (2) при `overwrite=True` рапортует успех, но остаётся СТАРЫЙ файл (прежние размер и md5).

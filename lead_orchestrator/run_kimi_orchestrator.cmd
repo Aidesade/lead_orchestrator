@@ -35,7 +35,9 @@ rem --- Single Kimi runtime. Key: KIMI_API_KEY, fallback GPLLM_API_KEY ---
 if not defined KIMI_API_KEY set "KIMI_API_KEY=%GPLLM_API_KEY%"
 if not defined KIMI_BASE_URL set "KIMI_BASE_URL=https://gpllmkeeper.dtc.tatar/v1"
 if not defined KIMI_MODEL_NAME set "KIMI_MODEL_NAME=kimi-k2.7-code"
-if not defined LEAD_SOURCE set "LEAD_SOURCE=ofdata"
+if not defined LEAD_SOURCE set "LEAD_SOURCE=rusprofile"
+if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
+if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\env\rusprofile_cookies.json"
 set "DR_LLM_PROVIDER=kimi"
 set "ORQ_KIMI_ONLY=1"
 
@@ -51,6 +53,19 @@ if /I "%LEAD_SOURCE%"=="ofdata" (
         echo [ERROR] No OfData key in "%~dp0..\env\.env".
         echo         Add OFDATA_API_KEY there; the env folder is Git-ignored.
         exit /b 8
+    )
+)
+if /I "%LEAD_SOURCE%"=="rusprofile" (
+    if not exist "%RUSPROFILE_COOKIES_FILE%" (
+        echo [ERROR] No RusProfile cookie file at "%RUSPROFILE_COOKIES_FILE%".
+        echo         Run: py rusprofile_session.py --login
+        exit /b 9
+    )
+    "%ORQ_MAIN_PY%" -c "import playwright.sync_api" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Playwright is missing in %ORQ_MAIN_PY%.
+        echo         Install project requirements and Playwright Chromium.
+        exit /b 10
     )
 )
 

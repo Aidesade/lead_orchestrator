@@ -634,8 +634,8 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
     """ФАЗА 1 (первый агент): сбор -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
-    Источник — env LEAD_SOURCE: 'ofdata' (по умолчанию, API), 'checko' (API-откат)
-    либо 'rusprofile' (живой Chrome + платная сессия). Возвращает picked[]."""
+    Источник — env LEAD_SOURCE: 'rusprofile' (по умолчанию, Playwright+cookie),
+    'ofdata' или 'checko' (явные API-пути отката). Возвращает picked[]."""
     import math
     import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
@@ -645,7 +645,7 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("не распознаны отрасли. Доступно: " + ", ".join(sorted(RP.INDUSTRY)))
     per_ind = math.ceil(count / max(1, len(inds)))
 
-    source = (os.environ.get("LEAD_SOURCE") or "ofdata").strip().lower()
+    source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
     if source in ("ofdata", "ofdata_api"):
         return _collect_ofdata(inds, count, min_revenue, region, base, account, json_out, per_ind)
     if source in ("checko", "checko_api", "api"):
@@ -654,40 +654,80 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit(
             f"неизвестный LEAD_SOURCE={source!r}; допустимо: ofdata, checko, rusprofile")
 
-    # --- RusProfile (явный legacy-откат): живой Chrome + платная сессия контактов ---
+    # --- RusProfile: штатная Фаза 1; Playwright search + одна карточка на выбранный лид ---
     import rusprofile_session as RPS
     if not os.path.exists(RPS.COOKIES_FILE):
         raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
-    print(f"[1/2] RusProfile: {inds} | порог >{min_revenue / 1e9:g} млрд"
+    threshold = max(float(min_revenue), float(RP.MIN_REVENUE_FLOOR))
+    browser = (os.environ.get("RUSPROFILE_BROWSER") or "playwright").strip().lower()
+    print(f"[1/2] RusProfile/{browser}: {inds} | порог >={threshold / 1e9:g} млрд"
           + (f" | регион {region}" if region else ""))
     leads = []
-    for attempt in (1, 2):     # антибот/Chrome сбоят — вторая попытка с чистой сессией
-        try:
-            leads = RP.harvest(inds, min_revenue=min_revenue, per_industry=per_ind,
-                               region=region, headless=headless, out_path=json_out,
-                               offscreen=offscreen)
-        except Exception as e:
-            print(f"[1/2] сбор упал: {str(e)[:120]}")
-            leads = []
-        if leads:
-            break
-        if attempt == 1:
-            print("[1/2] пусто/сбой — повтор через 15с (новая Chrome-сессия)")
-            time.sleep(15)
-    if not leads:
-        raise SystemExit("RusProfile ничего не вернул (2 попытки) — проверь коды ОКВЭД/доступ/антибот.")
     res = {}
-    for attempt in (1, 2):     # контакты с платного аккаунта; прогресс — в JSON каждые 20 карточек
-        try:
-            with RPS.RusProfileAuth(headless=headless, offscreen=offscreen) as rs:
-                res = rs.enrich_leads(leads, only_missing=True, log=print,
-                                      checkpoint=lambda: RP._save(leads, json_out))
-            break
-        except Exception as e:
-            print(f"[1/2] сессия контактов упала: {str(e)[:120]}"
-                  + (" — повтор через 10с" if attempt == 1 else " — продолжаю БЕЗ контактов RusProfile"))
+    if browser in ("playwright", "pw"):
+        from rusprofile_playwright import (
+            RusProfilePlaywrightError,
+            RusProfilePlaywrightSession,
+        )
+        playwright_completed = False
+        for attempt in (1, 2):
+            try:
+                with RusProfilePlaywrightSession(
+                        headless=headless, offscreen=offscreen) as rs:
+                    leads = RP.harvest(
+                        inds, min_revenue=threshold, per_industry=per_ind,
+                        region=region, out_path=json_out, session=rs)
+                    if not leads:
+                        raise RusProfilePlaywrightError(
+                            "расширенный поиск вернул пустой список")
+                    # Карточки открываются только после revenue-sort и отбора N.
+                    res = rs.enrich_leads(
+                        leads, only_missing=True, log=print,
+                        checkpoint=lambda: RP._save(leads, json_out))
+                playwright_completed = True
+                break
+            except Exception as e:
+                print(f"[1/2] RusProfile/Playwright: {str(e)[:160]}"
+                      + (" — повтор через 10с" if attempt == 1 else ""))
+                if attempt == 1:
+                    time.sleep(10)
+        if not playwright_completed:
+            raise SystemExit(
+                "RusProfile/Playwright не завершил Фазу 1 после 2 попыток — "
+                "проверь cookie, коды ОКВЭД, доступ и антибот.")
+    elif browser in ("uc", "chrome", "selenium"):
+        for attempt in (1, 2):
+            try:
+                leads = RP.harvest(
+                    inds, min_revenue=threshold, per_industry=per_ind,
+                    region=region, headless=headless, out_path=json_out,
+                    offscreen=offscreen)
+            except Exception as e:
+                print(f"[1/2] RusProfile/UC: {str(e)[:160]}")
+                leads = []
+            if leads:
+                break
             if attempt == 1:
-                time.sleep(10)
+                print("[1/2] пусто/сбой — повтор через 15с (новая Chrome-сессия)")
+                time.sleep(15)
+        if not leads:
+            raise SystemExit(
+                "RusProfile ничего не вернул (2 попытки) — проверь коды ОКВЭД/доступ/антибот.")
+        for attempt in (1, 2):
+            try:
+                with RPS.RusProfileAuth(headless=headless, offscreen=offscreen) as rs:
+                    res = rs.enrich_leads(
+                        leads, only_missing=True, log=print,
+                        checkpoint=lambda: RP._save(leads, json_out))
+                break
+            except Exception as e:
+                print(f"[1/2] сессия контактов упала: {str(e)[:120]}"
+                      + (" — повтор через 10с" if attempt == 1 else ""))
+                if attempt == 1:
+                    time.sleep(10)
+    else:
+        raise SystemExit(
+            f"неизвестный RUSPROFILE_BROWSER={browser!r}; допустимо: playwright, uc")
     if res.get("locked"):
         raise SystemExit("Контакты RusProfile закрыты — платная сессия протухла. Один раз: "
                          f"py rusprofile_session.py --login (сырой список уже сохранён: {json_out})")

@@ -2,9 +2,9 @@
 r"""
 Источник лидов RusProfile — расширенный поиск с фильтром по ОКВЭД + ВЫРУЧКЕ.
 
-Антибот RusProfile (Cloudflare) проходится undetected_chromedriver (проверено
-2026-06-16; List-Org для сравнения — IP-бан, RusProfile же нас по IP не банит).
-Выдача рендерится Vue через внутренний API:
+Штатный браузер Фазы 1 — Playwright с cookie авторизованного аккаунта.
+undetected_chromedriver сохранён как явный fallback через
+``RUSPROFILE_BROWSER=uc``. Выдача рендерится Vue через внутренний API:
 
   POST https://www.rusprofile.ru/ajax/search/advanced?cacheKey=<rand>
   заголовок X-Csrf-Token = cookie __Host-csrf-token (ротируется per-load)
@@ -14,9 +14,10 @@ r"""
          finance_revenue,authorized_capital,reg_date,okpo,link}, data.total_count,
          data.pagination{per_page_limit:50, page_count<=20}.
 
-Зовём API ИЗНУТРИ страницы (execute_script + синхронный XHR) — same-origin, cookie
+Зовём API ИЗНУТРИ страницы (Playwright page.evaluate + синхронный XHR) — same-origin, cookie
 Cloudflare и CSRF уже на месте. Фильтр по выручке и ОКВЭД делает сервер -> сразу
-крупный бизнес нужной отрасли с ИНН и выручкой.
+крупный бизнес нужной отрасли с ИНН и выручкой. RusProfile не гарантирует порядок
+по выручке, поэтому доступные страницы дополнительно сортируются на клиенте.
 
 CLI:
   py source_rusprofile.py --industries construction,energy,processing --min-revenue 1e9 \
@@ -27,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import time
 
@@ -43,6 +46,8 @@ except Exception:
     pass
 
 ADV_URL = "https://www.rusprofile.ru/search-advanced"
+MIN_REVENUE_FLOOR = 1_000_000_000
+MAX_SEARCH_PAGES = 20
 
 # ОКВЭД-2 коды по отраслям (RusProfile использует текущий ОКВЭД-2014).
 # Боль/оффер — те же, что в build_bigleads + ОПК.
@@ -324,13 +329,26 @@ class RusProfileSession:
             time.sleep(pause)
         return out
 
-def item_to_lead(it, cfg, industry):
-    rev = it.get("finance_revenue")
+def revenue_value(raw):
+    """Числовая выручка RusProfile; неизвестное значение сортируется последним."""
+    rev = raw
     try:
-        rev = int(rev) if rev not in (None, "") else None
+        if isinstance(rev, str):
+            rev = rev.replace("\xa0", "").replace(" ", "").replace(",", ".")
+        rev = int(float(rev)) if rev not in (None, "") else None
     except (TypeError, ValueError):
         rev = None
-    okved = it.get("main_okved_id") or ""
+    return rev
+
+
+def item_to_lead(it, cfg, industry):
+    rev = revenue_value(it.get("finance_revenue"))
+    okved = str(it.get("main_okved_id") or "").strip()
+    # Advanced-search иногда отдаёт frontend-маркер вроде ``!~.~1.01`` вместо
+    # 10.11. Не пропускаем его в JSON; правильный код добирается с уже открытой
+    # карточки Playwright без дополнительного GET.
+    if not re.fullmatch(r"\d{2}(?:\.\d{1,2}){1,2}", okved):
+        okved = ""
     niche = cfg["label"]
     descr = it.get("okved_descr")
     return {
@@ -456,8 +474,8 @@ def parse_region_query(query):
     return (inc or None), (exc or None)
 
 
-def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
-            headless=False, out_path=None, exclude_regions=None, offscreen=False):
+def _harvest_with_session(session, industries, min_revenue, per_industry, region,
+                          out_path, exclude_regions, max_pages):
     inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
     if exclude_regions:                    # явные исключения (обратная совместимость)
         exc = (exc or []) + list(exclude_regions)
@@ -465,42 +483,44 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
     has_filter = bool(inc or exclude_regions)
     by_inn = {}
     skipped_excl = 0
-    with RusProfileSession(headless=headless, offscreen=offscreen) as s:
-        for ind in industries:
-            cfg = INDUSTRY[ind]
-            pages = max(1, -(-per_industry // 50))  # ceil(per_industry/50)
-            if has_filter:
-                # регион фильтруется КЛИЕНТСКИ -> листаем по максимуму: нужная
-                # выдача рассыпана по всем страницам (по региону не сортируется).
-                pages = 20
-            log(f"\n=== {ind}: {cfg['label']}"
-                + (f" | регион: {region}" if has_filter else "") + " ===")
-            items = s.search(cfg["okved"], min_revenue, max_pages=min(20, pages))
-            kept = 0
-            for it in items:
-                inn = (it.get("inn") or "").strip()
-                if not inn or inn in by_inn:
-                    continue
-                if it.get("inactive"):
-                    continue
-                reg = it.get("region") or ""
-                if inc and not region_included(reg, inc):
-                    continue
-                if region_excluded(reg, exclude_regions):
-                    skipped_excl += 1
-                    continue
-                lead = item_to_lead(it, cfg, ind)
-                # строго: выручка должна быть известна И не ниже порога (>= min_revenue)
-                if not lead["_revenue"] or lead["_revenue"] < min_revenue:
-                    continue
-                by_inn[inn] = lead
-                kept += 1
-                if kept >= per_industry:
-                    break
-            log(f"  -> отобрано {kept} (порог >{min_revenue/1e9:g} млрд"
-                + (f", регион «{region}»" if has_filter else "") + ")")
-            if out_path:
-                _save(list(by_inn.values()), out_path)
+    for ind in industries:
+        cfg = INDUSTRY[ind]
+        log(f"\n=== {ind}: {cfg['label']}"
+            + (f" | регион: {region}" if has_filter else "") + " ===")
+        # Живой ответ RusProfile не упорядочен по finance_revenue. Берём все
+        # доступные страницы (API ограничивает их двадцатью), затем сортируем.
+        items = session.search(cfg["okved"], min_revenue, max_pages=max_pages)
+        items = sorted(
+            (it for it in items if isinstance(it, dict)),
+            key=lambda it: revenue_value(it.get("finance_revenue")) or -1,
+            reverse=True,
+        )
+        kept = 0
+        for it in items:
+            inn = (it.get("inn") or "").strip()
+            if not inn or inn in by_inn:
+                continue
+            if it.get("inactive"):
+                continue
+            reg = it.get("region") or ""
+            if inc and not region_included(reg, inc):
+                continue
+            if region_excluded(reg, exclude_regions):
+                skipped_excl += 1
+                continue
+            lead = item_to_lead(it, cfg, ind)
+            # Сервер уже получил finance_revenue_from; перепроверка не даёт
+            # пропустить пустую/некорректную выручку или регрессию API.
+            if lead["_revenue"] is None or lead["_revenue"] < min_revenue:
+                continue
+            by_inn[inn] = lead
+            kept += 1
+            if kept >= per_industry:
+                break
+        log(f"  -> отобрано {kept} по убыванию выручки (порог >={min_revenue/1e9:g} млрд"
+            + (f", регион «{region}»" if has_filter else "") + ")")
+        if out_path:
+            _save(list(by_inn.values()), out_path)
     res = list(by_inn.values())
     if exclude_regions:
         log(f"\n[исключение регионов] отсеяно {skipped_excl} компаний "
@@ -510,8 +530,48 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
     return res
 
 
+def _browser_session_class():
+    browser = (os.environ.get("RUSPROFILE_BROWSER") or "playwright").strip().lower()
+    if browser in ("playwright", "pw"):
+        from rusprofile_playwright import RusProfilePlaywrightSession
+        return RusProfilePlaywrightSession
+    if browser in ("uc", "chrome", "selenium"):
+        return RusProfileSession
+    raise ValueError(
+        f"неизвестный RUSPROFILE_BROWSER={browser!r}; допустимо: playwright, uc")
+
+
+def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
+            headless=False, out_path=None, exclude_regions=None, offscreen=False,
+            session=None, max_pages=None):
+    """Собрать лиды; переданный session удобен для одной Playwright-context Фазы 1."""
+    min_revenue = max(float(min_revenue), float(MIN_REVENUE_FLOOR))
+    per_industry = max(1, int(per_industry))
+    if max_pages is None:
+        max_pages = os.environ.get("RUSPROFILE_MAX_PAGES", str(MAX_SEARCH_PAGES))
+    try:
+        max_pages = max(1, min(MAX_SEARCH_PAGES, int(max_pages)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("RUSPROFILE_MAX_PAGES должен быть целым числом 1..20") from exc
+
+    args = (
+        industries, min_revenue, per_industry, region, out_path,
+        exclude_regions, max_pages,
+    )
+    if session is not None:
+        return _harvest_with_session(session, *args)
+
+    session_cls = _browser_session_class()
+    with session_cls(headless=headless, offscreen=offscreen) as owned_session:
+        return _harvest_with_session(owned_session, *args)
+
+
 def _save(rows, path):
-    json.dump(rows, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False, indent=1)
 
 
 def main():
@@ -534,8 +594,14 @@ def main():
     if a.okved:
         codes = [c.strip() for c in a.okved.split(",") if c.strip()]
         max_pages = 20 if a.region else a.max_pages  # регион -> листаем по максимуму
-        with RusProfileSession(headless=a.headless) as s:
-            items = s.search(codes, a.min_revenue, max_pages=max_pages)
+        threshold = max(float(a.min_revenue), float(MIN_REVENUE_FLOOR))
+        with _browser_session_class()(headless=a.headless) as s:
+            items = s.search(codes, threshold, max_pages=max_pages)
+        items = sorted(
+            items,
+            key=lambda it: revenue_value(it.get("finance_revenue")) or -1,
+            reverse=True,
+        )
         inc, exc = parse_region_query(a.region)  # 'НЕ Москва' -> exc=['москва']
         cfg = {"label": "ОКВЭД " + ",".join(codes), "pain": "", "offer": ""}
         leads, seen = [], set()
@@ -548,7 +614,10 @@ def main():
                 continue
             if region_excluded(reg, exc):
                 continue
-            seen.add(inn); leads.append(item_to_lead(it, cfg, "custom"))
+            lead = item_to_lead(it, cfg, "custom")
+            if lead["_revenue"] is None or lead["_revenue"] < threshold:
+                continue
+            seen.add(inn); leads.append(lead)
         _save(leads, a.out)
         log(f"\nГОТОВО: {len(leads)} компаний -> {a.out} за {int(time.time()-t0)}с")
         return

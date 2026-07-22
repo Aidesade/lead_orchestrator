@@ -112,7 +112,9 @@ def main() -> int:
     assert "OFDATA_API_KEY:" not in compose
 
     launcher = (HERE / "run_kimi_orchestrator.cmd").read_text(encoding="ascii")
-    assert 'set "LEAD_SOURCE=ofdata"' in launcher
+    assert 'set "LEAD_SOURCE=rusprofile"' in launcher
+    assert 'set "RUSPROFILE_BROWSER=playwright"' in launcher
+    assert "rusprofile_cookies.json" in launcher
     assert "from project_env import load_project_env" in launcher
     assert "r'%~dp0.'" in launcher  # %~dp0 ends with \ and is invalid as a raw string
     assert "orchestrator_agent.py" in launcher
