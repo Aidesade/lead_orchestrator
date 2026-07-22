@@ -18,7 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
 # ⚠️ ЗДЕСЬ БОЛЬШЕ НЕТ НИ GOOGLE CHROME, НИ XVFB — и это осознанно.
 # Они стояли ради ОДНОГО: Фаза 1 скребла RusProfile через undetected-chromedriver, а тот
 # требует НАСТОЯЩИЙ Chrome в headed-режиме (отсюда и Xvfb — виртуальный экран под него).
-# Источник лидов заменён на Checko API (lead_orchestrator/source_checko.py): обычные HTTPS-
+# Источник лидов заменён на OfData API (lead_orchestrator/source_ofdata.py): обычные HTTPS-
 # запросы — ни браузера, ни Cloudflare, ни кук, ни зависимости от репутации IP. Вместе с ними
 # из образа ушло ~1,5 ГБ и главный операционный риск деплоя.
 #
@@ -28,7 +28,7 @@ ENV PYTHONUNBUFFERED=1 \
 #
 # ⚠️ СЛЕДСТВИЕ: source_rusprofile в КОНТЕЙНЕРЕ НЕРАБОТОСПОСОБЕН (нет бинаря Chrome). Пакет
 # undetected-chromedriver в requirements оставлен намеренно — он импортируется и без браузера,
-# и локальный RusProfile-путь на Windows продолжает работать. В Docker источник — Checko.
+# и локальный RusProfile-путь на Windows продолжает работать. В Docker источник — OfData.
 #
 # Шрифты нужны chromium'у: без них кириллица в PDF one-pager рендерится квадратами.
 RUN apt-get update \
@@ -76,6 +76,8 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator/orchestrator.py \
        lead_orchestrator/kimi_config.py \
        lead_orchestrator/orchestrator_agent.py \
+       lead_orchestrator/project_env.py \
+       lead_orchestrator/source_ofdata.py \
        lead_orchestrator/writer_kimi.py \
        lead_orchestrator/kimi_research_cli.py \
        lead_orchestrator/rusprofile_session.py \
@@ -87,6 +89,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator_kimi/leadgen_tools.py \
        lead_orchestrator_kimi/html_to_pdf.py \
     && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
+    && python lead_orchestrator/test_source_ofdata.py \
     && python lead_orchestrator/test_kimi_only.py \
     && python lead_orchestrator/test_kimi_agent_freedom.py \
     && python lead_orchestrator/test_research_enrichment.py \
@@ -98,11 +101,11 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
 
 VOLUME ["/data"]
 # Дефолты именно ДЛЯ КОНТЕЙНЕРА (в конце — чтобы не инвалидировать дорогие слои apt/pip):
-#   LEAD_SOURCE=checko    — сбор ФАЗЫ 1 через Checko API (в образе нет Chrome под RusProfile);
+#   LEAD_SOURCE=ofdata    — сбор ФАЗЫ 1 через OfData API (в образе нет Chrome под RusProfile);
 #   DR_LLM_PROVIDER=kimi  — LLM-экстракт движка ресёрча через Kimi -> весь пайплайн без Anthropic.
 # Те же Kimi-only дефолты действуют и локально; контейнер дополнительно переключает источник
-# лидов на Checko, потому что Chrome под RusProfile из образа удалён.
-ENV LEAD_SOURCE=checko \
+# лидов на OfData, потому что Chrome под RusProfile из образа удалён.
+ENV LEAD_SOURCE=ofdata \
     DR_LLM_PROVIDER=kimi \
     ORQ_KIMI_ONLY=1 \
     KIMI_MODEL_NAME=kimi-k2.7-code

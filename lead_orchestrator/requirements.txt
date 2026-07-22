@@ -147,12 +147,9 @@ zipp==4.1.0
 # ============================================================================
 # ВНЕШНИЕ ТРЕБОВАНИЯ СРЕДЫ (НЕ pip — ставятся отдельно)
 # ============================================================================
-#   - реальный Chrome (undetected-chromedriver подбирает ChromeDriver под версию)
-#   - chromium для Crawl4AI:  python -m playwright install chromium   (нужен для PRIMARY-краула)
-#   - yacli CLI (Яндекс Диск): %LOCALAPPDATA%\Programs\yacli\bin\yacli.exe, разово `yacli login disk`
-#   - Стадия .pptx — официальный скилл Anthropic `pptx` в ~/.claude/skills/pptx/ (лицензия Proprietary):
-#       * Node.js + `npm i -g pptxgenjs`            (генерация .pptx с нуля; pptxgenjs == 4.0.1)
-#       * LibreOffice (soffice)  -> D:\Apps\LibreOffice\program          (рендер слайдов в PDF)
-#       * Poppler (pdftoppm)     -> D:\Apps\poppler\poppler-*\Library\bin (PDF -> JPG для самопроверки)
-#   - ENV: ANTHROPIC_API_KEY (или подписочный `claude` login); опц. DADATA_TOKEN, CHECKO_TOKEN,
-#       GEN_PRESENTATION=0 (отключить .pptx), FIRECRAWL_API_KEY, тумблеры движка DR_* (см. CLAUDE.md).
+#   - chromium для Crawl4AI/PDF: python -m playwright install chromium
+#   - реальный Chrome нужен только при явном legacy LEAD_SOURCE=rusprofile
+#   - Kimi SDK живёт в отдельном lead_orchestrator_kimi/.venv_kimi (см. его requirements.txt)
+#   - ENV штатного пути: KIMI_API_KEY (или GPLLM_API_KEY), OFDATA_API_KEY;
+#       опц. YANDEX_DISK_TOKEN, DADATA_TOKEN, CHECKO_TOKEN, FIRECRAWL_API_KEY,
+#       тумблеры движка DR_* / ORQ_* (см. CLAUDE.md).

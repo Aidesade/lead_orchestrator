@@ -107,6 +107,15 @@ def main() -> int:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "ORQ_KIMI_ONLY" in compose and "DR_LLM_PROVIDER: kimi" in compose
     assert "ANTHROPIC_API_KEY:" not in compose
+    assert "env_file:" in compose and "./env/.env" in compose
+    assert "KIMI_API_KEY:" not in compose
+    assert "OFDATA_API_KEY:" not in compose
+
+    launcher = (HERE / "run_kimi_orchestrator.cmd").read_text(encoding="ascii")
+    assert 'set "LEAD_SOURCE=ofdata"' in launcher
+    assert "from project_env import load_project_env" in launcher
+    assert "r'%~dp0.'" in launcher  # %~dp0 ends with \ and is invalid as a raw string
+    assert "orchestrator_agent.py" in launcher
 
     print("test_kimi_only: OK — controller/research/writer/web runtime закреплены за Kimi K2.7")
     return 0

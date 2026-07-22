@@ -17,9 +17,10 @@ venv/
 # действует в ЛЮБОЙ подпапке, а не только в корне.
 settings.local.json
 
-# Секреты и данные Docker-запуска: .env с токенами и том ./docker-data (лиды/куки/кэш) —
-# в git им не место (см. DEPLOY_TIMEWEB.md: .env с правами 600, никогда не коммитить).
+# Секреты и данные Docker-запуска: .env/папка env с токенами и том ./docker-data —
+# в git им не место (см. DEPLOY_TIMEWEB.md: env/.env, никогда не коммитить).
 .env
+/env/
 docker-data/
 
 # Артефакты прогонов

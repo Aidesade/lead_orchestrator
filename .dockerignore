@@ -13,5 +13,6 @@
 **/*.xlsx
 **/*.log
 docker-data
+/env
 .claude
 **/.claude

@@ -27,12 +27,12 @@ dependency-aware enrichment, писатель двух `.docx` и one-pager ра
 
 Полная цепочка в две фазы (детерминированный Python-оркестратор, НЕ LLM-оркестратор):
 
-- **ФАЗА 1 — сбор.** Источник переключается env `LEAD_SOURCE`: `rusprofile` (дефолт; ОКВЭД,
-  живой Chrome + платная сессия) либо `checko` (Checko API, без браузера/антибота — в Dockerfile
-  стоит `ENV LEAD_SOURCE=checko`). Общий строгий фильтр — **выручка ≥ порога (дефолт 1 млрд ₽)**;
-  на пути RusProfile выручка берётся ТОЛЬКО из RusProfile (ГИР БО/Dadata/Checko не зовутся),
-  на пути Checko её нет в `/search` → добор из ГИР БО + фильтр в коде.
-  Дальше → обогащение контактов (платный аккаунт) → отбор → `D:\лиды\leads_<отрасли>.json`
+- **ФАЗА 1 — сбор.** Штатный и кодовый дефолт `LEAD_SOURCE=ofdata`: OfData `/search`
+  выбирает действующие юрлица по основному ОКВЭД и региону, `/finances` даёт строку 2110,
+  затем код применяет строгий нижний порог **выручка ≥ 1 млрд ₽** (переданное меньшее значение
+  автоматически поднимается). Только прошедшие фильтр карточки обогащаются через `/company`.
+  `LEAD_SOURCE=checko` и `LEAD_SOURCE=rusprofile` сохранены как явные пути отката.
+  Дальше → отбор → `D:\лиды\leads_<отрасли>.json`
   (флаг `--out`; .xlsx из боевой ФАЗЫ 1 убран 2026-07-06) → дерево на Яндекс Диске `<--base>/<отрасль>/<категория полноты контактов>/<компания>/`
   (дефолт корня `disk:/Лиды`; категория — по наличию email/телефона/сайта/ЛПР, `category_for`)
   с 3 файлами-заглушками, которые ФАЗА 2 перезапишет.
@@ -94,6 +94,8 @@ py deep_research_engine.py --crawl avtodor-rzn.ru # отладка: только
 py rusprofile_session.py --login
 # сбор лидов через Checko API (без браузера/антибота; годится для Docker/Linux) -> leads.json:
 py source_checko.py --industries processing --min-revenue 1e9 --region Татарстан --out leads.json
+# штатный сбор через OfData API; на бесплатном тарифе выручка автоматически берётся из ГИР БО:
+py source_ofdata.py --industries processing --region Татарстан --out leads.json
 # Docker (из корня D:\lead_gen; секреты в .env): собрать и прогнать 10 компаний:
 docker compose build && docker compose run --rm lead-orchestrator mining --count 10
 # веб-интерфейс (из корня): API + фронт (подробности web/README.md):
@@ -125,12 +127,14 @@ py -m uvicorn web.api.main:app --port 8000      # затем web/ui: npm run dev
 | `kimi_config.py` | единая конфигурация Kimi: ключ, endpoint, модель, child env и Kimi-only guard |
 | `../lead_orchestrator_kimi/` | **Изолированные Kimi-агенты Фазы 2 + 3-я стадия** (свой venv): dependency-aware enrichment из пяти ролей (`official → contour+secondary → roles → contacts`), агентный писатель и one-pager HTML→PDF. `research_enrichment_agent.py` валидирует schema v3, exact evidence URL/redirect, покрытие ролей/кандидатов и ведёт версионированный checkpoint с evidence trace; `requirements.txt` фиксирует `kimi-agent-sdk==0.0.5` + `kimi-cli==1.12.0`. Свой `CLAUDE.md` — читать перед правкой |
 | `web/` (корень репо) | **веб-интерфейс** (FastAPI + React/Vite). `web/api` спавнит `orchestrator.py` подпроцессом и парсит его stdout в SSE-события (структурированных событий у оркестратора нет); один активный прогон (второй → 409). Свой `README.md` |
-| `Dockerfile` / `docker-compose.yml` / `DEPLOY_TIMEWEB.md` (корень) | **контейнеризация под Timeweb Cloud (Москва)**. Два venv в образе (основной + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен (источник — Checko). Сборка = build-gate (`py_compile`, офлайн `test_deep_research.py`, `apply_patches.py --check`). `AUDIT_KIMI.md` — аудит стадии Kimi |
+| `Dockerfile` / `docker-compose.yml` / `DEPLOY_TIMEWEB.md` (корень) | **контейнеризация под Timeweb Cloud (Москва)**. Два venv в образе (основной + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен (штатный источник — OfData). Сборка = build-gate (`py_compile`, офлайн `test_deep_research.py` + `test_source_ofdata.py`, `apply_patches.py --check`). `AUDIT_KIMI.md` — аудит стадии Kimi |
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк, PNG не нужен |
 | `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры**. `PROCESS_MAP_SYSTEM` / `ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля не загружает Claude SDK. Старый standalone LLM-agent доступен только при `ORQ_KIMI_ONLY=0`; штатно для одной компании используется one-lead JSON через `orchestrator.py`. В карту ролей детерминированно добавляются таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
 | `writer_kimi.py` | **штатный агентный писатель двух .docx на Kimi K2.7** и parent-мост пяти enrichment-ролей. Сначала отдельный Kimi-процесс выполняет `official → (contour + secondary) → role_candidates → candidate_contacts`; затем на документ запускается `writer_kimi_agent.py` с динамическими scout/critic/verifier. `apply_research_enrichment` машинно переносит критические таблицы в DOCX. URL-инструменты subprocess-мостом зовут `kimi_research_cli.py`; SDK не смешиваются. Legacy HTTP — только `KIMI_WRITER_AGENT=0` |
-| `source_checko.py` | **источник лидов через Checko API — замена RusProfile без браузера/антибота** (обычный HTTPS). Drop-in для `source_rusprofile.harvest()`; в `_collect` ПОДКЛЮЧЁН — включается `LEAD_SOURCE=checko` (`_collect_checko`), в Docker это дефолт. Плюс свой CLI → `leads.json` для ФАЗЫ 2. ОКВЭД матчится ТОЧНО (не префиксом) и не короче NN.NN, поэтому `usable_okved` разворачивает коды отраслей уровня NN/NN.N в подклассы через `okved2_codes.py` — работают все 21 отрасль (правка `INDUSTRY` руками не нужна). Регион — свой `resolve_region`: негатив разбирается ПО КАЖДОМУ элементу списка («Дагестан, не Москва» = вкл. Дагестан / искл. Москву), аббревиатуры (ХМАО/ЯНАО/СПб/МСК) — через `source_rusprofile.REGION_ALIASES`. Ключи ротируются на 403/лимите: `CHECKO_TOKEN`→`CHECKO_TOKEN_ALT`/`_2`/`_3` (общий `checko_keys()`, рабочий ключ запоминается). Выручки в /search нет → добор из ГИР БО + фильтр порогом в коде; ИП (`obj=org`) не попадают |
-| `okved2_codes.py` | справочник ОКВЭД-2 (ОК 029-2014): 623 подкласса NN.NN, снимок 2026-07-15 с github.com/carono/okvad2. Нужен ТОЛЬКО `source_checko` (разворачивает NN/NN.N в подклассы); RusProfile им не пользуется |
+| `source_ofdata.py` | **штатный источник Фазы 1 через OfData API**. Переиспользует проверенные `usable_okved`/`resolve_region` и `extract_company_contacts` Checko: `/search` → выручка (`/finances`, а при бесплатном тарифе balance=0 автоматический fallback на ГИР БО ФНС) → обязательный порог ≥1 млрд → `/company` только для прошедших. Ключ только `OFDATA_API_KEY`, POST form-urlencoded (ключ не в URL/логах), ретраи 429/5xx, счётчики запросов/баланса. `OFDATA_REVENUE_SOURCE=auto|ofdata|girbo`; капы: `OFDATA_MAX_CANDIDATES` (3000), `OFDATA_MAX_PAGES_PER_CODE` (50), `OFDATA_CONTACTS_CAP` (0 = все) |
+| `test_source_ofdata.py` | полностью офлайн проверяет формы `/finances`, включительный порог ровно 1 млрд, отсев ниже порога/без строки 2110, `/company`, раскрытие короткого ОКВЭД и отсутствие ключа в URL/ошибке |
+| `source_checko.py` | API-путь отката (`LEAD_SOURCE=checko`). Drop-in для `source_rusprofile.harvest()`: `/search`, выручка из ГИР БО, контакты `/company`; ключи `CHECKO_TOKEN` + запасные |
+| `okved2_codes.py` | справочник ОКВЭД-2 (ОК 029-2014): 623 подкласса NN.NN, снимок 2026-07-15 с github.com/carono/okvad2. Нужен `source_checko` и через его helpers — `source_ofdata`; RusProfile им не пользуется |
 | `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect, ответ ограничен `DR_FETCH_MAX_BYTES`. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
 | `source_rusprofile.py` | сбор RusProfile по ОКВЭД (uc, антибот); карта `INDUSTRY` (21 отрасль); строгий фильтр выручки; `parse_region_query` — регион-фильтр с отрицанием («НЕ Москва», списки через запятую) |
 | `rusprofile_session.py` | контакты с платного аккаунта (cookie; `--login`) |
@@ -252,8 +256,12 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   на нём остался старый `disk:/Лиды` (51 компания, ~10 МБ) — кодом НЕ используется, резюм его не видит.
   ⚠️ Уже открытые консоли/сессии наследуют старое окружение — новый токен подхватится только после
   их перезапуска (ярлык `new_orchestrator` открывает свежую консоль — там всё сразу правильно).
-- Опциональные токены: `DADATA_TOKEN`, `CHECKO_TOKEN` (+ запасные `CHECKO_TOKEN_ALT`/`_2`/`_3` —
-  ротация на 403/лимите) — без них работают только ГИР БО + веб.
+- Для штатной Фазы 1 обязателен `OFDATA_API_KEY`. Платный доступ к `/finances` используется
+  напрямую; бесплатная заглушка автоматически переключает выручку на официальный ГИР БО ФНС.
+  Ключ хранится в `env/.env`; вся `/env/` исключена из Git и Docker build context.
+  `project_env.load_project_env()` тихо загружает файл в desktop/CLI, не печатая значения.
+  Опциональные токены: `DADATA_TOKEN`, `CHECKO_TOKEN` (+ запасные `CHECKO_TOKEN_ALT`/`_2`/`_3`
+  только для пути отката).
 - Пресейл-брендинг (.docx): `PRESALE_VENDOR` (строка «Подготовлено для», по умолчанию пусто),
   `PRESALE_PLATFORM_DESC`.
 - **Стадия one-pager (.pdf):** живёт в `../lead_orchestrator_kimi/` — нужны её venv
@@ -292,8 +300,9 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   `D:\orq_cache` (кэш находок движка), `D:\orq_outbox` (недолитые на Диск файлы — доливаются
   следующим прогоном), `D:\orq_tmp\run_*.log` (логи прогонов).
 - **Переключатели окружения:** `LEAD_SOURCE`
-  (`rusprofile` | `checko`), `DR_LLM_PROVIDER` (`claude` | `kimi`), `ORQ_STORE`
-  (`local` | `disk`). Источник на Windows по-прежнему `rusprofile`, в Docker — `checko`, но
+  (`ofdata` | `checko` | `rusprofile`), `DR_LLM_PROVIDER` (`claude` | `kimi`), `ORQ_STORE`
+  (`local` | `disk`). Источник и на Windows, и в Docker штатно `ofdata`; desktop-ярлык
+  выставляет его явно. Checko и RusProfile доступны только как откат, но
   LLM-провайдер на обеих платформах теперь `kimi`; `ORQ_KIMI_ONLY=1` не даёт случайно уйти в Claude.
 - **Портируемость путей (для Docker/Linux; на Windows работают дефолты):** `ORQ_DATA_ROOT`
   (корень служебных папок; в контейнере `/data`), `ORQ_LEADS_DIR` (дефолт `D:\лиды` / `/data/leads`),
@@ -307,10 +316,11 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   положительное значение задаёт операторский cap), `KIMI_WRITER_AGENT_TIMEOUT` (0 = без общего
   таймаута), `ORQ_KIMI_TOOL_TIMEOUT` (180 на один сетевой/краул-вызов); legacy HTTP:
   `KIMI_WRITER_MAX_TOKENS` (16000), `KIMI_WRITER_TIMEOUT` (600), `_ATTEMPTS` (3).
-- **`.env.example` в репо нет**, но де-факто список секретов — блок `x-orch-env` в
-  `docker-compose.yml` (все `${...}` оттуда). Локальный `.env` в корне — gitignored, не коммитить
-  (см. `DEPLOY_TIMEWEB.md`: права 600). Для Docker минимум: `KIMI_API_KEY` (или `GPLLM_API_KEY`),
-  `CHECKO_TOKEN` (источник лидов там — Checko), опц. `DADATA_TOKEN`/`YANDEX_DISK_TOKEN`
+- **`.env.example` в репо нет**. Локальные секреты хранятся в gitignored `env/.env`;
+  Docker подключает его через `env_file`, а в build context папка не попадает. Для Docker минимум:
+  `KIMI_API_KEY` (или `GPLLM_API_KEY`),
+  `OFDATA_API_KEY` (поиск — OfData; выручка — `/finances` либо автоматический ГИР БО), опц.
+  `DADATA_TOKEN`/`YANDEX_DISK_TOKEN`/`CHECKO_TOKEN`
   (последний нужен только при `ORQ_STORE=disk`).
 
 ## Развёртывание и веб-интерфейс (добавлено 2026-07-14)
@@ -319,7 +329,7 @@ temp на D:, т.к. C: переполнен. При `--no-upload` файлы о
   прод — сервер в Москве; весь модельный runtime уже переведён на Kimi. Образ x86-64-only
   (`google-chrome-stable` был amd64). Два venv (`/opt/venv` + `/opt/kimi-venv`), конфликт
   `pydantic-core` сохраняется. **Chrome/Xvfb из образа убраны** → `source_rusprofile` в контейнере
-  неработоспособен; источник лидов там — `source_checko.py` (HTTPS, без антибота). Chromium в образе
+  неработоспособен; источник лидов там — `source_ofdata.py` (HTTPS, без антибота). Chromium в образе
   остаётся (headless, Playwright) — им краулит Crawl4AI и рендерит PDF one-pager. Сборка — build-gate:
   падает, если `py_compile`/`test_deep_research.py`/`apply_patches.py --check`/импорт стадии не прошли.
   ⚠️ Главный операционный риск не решается кодом — антибот RusProfile против IP дата-центра

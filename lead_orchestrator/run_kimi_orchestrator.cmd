@@ -35,13 +35,23 @@ rem --- Single Kimi runtime. Key: KIMI_API_KEY, fallback GPLLM_API_KEY ---
 if not defined KIMI_API_KEY set "KIMI_API_KEY=%GPLLM_API_KEY%"
 if not defined KIMI_BASE_URL set "KIMI_BASE_URL=https://gpllmkeeper.dtc.tatar/v1"
 if not defined KIMI_MODEL_NAME set "KIMI_MODEL_NAME=kimi-k2.7-code"
+if not defined LEAD_SOURCE set "LEAD_SOURCE=ofdata"
 set "DR_LLM_PROVIDER=kimi"
 set "ORQ_KIMI_ONLY=1"
 
-if not defined KIMI_API_KEY (
-    echo [ERROR] No Kimi key: neither KIMI_API_KEY nor GPLLM_API_KEY is set.
-    echo         Set the key and reopen the console.
+"%ORQ_MAIN_PY%" -c "import sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();import kimi_config as k;raise SystemExit(0 if k.api_key() else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] No KIMI_API_KEY or GPLLM_API_KEY in "%~dp0..\env\.env" or environment.
+    echo         Add the key there; the env folder is Git-ignored.
     exit /b 7
+)
+if /I "%LEAD_SOURCE%"=="ofdata" (
+    "%ORQ_MAIN_PY%" -c "import os,sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();raise SystemExit(0 if os.environ.get('OFDATA_API_KEY') else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] No OfData key in "%~dp0..\env\.env".
+        echo         Add OFDATA_API_KEY there; the env folder is Git-ignored.
+        exit /b 8
+    )
 )
 
 title Kimi K2.7 Lead Orchestrator - end to end

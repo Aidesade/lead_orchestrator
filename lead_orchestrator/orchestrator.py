@@ -52,6 +52,10 @@ warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
 
+from project_env import load_project_env
+
+load_project_env()
+
 import kimi_config as KC
 import disk_organize as DO  # пути на Диске + upload + заглушки (stdlib, без сети при импорте)
 
@@ -162,7 +166,8 @@ def _kimi_env():
 
     Стадию исполняет СТОРОННИЙ kimi-cli (альфа 0.0.5) и запускается он с yolo=True, то есть
     с авто-аппрувом вызовов инструментов. Отдавать ему весь os.environ незачем: раньше туда
-    уезжали ANTHROPIC_API_KEY, YANDEX_DISK_TOKEN, DADATA_TOKEN, CHECKO_TOKEN и FIRECRAWL_API_KEY,
+    уезжали ANTHROPIC_API_KEY, YANDEX_DISK_TOKEN, DADATA_TOKEN, OFDATA_API_KEY,
+    CHECKO_TOKEN и FIRECRAWL_API_KEY,
     хотя стадии нужен ровно один ключ — свой. Сравнение имён по upper() заодно ловит linux'овые
     http_proxy/https_proxy в нижнем регистре, сохраняя исходное написание ключа."""
     env = {k: v for k, v in os.environ.items() if k.upper() in _KIMI_ENV_ALLOW}
@@ -629,8 +634,8 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
     """ФАЗА 1 (первый агент): сбор -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
-    Источник — env LEAD_SOURCE: 'rusprofile' (по умолч., живой Chrome + платная сессия) либо
-    'checko' (Checko API, без браузера/антибота — для Docker/Linux). Возвращает picked[]."""
+    Источник — env LEAD_SOURCE: 'ofdata' (по умолчанию, API), 'checko' (API-откат)
+    либо 'rusprofile' (живой Chrome + платная сессия). Возвращает picked[]."""
     import math
     import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
@@ -640,11 +645,16 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("не распознаны отрасли. Доступно: " + ", ".join(sorted(RP.INDUSTRY)))
     per_ind = math.ceil(count / max(1, len(inds)))
 
-    source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
+    source = (os.environ.get("LEAD_SOURCE") or "ofdata").strip().lower()
+    if source in ("ofdata", "ofdata_api"):
+        return _collect_ofdata(inds, count, min_revenue, region, base, account, json_out, per_ind)
     if source in ("checko", "checko_api", "api"):
         return _collect_checko(inds, count, min_revenue, region, base, account, json_out, per_ind)
+    if source not in ("rusprofile", "rp"):
+        raise SystemExit(
+            f"неизвестный LEAD_SOURCE={source!r}; допустимо: ofdata, checko, rusprofile")
 
-    # --- RusProfile (по умолчанию): живой Chrome + платная сессия контактов ---
+    # --- RusProfile (явный legacy-откат): живой Chrome + платная сессия контактов ---
     import rusprofile_session as RPS
     if not os.path.exists(RPS.COOKIES_FILE):
         raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
@@ -687,6 +697,55 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     if _store_mode() == "disk":
         print("[1/2] раскладка папок+заготовок на Диске ...")
         DO.organize_to_disk(picked, base=base, account=account, log=print)   # папки создаёт ПЕРВЫЙ агент
+    return picked
+
+
+def _collect_ofdata(inds, count, min_revenue, region, base, account, json_out, per_ind):
+    """ФАЗА 1 через OfData: /search -> /finances -> >=1 млрд -> /company."""
+    import source_ofdata as OD
+    import pipeline
+
+    threshold = max(float(min_revenue), float(OD.MIN_REVENUE_FLOOR))
+    print(f"[1/2] OfData API: {inds} | порог >={threshold / 1e9:g} млрд"
+          + (f" | регион {region}" if region else ""))
+    try:
+        client = OD.OfDataClient()
+        max_candidates = int(os.environ.get("OFDATA_MAX_CANDIDATES", "3000"))
+        leads = OD.harvest(
+            inds,
+            min_revenue=threshold,
+            per_industry=per_ind,
+            region=region,
+            out_path=json_out,
+            max_candidates=max_candidates,
+            client=client,
+        )
+    except OD.OfDataSourceError as e:
+        raise SystemExit(f"OfData: {e}")
+    except ValueError as e:
+        raise SystemExit(f"OfData: неверная числовая настройка окружения — {e}")
+    except Exception as e:
+        raise SystemExit(f"OfData: сбор упал — {str(e)[:180]}")
+    if not leads:
+        raise SystemExit(
+            "OfData не вернул компаний с выручкой >= 1 млрд ₽ — проверь отрасль, регион, "
+            "доступ тарифа к /finances и OFDATA_API_KEY.")
+
+    # Как в Checko-пути: карточки запрашиваем только для уже прошедших дорогой фильтр.
+    # Ноль означает «все отобранные»; положительное значение ограничивает расход /company.
+    try:
+        cap = int(os.environ.get("OFDATA_CONTACTS_CAP", "0"))
+        OD.ofdata_contacts_pass(client, leads, cap=cap, only_missing=True, log=print)
+    except Exception as e:                          # noqa: BLE001
+        print(f"[1/2] контакты OfData не добраны: {str(e)[:140]}")
+
+    picked = pipeline._select(leads, count, inds)
+    pipeline._save(picked, json_out)
+    print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
+    print(f"[1/2] расход OfData: {client.usage_line()}")
+    if _store_mode() == "disk":
+        print("[1/2] раскладка папок+заготовок на Диске ...")
+        DO.organize_to_disk(picked, base=base, account=account, log=print)
     return picked
 
 

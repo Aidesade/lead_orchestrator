@@ -33,6 +33,10 @@ except Exception:
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPTS)
 
+from project_env import load_project_env  # noqa: E402
+
+load_project_env()
+
 import kimi_config as KC  # noqa: E402
 import source_rusprofile as RP  # noqa: E402
 
