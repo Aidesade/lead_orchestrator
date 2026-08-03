@@ -100,7 +100,7 @@ def main() -> int:
     assert not any(name == "anthropic" or name.startswith("claude_agent_sdk") for name in imports)
 
     orchestrator_source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
-    assert 'ap.add_argument("--model", default="kimi"' in orchestrator_source
+    assert 'ap.add_argument("--model", default=KC.default_model_flag()' in orchestrator_source
     assert "if KC.kimi_only():" in orchestrator_source
     assert "return await _research_one_kimi(" in orchestrator_source
 

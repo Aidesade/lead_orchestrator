@@ -32,6 +32,15 @@ IS_WIN = sys.platform == "win32"
 STAGES = ["research", "person", "writing", "onepager", "upload"]
 
 
+def _default_model_flag() -> str:
+    """Runtime-дефолт --model из конфига оркестратора (sys.path добавляет leads.py)."""
+    try:
+        import kimi_config
+        return kimi_config.default_model_flag()
+    except Exception:                              # noqa: BLE001 — веб не должен падать из-за конфига
+        return "claude"
+
+
 class RunConflict(RuntimeError):
     """Уже идёт прогон."""
 
@@ -198,7 +207,10 @@ def build_argv(p: Dict[str, Any]) -> List[str]:
         cmd += ["--region", ", ".join(tokens)]
     if (p.get("out") or "").strip():
         cmd += ["--out", p["out"].strip()]
-    cmd += ["--model", "kimi"]
+    model = str(p.get("model") or "").strip().lower()
+    if model not in ("kimi", "claude"):
+        model = _default_model_flag()          # пустое поле -> runtime-дефолт ветки
+    cmd += ["--model", model]
     cmd += ["--workers", str(int(p.get("workers") or 2))]
     cmd += ["--base", (p.get("base") or config.DISK_BASE).strip()]
     if p.get("show_browser"):

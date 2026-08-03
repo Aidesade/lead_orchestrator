@@ -12,6 +12,20 @@ LLM — через **Kimi Agent SDK** / Kimi CLI и OpenAI-совместимы�
 два `.docx` → HTML/PDF. One-pager отдельно проверен вживую 2026-07-13.
 Пробный результат: `disk:/Лиды/_kimi_test/АО Рязаньавтодор/` (тестовая папка, вне боевого дерева лидов).
 
+## Ветка claude-sdk: два runtime, одни файлы
+
+Штатный runtime ветки — **Claude Agent SDK**: те же `writer_kimi_agent.py` /
+`research_enrichment_agent.py` / `onepager_kimi.py` запускаются python'ом ОСНОВНОГО
+окружения, а под их kimi-интерфейс `prompt()` подложен адаптер
+**`claude_kimi_adapter.py`** (Kimi-совместимый async-генератор сообщений поверх
+claude-agent-sdk: MCP-тулы `Lead*` через тот же subprocess-мост, субагенты писателя —
+нативные субагенты SDK, `Agent`-вызовы нормализуются обратно в `Task`/`subagent_name`).
+Выбор runtime — env `ORQ_LLM_RUNTIME` (ставит родитель `writer_kimi.py`/оркестратор).
+Спеки `kimi_agent/*.yaml + *.md` ОБЩИЕ для обоих runtime — правя промпт роли, правишь оба.
+`claude_kimi_adapter.py` НЕ импортировать в `.venv_kimi` (pydantic-core конфликт); его
+селфтест гоняется основным python и включён в `test_claude_runtime.py`.
+Всё ниже про `.venv_kimi`/патчи/kimi-cli остаётся в силе для отката `ORQ_KIMI_ONLY=1`.
+
 ## Главные инварианты (НЕ сломать)
 
 1. **Интеграционный контракт с `../lead_orchestrator/` уже боевой.** Основной оркестратор не

@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-r"""Kimi K2.7 NL-обёртка полной цепочки лидогенерации.
+r"""NL-обёртка полной цепочки лидогенерации (runtime claude|kimi).
 
-Запрос на русском языке -> Kimi K2.7 возвращает строгий JSON-план -> детерминированный
-Python проверяет отрасли и объём -> subprocess запускает orchestrator.py. Любой LLM-вызов
-штатного пути использует один KIMI_API_KEY (с fallback GPLLM_API_KEY), KIMI_BASE_URL и
-KIMI_MODEL_NAME. Claude/Anthropic в этой обёртке не импортируется и не вызывается.
+Запрос на русском языке -> модель возвращает строгий JSON-план -> детерминированный
+Python проверяет отрасли и объём -> subprocess запускает orchestrator.py. Runtime
+выбирает kimi_config.runtime(): claude (штат ветки claude-sdk, Claude Agent SDK,
+авторизация логином Claude Code) либо kimi при ORQ_KIMI_ONLY=1 (KIMI_API_KEY с
+fallback GPLLM_API_KEY, KIMI_BASE_URL, KIMI_MODEL_NAME). Claude SDK грузится ТОЛЬКО
+лениво через importlib в claude-runtime — kimi-only офлайн-контракт видит модуль
+без статических импортов Anthropic.
 
 Запуск:
   py orchestrator_agent.py
@@ -50,12 +53,12 @@ BIG_RUN_COMPANIES = 50
 
 
 SYSTEM_PROMPT = """\
-Ты — Kimi-контроллер полного B2B lead-gen pipeline. Твоя единственная задача —
+Ты — контроллер полного B2B lead-gen pipeline. Твоя единственная задача —
 преобразовать запрос пользователя в ОДИН JSON-план. Сам pipeline запускает Python после
 проверки плана; не пиши команды, не имитируй запуск и не добавляй текст вне JSON.
 
 Pipeline делает: сбор компаний по отрасли -> deep research -> два DOCX -> one-pager PDF.
-Все модельные стадии уже закреплены за Kimi K2.7; поля выбора модели в плане НЕТ.
+Модельные стадии закреплены конфигурацией запуска; поля выбора модели в плане НЕТ.
 
 Доступные отрасли (верни только ключи слева):
 __INDUSTRIES__
@@ -171,6 +174,44 @@ def _normalise_plan(raw: dict) -> dict:
     }
 
 
+async def _claude_plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
+    """Один короткий вызов Claude Agent SDK: NL -> JSON-план. Без инструментов.
+
+    importlib вместо статического импорта — осознанно: kimi-only офлайн-контракт
+    (test_kimi_only) проверяет, что модуль не тянет claude_agent_sdk."""
+    import importlib
+
+    sdk = importlib.import_module("claude_agent_sdk")
+    convo = "".join(
+        f"{'Пользователь' if row.get('role') == 'user' else 'Прошлый план'}: {row.get('content')}\n"
+        for row in (history or [])[-6:])
+    full = (f"Предыдущий диалог:\n{convo}\n" if convo else "") + f"Запрос: {prompt}"
+    options = sdk.ClaudeAgentOptions(
+        model=KC.claude_model("controller"), system_prompt=SYSTEM_PROMPT,
+        max_turns=1, allowed_tools=[],
+        disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit", "WebSearch", "WebFetch"],
+        permission_mode="bypassPermissions", setting_sources=[])
+    text = ""
+    async for message in sdk.query(prompt=full, options=options):
+        if isinstance(message, sdk.AssistantMessage):
+            for block in message.content:
+                if isinstance(block, sdk.TextBlock):
+                    text += block.text
+        elif isinstance(message, sdk.ResultMessage):
+            if message.is_error:
+                raise RuntimeError(f"Claude controller завершился ошибкой: {message.subtype}")
+            if message.result:
+                text = message.result
+    return _normalise_plan(_extract_json(text)), text
+
+
+async def _plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
+    """NL -> проверенный JSON-план активным runtime."""
+    if KC.runtime() == "claude":
+        return await _claude_plan(prompt, history)
+    return await _kimi_plan(prompt, history)
+
+
 async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
     """Один короткий вызов Kimi K2.7: NL -> JSON-план. Без tool calls и shell."""
     KC.ensure_env(require_key=True)
@@ -226,7 +267,8 @@ def _build_cmd(plan: dict) -> tuple[list[str] | None, str | None]:
         cmd += ["--min-revenue", str(float(plan["min_revenue"]))]
     if str(plan.get("region") or "").strip():
         cmd += ["--region", str(plan["region"]).strip()]
-    cmd += ["--model", "kimi", "--workers", str(min(2, _positive_int(plan.get("workers"), 2)))]
+    cmd += ["--model", KC.default_model_flag(),
+            "--workers", str(min(2, _positive_int(plan.get("workers"), 2)))]
     if _bool(plan.get("show_browser")):
         cmd.append("--show-browser")
     if _bool(plan.get("dry_run")):
@@ -236,6 +278,13 @@ def _build_cmd(plan: dict) -> tuple[list[str] | None, str | None]:
     if _bool(plan.get("no_presentation")):
         cmd.append("--no-presentation")
     return cmd, None
+
+
+def _runtime_label() -> str:
+    """Человекочитаемая метка активного runtime для консоли."""
+    if KC.runtime() == "kimi":
+        return f"Kimi {KC.model_name()}"
+    return f"Claude Agent SDK ({KC.claude_model('controller')})"
 
 
 def _box(title: str, lines: list[str], pad: int = 1) -> str:
@@ -311,7 +360,7 @@ async def _execute(plan: dict) -> int:
         print(f"[ERROR] {exc}")
         return 5
     shown = "orchestrator.py " + subprocess.list2cmdline(cmd[2:])
-    print(f"[controller] Kimi {KC.model_name()} -> {shown}")
+    print(f"[controller] {_runtime_label()} -> {shown}")
 
     def run() -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -332,15 +381,17 @@ def _selftest() -> int:
     })
     cmd, error = _build_cmd(plan)
     assert error is None and cmd is not None
-    assert cmd[cmd.index("--model") + 1] == "kimi"
+    assert cmd[cmd.index("--model") + 1] == KC.default_model_flag()
     assert cmd[cmd.index("--workers") + 1] == "2"
     assert os.path.basename(cmd[1]).lower() == "orchestrator.py"
     assert KC.model_name().startswith("kimi-k2.7")
+    # Claude SDK допустим только лениво через importlib: kimi-only контракт
+    # (test_kimi_only) проверяет отсутствие статических импортов по AST.
     source = open(__file__, encoding="utf-8").read()
     forbidden = "claude" + "_agent_sdk"
     assert f"from {forbidden}" not in source
     assert f"\nimport {forbidden}" not in source
-    print(f"selftest passed: NL controller -> Kimi-only {KC.model_name()}")
+    print(f"selftest passed: NL controller -> {_runtime_label()}")
     return 0
 
 
@@ -350,14 +401,14 @@ async def main() -> int:
     KC.ensure_env(require_key=True)
     cli_prompt = " ".join(sys.argv[1:]).strip()
     if cli_prompt:
-        print(f"[controller] разбираю запрос на {KC.model_name()} ...")
-        plan, _ = await _kimi_plan(cli_prompt)
+        print(f"[controller] разбираю запрос: {_runtime_label()} ...")
+        plan, _ = await _plan(cli_prompt)
         if plan["action"] == "clarify":
             print(plan["message"])
             return 2
         return await _execute(plan)
 
-    print(f"Kimi Lead Orchestrator ({KC.model_name()}). Пустая строка или 'exit' — выход.")
+    print(f"Lead Orchestrator ({_runtime_label()}). Пустая строка или 'exit' — выход.")
     history: list[dict] = []
     while True:
         try:
@@ -367,9 +418,9 @@ async def main() -> int:
         if not prompt or prompt.lower() in ("exit", "quit", "выход"):
             break
         try:
-            plan, raw = await _kimi_plan(prompt, history)
+            plan, raw = await _plan(prompt, history)
         except Exception as exc:
-            print(f"Kimi controller недоступен: {exc}")
+            print(f"Контроллер недоступен: {exc}")
             continue
         history += [{"role": "user", "content": prompt},
                     {"role": "assistant", "content": raw}]

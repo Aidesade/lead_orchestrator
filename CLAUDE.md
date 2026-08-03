@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Оркестратор лидогенерации для B2B-агентства, продающего корпоративную on-premises LLM-платформу
 **Telepatt** от **АО «ЦИТ РТ»** (RAG-база знаний, автономные ИИ-агенты, ИИ-Коуч «Наставник»).
-Корень репозитория — **`D:\lead_gen`**, рабочая ветка **`kimi`**. Ядро пайплайна — `lead_orchestrator/`;
-изолированные Kimi-агенты Фазы 2 — `lead_orchestrator_kimi/` (свой venv); веб — `web/`;
-контейнеризация — `Dockerfile`/`docker-compose.yml`.
+Корень репозитория — **`D:\lead_gen`**; ЭТА ветка — **`claude-sdk`** (генератор на Claude Agent
+SDK; ветка `kimi` — прежний полный Kimi-runtime, основная — `master`). Ядро пайплайна —
+`lead_orchestrator/`; агенты Фазы 2 — `lead_orchestrator_kimi/` (общие для обоих runtime; свой
+venv нужен только kimi); веб — `web/`; контейнеризация — `Dockerfile`/`docker-compose.yml`.
 Python 3.12, основная платформа Windows, прод-цель — Docker в Linux. Комментарии в коде — на русском.
 
 Оркестратор **детерминированный Python**, а не LLM-оркестратор: модель принимает решения только
@@ -17,31 +18,50 @@ Python 3.12, основная платформа Windows, прод-цель — 
 вёрстка полосы метрик), `web/README.md` (ручки API и решения веба), `DEPLOY_TIMEWEB.md` (прод),
 `AUDIT_KIMI.md` (аудит Kimi-стадии).
 
-## Runtime: Kimi-only
+## Runtime: Claude Agent SDK (ветка claude-sdk)
 
-Штатный режим всего агента — **Kimi-only**: NL-контроллер, LLM-экстракт движка ресёрча,
-пять enrichment-ролей, писатель двух `.docx` и one-pager работают на одной модели
-`kimi-k2.7-code` через OpenAI-совместимый шлюз `KIMI_BASE_URL`.
+Штатный режим ЭТОЙ ветки — **генератор на Claude Agent SDK**: NL-контроллер, LLM-экстракт
+движка ресёрча (`DR_LLM_PROVIDER=claude`), пять enrichment-ролей, писатель двух `.docx`
+и one-pager работают через `claude-agent-sdk` (пин 0.2.103, CLI бандлится в пакет).
+**Pipeline ровно тот же, что у Kimi-runtime** — те же скрипты, промпты (yaml/md), валидация,
+checkpoint'ы: под них подложен Kimi-совместимый адаптер
+`lead_orchestrator_kimi/claude_kimi_adapter.py` (тот же интерфейс `prompt()`), а агентные
+подпроцессы запускаются python'ом ОСНОВНОГО окружения вместо `.venv_kimi`.
 
-- `ORQ_KIMI_ONLY` — **кодовый дефолт `1`** (`kimi_config.py:35`), а не только env лаунчера.
-- В этом режиме ID модели зафиксирован: любое другое `KIMI_MODEL_NAME` → fail-fast до первого
-  запроса (`kimi_config.model_name()`).
-- `--model` у `orchestrator.py` имеет **дефолт `kimi`**; любое не-kimi значение под guard'ом
-  роняет запуск в `SystemExit`. Ветка Claude недостижима без явного `ORQ_KIMI_ONLY=0`.
-- Ключ берётся в порядке `KIMI_API_KEY` → `GPLLM_API_KEY`; на этой машине задан второй.
-- Веб принимает только `model=kimi` (`/api/models` возвращает один пункт).
+- `kimi_config.runtime()` → `claude` (кодовый дефолт `ORQ_LLM_RUNTIME=claude`) | `kimi`.
+  `ORQ_KIMI_ONLY` — **кодовый дефолт `0`**; `=1` возвращает прежний Kimi-only режим ЦЕЛИКОМ
+  (все guard'ы ветки `kimi` продолжают работать — их держит `test_kimi_only.py`).
+- `--model` у `orchestrator.py` — **дефолт по runtime** (`claude`); `--model kimi` на прогон
+  включает kimi-runtime (нужен ключ шлюза). Значение прокидывается детям через env.
+- Модели стадий Claude (алиасы CLI, перекрываются env): писатель `opus` (`ORQ_WRITER_MODEL`),
+  роли `sonnet` (`ORQ_ENRICH_MODEL`), one-pager `opus` (`ORQ_ONEPAGER_MODEL`), контроллер
+  `sonnet` (`ORQ_CONTROLLER_MODEL`), субагенты писателя `sonnet`
+  (`ORQ_SCOUT_MODEL`/`ORQ_CRITIC_MODEL`/`ORQ_VERIFIER_MODEL`), extract движка `sonnet`
+  (`DR_EXTRACT_MODEL`).
+- Авторизация — логин Claude Code (`~/.claude`, доезжает в урезанное env подпроцессов через
+  `USERPROFILE`) либо `ANTHROPIC_API_KEY`. Ключ Kimi в claude-runtime НЕ нужен; стоимость
+  сессий писателя отдаёт SDK (попадает в `[ГОТОВО] | стоимость`).
+- Веб: `/api/models` отдаёт `claude` (дефолт) и `kimi`; `POST /api/runs` принимает оба.
+- ⚠️ CLI отдаёт MCP-тулы «отложенными»: модель в начале сессии зовёт служебный `ToolSearch`,
+  затем работает `Lead*` как обычно. Это штатный хоп, не баг.
+- **Docker остаётся на kimi-runtime** (`ORQ_KIMI_ONLY=1` в образе/compose): headless-логина
+  Claude там нет; claude в контейнере — только осознанно через `ANTHROPIC_API_KEY` в env/.env.
 
-Ветка Claude сохранена в коде исключительно для аварийного отката (`_research_one` ниже
-kimi-диспатча, `PRESALE_SYSTEM`, `ORQ_SCOUT_MODEL`/`ORQ_CRITIC_MODEL`/`ORQ_VERIFIER_MODEL`,
-`ORQ_CRAWL_*`). Это **не** поддерживаемый рабочий дефолт — не «чинить» её попутно.
+Legacy-архитектура Claude «агент ресёрчит сам» (`_research_one` ниже диспатча,
+`PRESALE_SYSTEM`, `ORQ_CRAWL_*`) — НЕ этот runtime: она достижима только явным
+`--model opus|sonnet` при `ORQ_KIMI_ONLY=0` и остаётся аварийным артефактом — не «чинить» её
+попутно. Текущий claude-runtime — это ТЕКУЩИЙ pipeline (движок→роли→писатель), просто на
+другом SDK.
 
 ## Запуск
 
 Ярлык на рабочем столе **`new_orchestrator`** → `run_orchestrator.cmd` (канонический делегат) →
 `run_kimi_orchestrator.cmd` → NL-контроллер `orchestrator_agent.py` → **`orchestrator.py`**.
-Лаунчер выставляет `KIMI_API_KEY`←`GPLLM_API_KEY`, `KIMI_BASE_URL`, `KIMI_MODEL_NAME`,
-`LEAD_SOURCE=rusprofile`, `RUSPROFILE_BROWSER=playwright`, `DR_LLM_PROVIDER=kimi`, `ORQ_KIMI_ONLY=1`;
-отсутствие ключа/cookie — жёсткая ошибка ДО запуска, а не тихий пропуск стадии.
+Лаунчер выставляет `ORQ_LLM_RUNTIME=claude` (`ORQ_KIMI_ONLY=0`), `DR_LLM_PROVIDER=claude`,
+`LEAD_SOURCE=rusprofile`, `RUSPROFILE_BROWSER=playwright` + Kimi-дефолты (безвредны для claude,
+обязательны для отката `ORQ_KIMI_ONLY=1`). Прекондишены — жёсткая ошибка ДО запуска, а не тихий
+пропуск стадии: для claude проверяется импорт `claude-agent-sdk`, для kimi — ключ шлюза; cookie
+RusProfile — в обоих режимах.
 
 ⚠️ **Лаунчеры намеренно не зовут `py`.** Они резолвят `ORQ_MAIN_PY` →
 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe` («py launcher may have no registered runtime»).
@@ -108,8 +128,9 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 
 ```
 py -m py_compile orchestrator.py writer_kimi.py deep_research_engine.py company_research_agent.py
-py test_kimi_only.py             # единый Kimi K2.7 runtime и запрет Claude в штатных entrypoint
-py test_kimi_agent_freedom.py    # контракт свободного Kimi Agent loop
+py test_claude_runtime.py        # ШТАТ ветки: дефолт claude, диспатч, модели стадий, адаптер
+py test_kimi_only.py             # откат ORQ_KIMI_ONLY=1: Kimi K2.7 runtime цел и запирает Claude
+py test_kimi_agent_freedom.py    # контракт свободного Agent loop писателя
 py test_research_enrichment.py   # scheduler/контракты/cache/DOCX-adapter пяти ролей (вкл. деградацию)
 py test_rusprofile_playwright.py # cookie-нормализация, порог 1 млрд, revenue-sort по убыванию
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
@@ -121,14 +142,17 @@ py ..\web\api\test_events.py            # парсер stdout -> SSE на НАС
 py orchestrator.py sample_ryazanavtodor.json --dry-run --no-upload   # вся цепочка офлайн, заглушки
 ```
 
-В venv Kimi-папки — ещё два (см. её `CLAUDE.md`):
+Агентные селфтесты: claude-режим — ОСНОВНЫМ python'ом
+(`set ORQ_LLM_RUNTIME=claude && py ..\lead_orchestrator_kimi\writer_kimi_agent.py --selftest`,
+`py ..\lead_orchestrator_kimi\claude_kimi_adapter.py` — оба уже гоняет `test_claude_runtime.py`);
+kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `.venv_kimi\Scripts\python.exe writer_kimi_agent.py --selftest` и
 `... research_enrichment_agent.py --selftest`, плюс `patches/apply_patches.py --check`.
 
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
 `test_source_ofdata.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
-`test_kimi_agent_freedom.py`, `test_research_enrichment.py`, `apply_patches.py --check` и импорт
-Kimi-стадии. Добавил тест — добавь его и в гейт.
+`test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
+`apply_patches.py --check` и импорт Kimi-стадии. Добавил тест — добавь его и в гейт.
 
 ⚠️ `web/api/test_events.py` гонять при ЛЮБОЙ правке печати в `orchestrator.py`: веб парсит именно
 эти русские префиксы, структурированных событий у оркестратора нет. Переименовал строку вывода —
@@ -180,7 +204,8 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
 2. **Обогащение ЛПР (`person_enrich`)** — тоже детерминированно, вне SDK-сессии: по `contact_person`+ИНН
    прямые рабочие контакты; блок дописывается к находкам прохода `roles` (в `process` не идёт).
    ВКЛ по умолчанию; тихо пропускается, если у лида нет `contact_person` или `_inn`.
-3. **Пять enrichment-ролей (подпроцесс venv Kimi).** Граф
+3. **Пять enrichment-ролей (подпроцесс: claude — основной python + адаптер, kimi — venv Kimi).**
+   Граф
    `official_sources → (corporate_contour + secondary_sources) → role_candidates → candidate_contacts`.
    Контактник не видит общий seed персоналий — только структурированный список кандидатов.
    Ответы проходят enum/URL/date/confidence/source-policy validation; сниппет без Fetch/Crawl
@@ -194,25 +219,28 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
    не стартовал, а лог винил писателя («не сохранил .docx»). **Не возвращать `raise` в `run()`.**
    Родитель (`writer_kimi.run_research_subagents`) поднимает НАСТОЯЩУЮ причину из stdout, а не хвост
    stderr с шумом `authlib.jose` DeprecationWarning.
-4. **Писатель** — `writer_kimi.write_two_docx`: агент в отдельном venv, на каждый документ свой
-   главный писатель со свободным read-only веб-поиском + динамический веер `scout`/`verifier` +
-   обязательный `critic`, свой системный промпт (`PROCESS_MAP_SYSTEM` / `ROLES_CONTACTS_SYSTEM` из CRA)
-   и свои находки-seed со своего прохода → финальный JSON → общие рендереры CRA.
-   `apply_research_enrichment` машинно переносит критические таблицы в DOCX. URL-инструменты идут
-   subprocess-мостом через `kimi_research_cli.py` — SDK не смешиваются. Legacy HTTP-режим —
-   `KIMI_WRITER_AGENT=0`.
-   На Kimi долларовая вилка `[оценка]` не печатается (шлюз цену наружу не отдаёт → итог `$0`, не баг).
+4. **Писатель** — `writer_kimi.write_two_docx`: агент в подпроцессе (интерпретатор — по runtime),
+   на каждый документ свой главный писатель со свободным read-only веб-поиском + динамический
+   веер `scout`/`verifier` + обязательный `critic`, свой системный промпт (`PROCESS_MAP_SYSTEM` /
+   `ROLES_CONTACTS_SYSTEM` из CRA) и свои находки-seed со своего прохода → финальный JSON →
+   общие рендереры CRA. `apply_research_enrichment` машинно переносит критические таблицы в DOCX.
+   URL-инструменты идут subprocess-мостом через `kimi_research_cli.py` — у claude мост живёт
+   внутри MCP-тулов адаптера. Legacy HTTP-режим `KIMI_WRITER_AGENT=0` — только kimi.
+   На Kimi долларовая вилка `[оценка]` не печатается (шлюз цену наружу не отдаёт → итог `$0`,
+   не баг); на Claude стоимость сессий писателя отдаёт SDK и она попадает в итог.
 5. **Гард против болванок:** наружу идут только реальные `.docx` (>5000 байт, проверка в `process()`);
    иначе компания = неуспех.
 
 ### Третья стадия — one-pager (`_onepager_one`, по умолчанию ВКЛ)
 
-НЕ агентная SDK-сессия и НЕ python-рендерер: оркестратор запускает **подпроцесс venv-питона соседней
-папки** — `../lead_orchestrator_kimi/.venv_kimi/Scripts/python.exe onepager_kimi.py <компания>
---industry … --pain … --out <p.pdf>`. Kimi выдаёт самодостаточный HTML → Playwright рендерит PDF.
+НЕ агентная SDK-сессия и НЕ python-рендерер: оркестратор запускает **подпроцесс**
+`onepager_kimi.py <компания> --industry … --pain … --out <p.pdf>` (cwd — соседняя папка).
+Интерпретатор — по runtime: claude — ОСНОВНОЙ python (SDK и playwright там), kimi —
+`.venv_kimi/Scripts/python.exe`. Модель выдаёт самодостаточный HTML → Playwright рендерит PDF.
 
-Почему подпроцесс: `kimi-agent-sdk` тянет `pydantic-core 2.41.5`, а `claude-agent-sdk`/`anthropic`
-требуют `2.46.4` — в одном интерпретаторе не живут. Поэтому Kimi-стадии изолированы в своём venv.
+Почему подпроцесс: изоляция таймаута/kill-tree; а для kimi ещё и venv-барьер —
+`kimi-agent-sdk` тянет `pydantic-core 2.41.5`, а `claude-agent-sdk`/`anthropic` требуют
+`2.46.4` — в одном интерпретаторе не живут.
 
 Блоки листа 1–3, 6, 8 (шапка/герой/фичи/спикер/футер) — **КАНОН**, одинаковы у всех; под заказчика
 пишется только «Одна проблема — одно решение» + подписи метрик. Боль берётся из находок ресёрча
@@ -239,7 +267,7 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
 | `orchestrator.py` | **главный вход ФАЗА 1+2** (asyncio). `_collect` = ФАЗА 1; `_research_one_kimi` = штатный ресёрч+2 .docx; `_research_one` = диспатч (ниже него — legacy Claude); `_onepager_one` = 3-я стадия; `_upload_verified`/`_remote_state`/`_flush_outbox` = устойчивость; `_no_sleep` блокирует сон Windows |
 | `orchestrator_agent.py` | Kimi NL-контроллер: строгий JSON-план → валидация → запуск `orchestrator.py --model kimi` подпроцессом; дефолт count=200 |
 | `kimi_config.py` | единая конфигурация Kimi: ключ, endpoint, модель, `child_env`, Kimi-only guard |
-| `writer_kimi.py` | **штатный писатель двух .docx** и parent-мост пяти enrichment-ролей: сначала отдельный Kimi-процесс делает граф ролей, затем на документ запускается `writer_kimi_agent.py` |
+| `writer_kimi.py` | **штатный писатель двух .docx** и parent-мост пяти enrichment-ролей (оба runtime): выбирает интерпретатор/модели по `kimi_config.runtime()`, сначала отдельный агент-процесс делает граф ролей, затем на документ запускается `writer_kimi_agent.py` |
 | `kimi_research_cli.py` | subprocess-мост URL-инструментов (search/fetch/crawl) из venv Kimi в основной; `--selftest` |
 | `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры.** `PROCESS_MAP_SYSTEM`/`ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля НЕ загружает Claude SDK. Детерминированно дописывает таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
 | `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
@@ -250,7 +278,7 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
 | `connectors/` | `yadisk_client.py` — ядро Яндекс Диска на официальном REST API (stdlib); `yadisk_mcp.py` — MCP-обёртка над ним |
 | `project_env.py` | тихая загрузка `env/.env` в desktop/CLI без печати значений (`ORQ_ENV_FILE` перекрывает путь) |
 | `pipeline.py` | отбор `_select` + сохранение `_save`; его СОБСТВЕННАЯ цепочка `run()` работает только при прямом `py pipeline.py` — оркестратор её не вызывает |
-| `../lead_orchestrator_kimi/` | **изолированные Kimi-агенты** (свой venv): `research_enrichment_agent.py` (пять ролей, schema v3, evidence trace), `writer_kimi_agent.py` (агентный писатель одного документа), `onepager_kimi.py`+`html_to_pdf.py` (3-я стадия), `leadgen_tools.py` (read-only мост). Свой `CLAUDE.md` — читать перед правкой |
+| `../lead_orchestrator_kimi/` | **агенты Фазы 2 для обоих runtime**: `research_enrichment_agent.py` (пять ролей, schema v3, evidence trace), `writer_kimi_agent.py` (агентный писатель одного документа), `claude_kimi_adapter.py` (**Kimi-совместимый `prompt()` поверх Claude Agent SDK**; MCP-тулы Lead* + нативные субагенты; импортировать только основным python), `onepager_kimi.py`+`html_to_pdf.py` (3-я стадия), `leadgen_tools.py` (kosong-тулы kimi-cli). `.venv_kimi` нужен только kimi-runtime. Свой `CLAUDE.md` — читать перед правкой |
 | `web/` | FastAPI + React/Vite. Спавнит `orchestrator.py` подпроцессом и парсит его stdout в SSE; один активный прогон (второй → 409). Свой `README.md` |
 | `Dockerfile` / `docker-compose.yml` | два venv в образе (`/opt/venv` + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен. Сборка = build-gate (см. «Проверка правки») |
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк |
@@ -290,10 +318,11 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
 
 ## Окружение
 
-**Ключи.** `KIMI_API_KEY` → фолбэк `GPLLM_API_KEY` (обязателен). `OFDATA_API_KEY` — для ofdata-пути.
+**Ключи.** Claude-runtime (штат ветки): авторизация — логин Claude Code (`~/.claude`) либо
+`ANTHROPIC_API_KEY`; ключ Kimi не нужен. Kimi-runtime (`ORQ_KIMI_ONLY=1`): `KIMI_API_KEY` →
+фолбэк `GPLLM_API_KEY` (обязателен). `OFDATA_API_KEY` — для ofdata-пути.
 Опционально: `DADATA_TOKEN`, `CHECKO_TOKEN` (+`_ALT`/`_2`/`_3`), `FIRECRAWL_API_KEY`,
-`YANDEX_DISK_TOKEN` (нужен только при `ORQ_STORE=disk`). Anthropic-аутентификация относится только
-к явно включённому legacy-откату.
+`YANDEX_DISK_TOKEN` (нужен только при `ORQ_STORE=disk`).
 
 Секреты живут в gitignored `env/.env` (`.env.example` в репо нет); Docker подключает его через
 `env_file`, в build context папка не попадает.
@@ -315,8 +344,12 @@ Kimi-стадии. Добавил тест — добавь его и в гей�
 только после перезапуска (ярлык открывает свежую консоль).
 
 **Переключатели режима:** `LEAD_SOURCE` (`rusprofile` дефолт | `ofdata` | `checko`),
-`ORQ_STORE` (`local` дефолт | `disk`), `DR_LLM_PROVIDER` (`kimi` дефолт | `claude` — только с `ORQ_KIMI_ONLY=0`),
-`ORQ_KIMI_ONLY` (`1`).
+`ORQ_STORE` (`local` дефолт | `disk`), `ORQ_LLM_RUNTIME` (`claude` дефолт ветки | `kimi`),
+`ORQ_KIMI_ONLY` (`0`; `=1` — полный Kimi-режим, перекрывает всё),
+`DR_LLM_PROVIDER` (по runtime: `claude` | `kimi`; можно перекрыть отдельно).
+**Модели claude-стадий:** `ORQ_WRITER_MODEL` (`opus`), `ORQ_ENRICH_MODEL` (`sonnet`),
+`ORQ_ONEPAGER_MODEL` (`opus`), `ORQ_CONTROLLER_MODEL` (`sonnet`),
+`ORQ_SCOUT_MODEL`/`ORQ_CRITIC_MODEL`/`ORQ_VERIFIER_MODEL` (`sonnet`), `DR_EXTRACT_MODEL` (`sonnet`).
 
 **Портируемость путей** (для Docker/Linux; на Windows работают дефолты): `ORQ_DATA_ROOT` (корень
 служебных папок; в контейнере `/data`), `ORQ_LEADS_DIR` (`D:\лиды` / `/data/leads`),

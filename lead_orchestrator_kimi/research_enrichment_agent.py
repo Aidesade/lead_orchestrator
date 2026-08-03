@@ -1402,10 +1402,21 @@ def _load_checkpoint(path: pathlib.Path | None, request: dict, *, input_hash: st
 
 async def run(request: dict, *, prompt_fn=None) -> dict:
     if prompt_fn is None:
-        try:
-            from kimi_agent_sdk import prompt as prompt_fn
-        except ImportError as exc:
-            raise RuntimeError("research_enrichment_agent надо запускать из .venv_kimi") from exc
+        # Runtime выбирает родитель (writer_kimi.py) через ORQ_LLM_RUNTIME: claude —
+        # Kimi-совместимый адаптер поверх Claude Agent SDK в ОСНОВНОМ окружении,
+        # иначе — прежний kimi_agent_sdk из .venv_kimi. Граф/валидация/чекпойнт общие.
+        if (os.environ.get("ORQ_LLM_RUNTIME") or "").strip().lower() == "claude":
+            try:
+                from claude_kimi_adapter import prompt as prompt_fn
+            except ImportError as exc:
+                raise RuntimeError(
+                    "claude-runtime: research_enrichment_agent надо запускать "
+                    "python'ом основного окружения (claude-agent-sdk)") from exc
+        else:
+            try:
+                from kimi_agent_sdk import prompt as prompt_fn
+            except ImportError as exc:
+                raise RuntimeError("research_enrichment_agent надо запускать из .venv_kimi") from exc
 
     request = dict(request)
     request["_observed_at"] = _now()

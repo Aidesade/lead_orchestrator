@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Писатель двух пресейл-.docx на Kimi.
+"""Писатель двух пресейл-.docx (агентный, runtime kimi|claude).
 
-Kimi по умолчанию тоже АГЕНТ: запускается подпроцессом из изолированного .venv_kimi,
-основной писатель вызывает нативным Task веер scout'ов, verifier'ов и critic. Scout/verifier
-получают read-only поиск/чтение/краул через subprocess-мост в основной venv. Финальный JSON
-возвращается сюда, а .docx рендерят ТЕ ЖЕ функции CRA._write_*_docx. Поэтому несовместимые
-kimi-agent-sdk и claude-agent-sdk не импортируются одним интерпретатором.
+Писатель — АГЕНТ в подпроцессе: основной писатель вызывает веер scout'ов, verifier'ов и
+critic; scout/verifier получают read-only поиск/чтение/краул через subprocess-мост в
+основной venv. Финальный JSON возвращается сюда, а .docx рендерят ТЕ ЖЕ функции
+CRA._write_*_docx. Runtime выбирает kimi_config.runtime():
+
+  * claude (дефолт ветки claude-sdk) — те же скрипты соседней папки запускаются
+    python'ом ОСНОВНОГО окружения; под ними Kimi-совместимый адаптер prompt() поверх
+    Claude Agent SDK (claude_kimi_adapter.py), субагенты — нативные субагенты SDK.
+  * kimi (ORQ_KIMI_ONLY=1) — прежний маршрут: python изолированного .venv_kimi,
+    kimi-agent-sdk, нативный Task. Несовместимые SDK по-прежнему не импортируются
+    одним интерпретатором.
 
 У каждого документа СВОЙ системный промпт (CRA.PROCESS_MAP_SYSTEM / CRA.ROLES_CONTACTS_SYSTEM)
 и СВОИ находки — со своего прохода движка (orchestrator.RESEARCH_PASSES).
 Раньше был один PRESALE_SYSTEM и одни общие находки на оба документа.
 
 Старый одиночный OpenAI-совместимый HTTP-писатель оставлен как явный аварийный режим
-`KIMI_WRITER_AGENT=0`; автоматически на него не откатываемся, иначе поломка субагентов
-молчаливо ухудшила бы качество документов.
+`KIMI_WRITER_AGENT=0` ТОЛЬКО для kimi-runtime; у claude HTTP-режима нет — там всегда
+агент. Автоматически на HTTP не откатываемся, иначе поломка субагентов молчаливо
+ухудшила бы качество документов.
 """
 from __future__ import annotations
 
@@ -52,7 +59,31 @@ KIMI_PY = pathlib.Path(os.environ.get("KIMI_PY") or (
 ))
 KIMI_AGENT_CLI = KIMI_DIR / "writer_kimi_agent.py"
 KIMI_RESEARCH_CLI = KIMI_DIR / "research_enrichment_agent.py"
+ADAPTER_FILE = KIMI_DIR / "claude_kimi_adapter.py"
 RESEARCH_TOOL = HERE / "kimi_research_cli.py"
+
+
+def _runtime() -> str:
+    return KC.runtime()
+
+
+def _agent_python() -> pathlib.Path:
+    """Интерпретатор агентных подпроцессов: claude — ОСНОВНОЙ python (claude-agent-sdk
+    живёт здесь, CLI бандлится в пакет); kimi — python изолированного .venv_kimi."""
+    return pathlib.Path(sys.executable) if _runtime() == "claude" else KIMI_PY
+
+
+def _agent_files_missing(cli: pathlib.Path) -> list[str]:
+    required = [_agent_python(), cli, RESEARCH_TOOL]
+    if _runtime() == "claude":
+        required.append(ADAPTER_FILE)
+    return [str(p) for p in required if not p.is_file()]
+
+
+def _require_provider_key() -> None:
+    """Ключ нужен только kimi-runtime; Claude авторизуется логином Claude Code/ANTHROPIC_*."""
+    if _runtime() != "claude" and not kimi_key():
+        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
 # По умолчанию агенту не ставим общий дедлайн: реальный scout-ресёрч может быть долгим.
 # Положительное значение env возвращает опциональный предохранитель для оператора.
 AGENT_TIMEOUT = float(os.environ.get("KIMI_WRITER_AGENT_TIMEOUT", "0"))
@@ -73,6 +104,11 @@ _AGENT_ENV_ALLOW = frozenset({
     "KIMI_WRITER_MAX_STEPS", "KIMI_WRITER_THINKING", "ORQ_KIMI_TOOL_TIMEOUT",
     "KIMI_RESEARCH_SUBAGENT_MAX_STEPS", "KIMI_RESEARCH_SUBAGENT_ATTEMPTS",
     "KIMI_RESEARCH_CHECKPOINT_TTL_H", "KIMI_TOOL_LOG_DIR",
+    # claude-runtime: авторизация Claude Code/Anthropic и модели стадий.
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_OAUTH_TOKEN",
+    "ORQ_WRITER_MODEL", "ORQ_ENRICH_MODEL",
+    "ORQ_SCOUT_MODEL", "ORQ_CRITIC_MODEL", "ORQ_VERIFIER_MODEL",
 })
 
 
@@ -82,12 +118,21 @@ def kimi_key() -> str:
 
 
 def kimi_model(model: str | None = None) -> str:
-    """Имя модели у провайдера. UI/CLI передаёт 'kimi' — это псевдоним, а не имя модели:
-    реальное имя берём из env (как и стадия one-pager), иначе дефолт."""
+    """Имя модели ПИСАТЕЛЯ у активного провайдера. UI/CLI передаёт псевдоним
+    ('kimi'/'claude') — реальное имя резолвит конфиг; явное имя модели идёт как есть."""
     m = (model or "").strip()
-    if m and m.lower() not in ("kimi", "kimi-writer"):
+    if m and m.lower() not in ("kimi", "kimi-writer", "claude", "claude-writer"):
         return m                                   # явное имя модели передали как есть
+    if _runtime() == "claude":
+        return KC.claude_model("writer")
     return KC.model_name()
+
+
+def _enrich_model(model: str | None) -> str:
+    """Модель пяти enrichment-ролей: у claude свой (дешёвый) тир, у kimi — общая K2.7."""
+    if _runtime() == "claude":
+        return KC.claude_model("enrich")
+    return kimi_model(model)
 
 
 def kimi_base_url() -> str:
@@ -98,18 +143,28 @@ def is_kimi(model: str | None) -> bool:
     return str(model or "").strip().lower().startswith("kimi")
 
 
+def is_claude(model: str | None) -> bool:
+    """Псевдоним claude-runtime текущего пайплайна (НЕ legacy-ветка opus/sonnet)."""
+    return str(model or "").strip().lower() in ("claude", "claude-writer")
+
+
 def _agent_enabled() -> bool:
+    if _runtime() == "claude":
+        return True     # у claude-runtime HTTP-фолбэка нет — только агентный писатель
     return os.environ.get("KIMI_WRITER_AGENT", "1").strip().lower() not in (
         "0", "false", "no", "off", "нет",
     )
 
 
 def _agent_env(api_model: str, share_dir: str) -> dict[str, str]:
-    """Минимальное окружение Kimi-процесса: без токенов Диска/Checko/Dadata/Anthropic."""
+    """Минимальное окружение агентного подпроцесса: без токенов Диска/Checko/Dadata.
+    Для claude-runtime дополнительно проходят ANTHROPIC_*/CLAUDE_CODE_* из allowlist —
+    авторизация Claude; ключи Kimi при этом ему не нужны, но и не мешают."""
     env = {k: v for k, v in os.environ.items() if k.upper() in _AGENT_ENV_ALLOW}
     env["KIMI_API_KEY"] = kimi_key()
     env["KIMI_BASE_URL"] = kimi_base_url()
-    env["KIMI_MODEL_NAME"] = api_model
+    env["KIMI_MODEL_NAME"] = api_model if _runtime() == "kimi" else KC.DEFAULT_MODEL
+    env["ORQ_LLM_RUNTIME"] = _runtime()
     env["PYTHONIOENCODING"] = "utf-8"
     env["ORQ_MAIN_PY"] = sys.executable
     env["ORQ_RESEARCH_TOOL"] = str(RESEARCH_TOOL)
@@ -155,12 +210,11 @@ def _research_stage_sem() -> asyncio.Semaphore:
 async def _ask_agent_json(system: str, user: str, api_model: str, idx: int,
                           label: str, temp_parent: str, company: str = "",
                           inn: str = "") -> tuple[dict, dict]:
-    """Один документ через Kimi Agent SDK + Task-субагентов в отдельном venv."""
-    if not kimi_key():
-        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
-    missing = [str(p) for p in (KIMI_PY, KIMI_AGENT_CLI, RESEARCH_TOOL) if not p.is_file()]
+    """Один документ через агентный SDK (kimi или claude) в отдельном подпроцессе."""
+    _require_provider_key()
+    missing = _agent_files_missing(KIMI_AGENT_CLI)
     if missing:
-        raise RuntimeError("не готовы файлы Kimi Agent writer: " + ", ".join(missing))
+        raise RuntimeError("не готовы файлы агентного writer: " + ", ".join(missing))
 
     with tempfile.TemporaryDirectory(prefix=f"kimi_{label}_", dir=temp_parent) as td:
         share_dir = pathlib.Path(td) / "kimi_share"
@@ -174,7 +228,7 @@ async def _ask_agent_json(system: str, user: str, api_model: str, idx: int,
         spawn = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
                  if os.name == "nt" else {"start_new_session": True})
         proc = await asyncio.create_subprocess_exec(
-            str(KIMI_PY), str(KIMI_AGENT_CLI), str(req), str(result),
+            str(_agent_python()), str(KIMI_AGENT_CLI), str(req), str(result),
             cwd=str(KIMI_DIR), env=_agent_env(api_model, str(share_dir)),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             **spawn,
@@ -222,12 +276,11 @@ async def run_research_subagents(lead: dict, idx: int, seed,
 async def _run_research_subagents_unlocked(lead: dict, idx: int, seed,
                                             temp_parent: str, model: str | None,
                                             checkpoint: str, checkpoint_ttl_h: float) -> dict:
-    if not kimi_key():
-        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
-    missing = [str(p) for p in (KIMI_PY, KIMI_RESEARCH_CLI, RESEARCH_TOOL) if not p.is_file()]
+    _require_provider_key()
+    missing = _agent_files_missing(KIMI_RESEARCH_CLI)
     if missing:
-        raise RuntimeError("не готовы файлы Kimi research-субагентов: " + ", ".join(missing))
-    api_model = kimi_model(model)
+        raise RuntimeError("не готовы файлы research-субагентов: " + ", ".join(missing))
+    api_model = _enrich_model(model)
     name = (lead.get("name") or "").strip()
     inn = str(lead.get("_inn") or "").strip()
     with tempfile.TemporaryDirectory(prefix="kimi_enrichment_", dir=temp_parent) as td:
@@ -242,7 +295,7 @@ async def _run_research_subagents_unlocked(lead: dict, idx: int, seed,
         spawn = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
                  if os.name == "nt" else {"start_new_session": True})
         proc = await asyncio.create_subprocess_exec(
-            str(KIMI_PY), str(KIMI_RESEARCH_CLI), str(req), str(result),
+            str(_agent_python()), str(KIMI_RESEARCH_CLI), str(req), str(result),
             cwd=str(KIMI_DIR), env=_agent_env(api_model, str(share_dir)),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, **spawn,
         )
@@ -659,7 +712,8 @@ def _tokens(usage) -> int:
 async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_roles: str,
                          d_tmp: str, s_tmp: str, model: str | None = None,
                          enrichment: dict | None = None) -> float:
-    """Сделать оба .docx на Kimi. Возвращает стоимость (0.0 — шлюз цену не отдаёт).
+    """Сделать оба .docx активным runtime. Возвращает стоимость: у claude её отдаёт
+    SDK (сумма сессий писателя), у kimi всегда 0.0 — шлюз цену не отдаёт.
 
     У каждого документа СВОЙ системный промпт (PROCESS_MAP_SYSTEM / ROLES_CONTACTS_SYSTEM)
     и СВОИ находки — со своего прохода движка. Раньше был один PRESALE_SYSTEM и одни общие
@@ -683,6 +737,8 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
     use_agent = _agent_enabled()
     client = None if use_agent else _client()
     total_tokens = 0
+    cost = 0.0
+    tag = _runtime()                         # 'kimi' | 'claude' — префикс строк лога
     try:
         for system, title, schema, extra, findings, render, path, label in jobs:
             user = _user_prompt(title, schema, name, inn, findings, extra)
@@ -690,12 +746,13 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
                 payload, meta = await _ask_agent_json(
                     system, user, api_model, idx, label, os.path.dirname(path), name, inn)
                 usage = None
+                cost += float(meta.get("cost_usd") or 0.0)
                 sub = meta.get("subagents") or {}
-                print(f"    [{idx}] [kimi:{label}] субагенты: "
+                print(f"    [{idx}] [{tag}:{label}] субагенты: "
                       f"scout={sub.get('scout', 0)}, critic={sub.get('critic', 0)}, "
                       f"verifier={sub.get('verifier', 0)}")
                 web = meta.get("web_tools") or {}
-                print(f"    [{idx}] [kimi:{label}] прямой веб: "
+                print(f"    [{idx}] [{tag}:{label}] прямой веб: "
                       f"search={web.get('LeadSearch', 0)}, fetch={web.get('LeadFetch', 0)}, "
                       f"crawl={web.get('LeadCrawl', 0)}")
             else:
@@ -714,13 +771,14 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
                           f"({type(exc).__name__}: {str(exc)[:120]}); документ ролей — без них")
             await asyncio.to_thread(render, dict(payload), path)
             mode = "agent" if use_agent else "legacy-http"
-            print(f"    [{idx}] → kimi:{label} сохранён ({api_model}, {mode})")
+            print(f"    [{idx}] → {tag}:{label} сохранён ({api_model}, {mode})")
     finally:
         if client is not None:
             await client.close()
 
     if use_agent:
-        print(f"    [{idx}] [kimi] агентный писатель завершён ({api_model})")
+        price = f", ~${cost:.2f}" if cost else ""
+        print(f"    [{idx}] [{tag}] агентный писатель завершён ({api_model}{price})")
     else:
-        print(f"    [{idx}] [kimi] legacy HTTP: {total_tokens} токенов ({api_model})")
-    return 0.0          # gpllmkeeper цену за вызов не возвращает — считать нечего
+        print(f"    [{idx}] [{tag}] legacy HTTP: {total_tokens} токенов ({api_model})")
+    return cost          # kimi: 0.0 — gpllmkeeper цену за вызов не возвращает

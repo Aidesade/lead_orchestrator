@@ -28,10 +28,12 @@ r"""
 
 Chrome при сборе по умолчанию СКРЫТ (окно не открывается); показать — --show-browser.
 
-Штатный боевой режим — Kimi-only: controller, deep-research extract, enrichment-роли,
-оба DOCX-писателя и one-pager используют KIMI_MODEL_NAME через KIMI_API_KEY
-(fallback GPLLM_API_KEY). Доступ к Диску — env YANDEX_DISK_TOKEN.
-dry-run не требует ничего сверх stdlib.
+Штатный боевой режим ветки claude-sdk — генератор на Claude Agent SDK: controller,
+deep-research extract, enrichment-роли, оба DOCX-писателя и one-pager работают через
+claude-agent-sdk основного окружения (авторизация — логин Claude Code/ANTHROPIC_API_KEY).
+Pipeline тот же, что у Kimi-runtime; прежний полный Kimi-режим возвращается
+ORQ_KIMI_ONLY=1 (ключ KIMI_API_KEY, fallback GPLLM_API_KEY).
+Доступ к Диску — env YANDEX_DISK_TOKEN. dry-run не требует ничего сверх stdlib.
 """
 import argparse
 import asyncio
@@ -141,6 +143,9 @@ def _crawl_sem():
 _KIMI_ENV_ALLOW = frozenset((
     # Ради чего стадия и запускается.
     "KIMI_API_KEY", "KIMI_BASE_URL", "KIMI_MODEL_NAME",
+    # claude-runtime: авторизация Claude Code/Anthropic и модель стадии.
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CODE_OAUTH_TOKEN", "ORQ_ONEPAGER_MODEL",
     # Python и кодировки. PYTHONPATH намеренно НЕ пропускаем: он подмешал бы site-packages
     # основного venv в интерпретатор Kimi — а это ровно тот конфликт pydantic-core, из-за
     # которого venv и разведены.
@@ -174,6 +179,7 @@ def _kimi_env():
     env["KIMI_API_KEY"] = _kimi_key()
     env["KIMI_BASE_URL"] = KC.base_url()
     env["KIMI_MODEL_NAME"] = KC.model_name()
+    env["ORQ_LLM_RUNTIME"] = KC.runtime()      # claude|kimi — выбирает ветку в onepager_kimi
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -232,7 +238,10 @@ async def _person_enrichment_block(lead, idx, enabled=True):
 
 
 async def _research_one_kimi(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
-    """Полный штатный research/write-маршрут без импорта Claude SDK."""
+    """Полный ШТАТНЫЙ research/write-маршрут (текущий pipeline) для обоих runtime:
+    движок двумя проходами -> person_enrich -> граф пяти enrichment-ролей -> агентный
+    писатель на документ. SDK под стадиями выбирает kimi_config.runtime(); в claude-режиме
+    Claude Agent SDK живёт в подпроцессах агентов, а не в этом интерпретаторе."""
     import deep_research_engine as DRE
     import writer_kimi as WK
 
@@ -328,6 +337,12 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
         raise RuntimeError(
             "Claude/Anthropic отключён: _research_one принимает только model='kimi'")
     if WK.is_kimi(model):
+        return await _research_one_kimi(
+            lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
+    if WK.is_claude(model):
+        # Тот же текущий pipeline, но стадии работают на Claude Agent SDK (штат ветки).
+        # Ниже по файлу остаётся ДРУГАЯ архитектура — legacy «агент ресёрчит сам»,
+        # достижимая только явным именем модели (opus/sonnet) при ORQ_KIMI_ONLY=0.
         return await _research_one_kimi(
             lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
 
@@ -556,17 +571,23 @@ def _presentation_prereqs():
     """Готовность стадии one-pager. Возвращает (ok: bool, reason: str).
     reason — человекочитаемая русская причина пропуска (пусто при ok=True).
     Деградируем мягко: НИКОГДА не валим компанию — просто пропускаем стадию (два .docx делаются).
-      - соседняя папка lead_orchestrator_kimi со своим venv (kimi-agent-sdk + playwright);
-      - фото спикера (вшивается в PDF data-URI);
-      - ключ провайдера Kimi (KIMI_API_KEY или GPLLM_API_KEY)."""
+      - CLI стадии в соседней папке lead_orchestrator_kimi + фото спикера;
+      - claude-runtime: claude-agent-sdk в ОСНОВНОМ окружении (venv/ключ Kimi не нужны);
+      - kimi-runtime: venv Kimi и ключ провайдера (KIMI_API_KEY или GPLLM_API_KEY)."""
     if not os.path.isfile(KIMI_CLI):
         return False, f"нет {KIMI_CLI} (стадия one-pager живёт в соседней папке lead_orchestrator_kimi)"
+    if not os.path.exists(PHOTO_PNG):
+        return False, "нет assets/bulat_zamaliev.png (фото спикера для one-pager)"
+    if KC.runtime() == "claude":
+        try:
+            import claude_agent_sdk  # noqa: F401 — стадия пойдёт этим же интерпретатором
+        except ImportError:
+            return False, "claude-agent-sdk не установлен в основном окружении (pip install -r requirements.txt)"
+        return True, ""
     if not os.path.isfile(KIMI_PY):
         return False, (f"нет venv Kimi: {KIMI_PY} "
                        "(создай: py -m venv .venv_kimi && .venv_kimi\\Scripts\\python.exe -m pip "
                        "install kimi-agent-sdk playwright — и применить патчи, см. CLAUDE.md той папки)")
-    if not os.path.exists(PHOTO_PNG):
-        return False, "нет assets/bulat_zamaliev.png (фото спикера для one-pager)"
     if not _kimi_key():
         return False, "не задан ключ Kimi (KIMI_API_KEY или GPLLM_API_KEY)"
     return True, ""
@@ -605,7 +626,10 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
     industry = DO.industry_folder(lead) if hasattr(DO, "industry_folder") else (lead.get("niche") or "")
     pain = _main_pain(findings)
 
-    cmd = [KIMI_PY, KIMI_CLI, h["company_name"], "--out", p_tmp]
+    # claude-runtime исполняет тот же CLI основным python'ом (SDK и playwright там);
+    # kimi-runtime — прежним python'ом изолированного .venv_kimi.
+    stage_py = sys.executable if KC.runtime() == "claude" else KIMI_PY
+    cmd = [stage_py, KIMI_CLI, h["company_name"], "--out", p_tmp]
     if industry:
         cmd += ["--industry", industry]
     if pain:
@@ -1168,9 +1192,10 @@ async def main():
     ap.add_argument("--account", default=None)
     ap.add_argument("--workers", type=int, default=2,
                     help="параллельных Kimi-ресёрчей; при нехватке RAM авто-снижается до 1")
-    ap.add_argument("--model", default="kimi",
-                    help="писатель двух .docx: штатно только kimi; точный ID берётся из "
-                         "KIMI_MODEL_NAME (дефолт kimi-k2.7-code)")
+    ap.add_argument("--model", default=KC.default_model_flag(),
+                    help="runtime писателя двух .docx: 'claude' (штат ветки, Claude Agent SDK; "
+                         "модели стадий — ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL и т.д.) или 'kimi' "
+                         "(точный ID из KIMI_MODEL_NAME, дефолт kimi-k2.7-code)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
     ap.add_argument("--redo", action="store_true",
@@ -1202,6 +1227,23 @@ async def main():
         a.model = "kimi"
         KC.ensure_env(require_key=not a.dry_run)
         print(f"[LLM] Kimi-only: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
+    else:
+        # Runtime на прогон определяет флаг --model: kimi* -> kimi (нужен ключ шлюза),
+        # всё остальное -> claude. Дочерние процессы наследуют выбор через env.
+        flag_runtime = "kimi" if str(a.model or "").strip().lower().startswith("kimi") else "claude"
+        os.environ["ORQ_LLM_RUNTIME"] = flag_runtime
+        if flag_runtime == "kimi":
+            os.environ["DR_LLM_PROVIDER"] = "kimi"
+        else:
+            os.environ.setdefault("DR_LLM_PROVIDER", "claude")
+        KC.ensure_env(require_key=not a.dry_run)
+        if flag_runtime == "claude":
+            print(f"[LLM] Claude Agent SDK: писатель={KC.claude_model('writer')}, "
+                  f"роли={KC.claude_model('enrich')}, one-pager={KC.claude_model('onepager')}, "
+                  f"extract={os.environ.get('DR_EXTRACT_MODEL', 'sonnet')} "
+                  f"(DR_LLM_PROVIDER={os.environ.get('DR_LLM_PROVIDER')})")
+        else:
+            print(f"[LLM] Kimi runtime: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
     # Копия ВСЕГО вывода (stdout+stderr, включая трейсбеки) в файл: диагноз упавшего
     # прогона не должен зависеть от того, сохранил ли кто-то консоль.
     try:
@@ -1289,7 +1331,8 @@ async def main():
             print(f"[onepager] стадия отключена: {why_pp}. Два .docx делаются как обычно.")
             gen_pdf = False
         else:
-            print("[onepager] стадия включена: по каждой компании будет one-pager .pdf (Kimi).")
+            print("[onepager] стадия включена: по каждой компании будет one-pager .pdf "
+                  f"({'Kimi' if KC.runtime() == 'kimi' else 'Claude'}).")
     # Транзитная рабочая папка. Файлы здесь ВРЕМЕННЫЕ: после заливки на Я.Диск папка удаляется
     # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места);
     # если D: нет — системный %TEMP%.
@@ -1320,9 +1363,11 @@ async def main():
     # поэтому не сериализуем его намертво, но и не даём разойтись: каждая стадия = свой chromium.
     pdf_sem = asyncio.Semaphore(max(1, int(os.environ.get("ORQ_ONEPAGER_CONCURRENCY", "2"))))
     min_ram = float(os.environ.get("ORQ_MIN_RAM_GB", "2.5"))
-    # Kimi writer с веером Task-субагентов может работать дольше 30 минут; по умолчанию
-    # не обрываем его внешним дедлайном. Для Claude сохраняем прежний предохранитель.
-    default_research_timeout = "0" if WK.is_kimi(a.model) else "1800"
+    # Агентный писатель с веером субагентов может работать дольше 30 минут; в текущем
+    # pipeline (kimi и claude) общий дедлайн по умолчанию не ставим — у стадий свои
+    # таймауты. Прежний предохранитель 1800с остаётся только для legacy-архитектуры.
+    default_research_timeout = ("0" if (WK.is_kimi(a.model) or WK.is_claude(a.model))
+                                else "1800")
     research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", default_research_timeout))
     pdf_timeout = float(os.environ.get("ORQ_ONEPAGER_TIMEOUT", "900"))        # сек на попытку one-pager
 

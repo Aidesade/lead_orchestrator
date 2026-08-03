@@ -89,12 +89,14 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator_kimi/onepager_kimi.py \
        lead_orchestrator_kimi/writer_kimi_agent.py \
        lead_orchestrator_kimi/research_enrichment_agent.py \
+       lead_orchestrator_kimi/claude_kimi_adapter.py \
        lead_orchestrator_kimi/leadgen_tools.py \
        lead_orchestrator_kimi/html_to_pdf.py \
     && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
     && python lead_orchestrator/test_source_ofdata.py \
     && python lead_orchestrator/test_rusprofile_playwright.py \
     && python lead_orchestrator/test_kimi_only.py \
+    && python lead_orchestrator/test_claude_runtime.py \
     && python lead_orchestrator/test_kimi_agent_freedom.py \
     && python lead_orchestrator/test_research_enrichment.py \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/patches/apply_patches.py --check \
@@ -106,9 +108,10 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
 VOLUME ["/data"]
 # Дефолты именно ДЛЯ КОНТЕЙНЕРА (в конце — чтобы не инвалидировать дорогие слои apt/pip):
 #   LEAD_SOURCE=ofdata    — сбор ФАЗЫ 1 через OfData API (в образе нет Chrome под RusProfile);
-#   DR_LLM_PROVIDER=kimi  — LLM-экстракт движка ресёрча через Kimi -> весь пайплайн без Anthropic.
-# Те же Kimi-only дефолты действуют и локально; контейнер дополнительно переключает источник
-# лидов на OfData, потому что Chrome под RusProfile из образа удалён.
+#   ORQ_KIMI_ONLY=1       — контейнер ОСТАЁТСЯ на Kimi-runtime: claude-runtime требует
+#                           авторизации Anthropic (логин Claude Code недоступен headless;
+#                           нужен ANTHROPIC_API_KEY в env/.env + ORQ_KIMI_ONLY=0 осознанно).
+# Локальный desktop-дефолт ветки — наоборот, claude (см. run_kimi_orchestrator.cmd).
 ENV LEAD_SOURCE=ofdata \
     DR_LLM_PROVIDER=kimi \
     ORQ_KIMI_ONLY=1 \

@@ -58,15 +58,24 @@ async def industries() -> List[Dict[str, Any]]:
 
 @app.get("/api/models")
 async def models() -> List[Dict[str, Any]]:
-    """Модели ПИСАТЕЛЯ двух .docx (флаг --model).
+    """Runtime ПИСАТЕЛЯ двух .docx (флаг --model): claude (штат ветки) и kimi.
 
-    `kimi` — псевдоним: конкретное имя модели берётся из единого KIMI_MODEL_NAME.
-    У Kimi другой биллинг: цену за вызов шлюз наружу не отдаёт, поэтому вилку «$N–$2N»
-    (она верна только для Claude-сессий) UI на нём не показывает.
+    `claude`/`kimi` — псевдонимы: конкретные модели резолвит kimi_config
+    (ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL или единый KIMI_MODEL_NAME). У Kimi биллинг
+    провайдера: цену за вызов шлюз наружу не отдаёт; у Claude стоимость отдаёт SDK.
     """
-    import writer_kimi as _wk                  # лежит в пакете оркестратора (sys.path уже добавлен в leads.py)
-    return [{"id": "kimi", "label": f"Kimi ({_wk.kimi_model('kimi')})",
-             "billing": "provider", "default": True}]
+    import kimi_config as _kc                  # лежит в пакете оркестратора (sys.path уже добавлен в leads.py)
+    default = _kc.default_model_flag()
+    items = [
+        {"id": "claude",
+         "label": f"Claude Agent SDK ({_kc.claude_model('writer')}+{_kc.claude_model('enrich')})",
+         "billing": "sdk", "default": default == "claude"},
+        {"id": "kimi", "label": f"Kimi ({_kc.DEFAULT_MODEL})",
+         "billing": "provider", "default": default == "kimi"},
+    ]
+    if _kc.kimi_only():                        # аварийный полный Kimi-режим: выбор один
+        return [item for item in items if item["id"] == "kimi"]
+    return items
 
 
 @app.get("/api/regions")
@@ -158,7 +167,7 @@ class RunParams(BaseModel):
     min_revenue: float = 1e9
     regions: List[str] = Field(default_factory=list)
     exclude_regions: List[str] = Field(default_factory=list)
-    model: Literal["kimi"] = "kimi"
+    model: Literal["kimi", "claude", ""] = ""  # пусто -> runtime-дефолт ветки (build_argv)
     workers: int = 2
     out: str = ""
     base: str = ""

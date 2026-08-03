@@ -83,23 +83,58 @@ def _tool_subject(call) -> str:
     return "?"
 
 
-async def run_agent(request: dict) -> dict:
+def _claude_runtime() -> bool:
+    return (os.environ.get("ORQ_LLM_RUNTIME") or "").strip().lower() == "claude"
+
+
+def _prompt_fn():
+    """SDK выбирает родитель (writer_kimi.py) через ORQ_LLM_RUNTIME; интерфейс общий."""
+    if _claude_runtime():
+        try:
+            from claude_kimi_adapter import prompt
+        except ImportError as exc:
+            raise RuntimeError(
+                "claude-runtime: writer_kimi_agent надо запускать python'ом "
+                "основного окружения (claude-agent-sdk)") from exc
+        return prompt
     try:
         from kimi_agent_sdk import prompt
     except ImportError as exc:
         raise RuntimeError("writer_kimi_agent надо запускать python из .venv_kimi") from exc
+    return prompt
+
+
+# Врезка режима: у kimi Task вместо Agent, у claude нет WebSearch/WebFetch. В обоих
+# runtime деливерабл один — финальный JSON-объект, который рендерит родительский процесс.
+_MODE_NOTE_KIMI = (
+    "===== РЕЖИМ KIMI AGENT =====\n"
+    "Инструкции выше могли называть Claude-инструмент Agent и save_*_docx. Здесь их нет. "
+    "Вместо Agent используй Task с ролями scout/critic/verifier. Вместо save_* финальным "
+    "деливераблом является один JSON-объект: его отрендерит родительский процесс. "
+    "Сам решай, сколько scout нужно и как разделить направления; независимые задачи запускай "
+    "параллельно. До финала обязательно вызови critic по черновому JSON. Для спорных фактов "
+    "и каждого заявленного ЛПР вызывай verifier."
+)
+_MODE_NOTE_CLAUDE = (
+    "===== РЕЖИМ CLAUDE AGENT =====\n"
+    "Инструкции выше могли называть WebSearch/WebFetch и save_*_docx. Здесь их нет: веб "
+    "открывай инструментами LeadSearch/LeadFetch/LeadCrawl, субагентов scout/critic/verifier "
+    "вызывай инструментом Agent. Вместо save_* финальным деливераблом является один "
+    "JSON-объект: его отрендерит родительский процесс. Сам решай, сколько scout нужно и как "
+    "разделить направления; независимые задачи запускай параллельно. До финала обязательно "
+    "вызови critic по черновому JSON. Для спорных фактов и каждого заявленного ЛПР вызывай "
+    "verifier."
+)
+
+
+async def run_agent(request: dict, prompt_fn=None) -> dict:
+    prompt = prompt_fn or _prompt_fn()
 
     model = request.get("model") or os.environ.get("KIMI_MODEL_NAME")
     full_input = (
         f"{request['system']}\n\n"
-        "===== РЕЖИМ KIMI AGENT =====\n"
-        "Инструкции выше могли называть Claude-инструмент Agent и save_*_docx. Здесь их нет. "
-        "Вместо Agent используй Task с ролями scout/critic/verifier. Вместо save_* финальным "
-        "деливераблом является один JSON-объект: его отрендерит родительский процесс. "
-        "Сам решай, сколько scout нужно и как разделить направления; независимые задачи запускай "
-        "параллельно. До финала обязательно вызови critic по черновому JSON. Для спорных фактов "
-        "и каждого заявленного ЛПР вызывай verifier.\n\n"
-        "===== ЗАДАНИЕ И ДАННЫЕ =====\n\n"
+        + (_MODE_NOTE_CLAUDE if _claude_runtime() else _MODE_NOTE_KIMI)
+        + "\n\n===== ЗАДАНИЕ И ДАННЫЕ =====\n\n"
         f"{request['user']}"
     )
 
@@ -154,20 +189,43 @@ async def run_agent(request: dict) -> dict:
             final_text = text
 
     if counts["critic"] < 1:
-        raise RuntimeError("Kimi-писатель не вызвал critic перед финалом")
+        raise RuntimeError("писатель не вызвал critic перед финалом")
     if not final_text:
-        raise RuntimeError("Kimi-писатель не вернул финальный текст")
+        raise RuntimeError("писатель не вернул финальный текст")
 
-    return {
+    result = {
         "payload": _extract_json(final_text),
         "subagents": counts,
         "web_tools": web_counts,
         "parallel_scout": parallel_scout,
         "model": model or "",
     }
+    if _claude_runtime():
+        # Стоимость сессии отдаёт сам SDK — в отличие от шлюза Kimi.
+        import claude_kimi_adapter
+        result["cost_usd"] = float(claude_kimi_adapter.LAST_COST.get("usd") or 0.0)
+    return result
 
 
 def selftest() -> int:
+    if _claude_runtime():
+        # Основное окружение: те же yaml/md проверяются адаптером Claude Agent SDK.
+        import claude_kimi_adapter as adapter
+
+        spec = adapter.load_spec(AGENT_FILE)
+        assert spec["lead_tools"] == ["LeadSearch", "LeadFetch", "LeadCrawl"]
+        assert spec["wants_subagents"]
+        assert set(spec["subagents"]) == {"scout", "critic", "verifier"}
+        for role, sub in spec["subagents"].items():
+            child = adapter.load_spec(sub["path"])
+            if role in ("scout", "verifier"):
+                assert {"LeadSearch", "LeadFetch"} <= set(child["lead_tools"]), role
+            else:
+                assert child["lead_tools"] == [], role
+        assert _extract_json('до ```json\n{"ok": true}\n``` после') == {"ok": True}
+        print("selftest passed: writer + scout/critic/verifier specs (claude adapter)")
+        return 0
+
     from kimi_cli.agentspec import load_agent_spec
 
     spec = load_agent_spec(AGENT_FILE)

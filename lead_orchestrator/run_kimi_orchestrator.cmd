@@ -1,15 +1,18 @@
 @echo off
 rem ==========================================================================
-rem  kimi_orchestrator - full lead-gen chain (PHASE 1 + PHASE 2).
+rem  lead orchestrator - full lead-gen chain (PHASE 1 + PHASE 2).
 rem    Double-click       -> interactive agent (talk to it in Russian).
 rem    With a request arg -> one-shot, e.g.:
 rem        run_kimi_orchestrator.cmd "collect 10 mining, dry-run"
 rem
-rem  Every LLM stage uses the SAME Kimi K2.7 key/model:
+rem  Branch claude-sdk: default LLM runtime is CLAUDE AGENT SDK (main python,
+rem  auth = Claude Code login / ANTHROPIC_API_KEY). Same pipeline as before:
 rem    NL controller + deep research extract + five research roles +
 rem    two DOCX writers + one-pager PDF.
+rem  Set ORQ_KIMI_ONLY=1 (or ORQ_LLM_RUNTIME=kimi) to get the previous
+rem  Kimi K2.7 runtime end to end (needs KIMI_API_KEY / GPLLM_API_KEY).
 rem
-rem  Per company: 2 neutral .docx + one-pager .pdf, all on Kimi -> storage.
+rem  Per company: 2 neutral .docx + one-pager .pdf -> storage.
 rem  Chrome during scraping is HIDDEN (offscreen).
 rem  NOTE: keep this file ASCII + CRLF - cmd.exe garbles UTF-8/LF batch files.
 rem ==========================================================================
@@ -31,22 +34,40 @@ if errorlevel 1 (
 
 if /I "%~1"=="oil28" goto oil28
 
-rem --- Single Kimi runtime. Key: KIMI_API_KEY, fallback GPLLM_API_KEY ---
+rem --- Runtime selection: claude is the branch default, kimi is the explicit fallback ---
+if not defined ORQ_KIMI_ONLY set "ORQ_KIMI_ONLY=0"
+if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=claude"
+if /I "%ORQ_KIMI_ONLY%"=="1" set "ORQ_LLM_RUNTIME=kimi"
+
+rem Kimi endpoint defaults stay exported: harmless for claude, required for kimi.
 if not defined KIMI_API_KEY set "KIMI_API_KEY=%GPLLM_API_KEY%"
 if not defined KIMI_BASE_URL set "KIMI_BASE_URL=https://gpllmkeeper.dtc.tatar/v1"
 if not defined KIMI_MODEL_NAME set "KIMI_MODEL_NAME=kimi-k2.7-code"
 if not defined LEAD_SOURCE set "LEAD_SOURCE=rusprofile"
 if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
 if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\env\rusprofile_cookies.json"
-set "DR_LLM_PROVIDER=kimi"
-set "ORQ_KIMI_ONLY=1"
+if /I "%ORQ_LLM_RUNTIME%"=="kimi" (
+    set "DR_LLM_PROVIDER=kimi"
+) else (
+    if not defined DR_LLM_PROVIDER set "DR_LLM_PROVIDER=claude"
+)
 
+if /I not "%ORQ_LLM_RUNTIME%"=="kimi" goto runtime_ready
 "%ORQ_MAIN_PY%" -c "import sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();import kimi_config as k;raise SystemExit(0 if k.api_key() else 1)" >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] No KIMI_API_KEY or GPLLM_API_KEY in "%~dp0..\env\.env" or environment.
     echo         Add the key there; the env folder is Git-ignored.
     exit /b 7
 )
+:runtime_ready
+if /I not "%ORQ_LLM_RUNTIME%"=="claude" goto claude_ready
+"%ORQ_MAIN_PY%" -c "import claude_agent_sdk" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] claude-agent-sdk is missing in %ORQ_MAIN_PY%.
+    echo         Install project requirements: pip install -r requirements.txt
+    exit /b 7
+)
+:claude_ready
 if /I "%LEAD_SOURCE%"=="ofdata" (
     "%ORQ_MAIN_PY%" -c "import os,sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();raise SystemExit(0 if os.environ.get('OFDATA_API_KEY') else 1)" >nul 2>&1
     if errorlevel 1 (
@@ -69,7 +90,7 @@ if /I "%LEAD_SOURCE%"=="rusprofile" (
     )
 )
 
-title Kimi K2.7 Lead Orchestrator - end to end
+title Lead Orchestrator [%ORQ_LLM_RUNTIME%] - end to end
 "%ORQ_MAIN_PY%" "%~dp0orchestrator_agent.py" %*
 echo.
 echo --- agent finished, press any key to close ---

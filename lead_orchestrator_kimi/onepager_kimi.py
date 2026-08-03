@@ -183,6 +183,41 @@ _AGENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "kimi_agent", "onepager.yaml")
 
 
+async def _generate_html_claude(user_content, model=None):
+    """Claude-runtime той же стадии: ONEPAGER_SYSTEM + контент -> HTML-текст ответа.
+
+    Агент без тулов, как и kimi-вариант: стадия чисто текстовая. Запускается
+    python'ом ОСНОВНОГО окружения (claude-agent-sdk там; CLI бандлится в пакет)."""
+    try:
+        from claude_agent_sdk import (AssistantMessage, ClaudeAgentOptions,
+                                      ResultMessage, TextBlock, query)
+    except ImportError as e:
+        raise RuntimeError(
+            "claude-agent-sdk не установлен: claude-runtime one-pager запускается "
+            "python'ом основного окружения") from e
+
+    model = model or os.environ.get("ORQ_ONEPAGER_MODEL") or "opus"
+    options = ClaudeAgentOptions(
+        model=model, system_prompt=ONEPAGER_SYSTEM, max_turns=1,
+        allowed_tools=[],
+        disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit",
+                          "WebSearch", "WebFetch", "Read", "Glob", "Grep"],
+        permission_mode="bypassPermissions", setting_sources=[])
+    text = ""
+    async for message in query(prompt=user_content, options=options):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    text += block.text
+        elif isinstance(message, ResultMessage):
+            if message.is_error:
+                raise RuntimeError(
+                    f"Claude one-pager завершился ошибкой: {message.subtype}")
+            if message.result:
+                text = message.result
+    return text.strip()
+
+
 async def generate_onepager_html(user_content, model=None, thinking=False):
     """Вызвать Kimi по ONEPAGER_SYSTEM -> вернуть HTML-текст ответа.
 
@@ -191,7 +226,12 @@ async def generate_onepager_html(user_content, model=None, thinking=False):
     agent_file/config), поэтому системную инструкцию кладём префиксом в user_input —
     работает независимо от механизма; при желании можно вынести в agent_file.
     Проверено вживую: kimi_agent_sdk импортится (после локального патча venv, см. README),
-    Message.extract_text() существует. Не хватает только endpoint провайдера для прогона."""
+    Message.extract_text() существует. Не хватает только endpoint провайдера для прогона.
+
+    При ORQ_LLM_RUNTIME=claude тот же контент уходит в Claude Agent SDK — контракт CLI
+    (аргументы, exit-коды, файл по --out) не меняется."""
+    if (os.environ.get("ORQ_LLM_RUNTIME") or "").strip().lower() == "claude":
+        return await _generate_html_claude(user_content, model=model)
     try:
         from kimi_agent_sdk import prompt   # [СВЕРИТЬ] точка входа
     except ImportError as e:
