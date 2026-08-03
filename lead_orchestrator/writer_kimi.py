@@ -705,7 +705,13 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
             # Рендер ждёт org_name: модель иногда кладёт company/название в другое поле.
             payload.setdefault("org_name", name)
             if label == "роли":
-                apply_research_enrichment(payload, enrichment)
+                # Обогащение — «улучшайзер» payload; его сбой НЕ должен ронять документ:
+                # роли всё равно отрендерятся из находок движка (мягкая деградация).
+                try:
+                    apply_research_enrichment(payload, enrichment)
+                except Exception as exc:                 # noqa: BLE001
+                    print(f"    [{idx}] enrichment-таблицы не применены "
+                          f"({type(exc).__name__}: {str(exc)[:120]}); документ ролей — без них")
             await asyncio.to_thread(render, dict(payload), path)
             mode = "agent" if use_agent else "legacy-http"
             print(f"    [{idx}] → kimi:{label} сохранён ({api_model}, {mode})")

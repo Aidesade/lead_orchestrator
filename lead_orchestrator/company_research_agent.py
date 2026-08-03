@@ -334,32 +334,94 @@ def _title_block(doc, Pt, RGBColor, title, subtitles, meta):
         vr.font.color.rgb = GRAY
 
 
+# --- Устойчивость рендера к форме ответа модели ----------------------------
+# Kimi/LLM под схему возвращает JSON, но форму соблюдает не всегда: массив
+# объектов может прийти списком СТРОК, список пунктов — одной строкой, текстовое
+# поле — списком. Рендер таблиц зовёт r.get(...) на каждом элементе, и ОДНА
+# строка вместо объекта роняла AttributeError('str' has no attribute 'get') —
+# а с ним весь документ и оба .docx, хотя агент уже отработал. Три хелпера ниже
+# приводят данные к ожидаемой форме БЕЗ потери фактуры, поэтому .docx создаётся
+# всегда, даже когда модель немного отклонилась от схемы.
+def _text(value) -> str:
+    """Любое значение поля -> строка. list/tuple объединяются, None -> ''."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "; ".join(_text(v) for v in value if v not in (None, ""))
+    if isinstance(value, dict):
+        return "; ".join(_text(v) for v in value.values() if v not in (None, ""))
+    return str(value)
+
+
+def _rows(items, primary=None):
+    """Массив строк таблицы -> список dict-ов, устойчиво к форме от LLM.
+
+    Строку/скаляр не теряем, а кладём в главную колонку primary; не-список
+    оборачиваем; None/пустые выкидываем. Возврат гарантированно из dict-ов —
+    последующий r.get(...) безопасен.
+    """
+    if isinstance(items, dict):
+        items = [items]
+    elif not isinstance(items, (list, tuple)):
+        items = [items] if items else []
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            out.append(it)
+        elif it is None:
+            continue
+        else:
+            s = _text(it).strip()
+            if s:
+                out.append({primary: s} if primary else {})
+    return out
+
+
+def _items(seq):
+    """Массив пунктов -> список НЕпустых строк: 'строка вместо списка' и
+    не-строковые элементы больше не роняют _bullet/_para."""
+    if isinstance(seq, str):
+        seq = [seq]
+    elif not isinstance(seq, (list, tuple)):
+        seq = [seq] if seq else []
+    out = []
+    for it in seq:
+        s = _text(it).strip()
+        if s:
+            out.append(s)
+    return out
+
+
 def _h(doc, text, level=1):
-    return doc.add_heading(text, level=level)
+    return doc.add_heading(_text(text) or " ", level=level)
 
 
 def _para(doc, Pt, text):
-    p = doc.add_paragraph(text or "")
+    p = doc.add_paragraph(_text(text))
     p.paragraph_format.space_after = Pt(3)
     return p
 
 
 def _bullet(doc, Pt, text):
     """Пункт списка; жирная лид-метка до первого ':' либо '—'."""
+    text = _text(text)
     p = doc.add_paragraph(style="List Bullet")
     p.paragraph_format.space_after = Pt(2)
-    m = re.match(r"^(.*?[:—])(\s*)(.*)$", text or "", re.DOTALL)
+    m = re.match(r"^(.*?[:—])(\s*)(.*)$", text, re.DOTALL)
     if m:
         p.add_run(m.group(1)).bold = True
         if m.group(3):
             p.add_run(" " + m.group(3))
     else:
-        p.add_run(text or "")
+        p.add_run(text)
     return p
 
 
 def _labeled(doc, Pt, label, text):
     """Абзац вида «As-is: ...» — жирная метка, дальше обычный текст."""
+    text = _text(text)
     if not text:
         return
     p = doc.add_paragraph()
@@ -494,31 +556,31 @@ def _write_process_map_docx(payload: dict, path: str = None) -> str:
 
     if payload.get("tldr"):
         _h(doc, "Краткое резюме (TL;DR)", 1)
-        for b in payload["tldr"]:
+        for b in _items(payload.get("tldr")):
             _bullet(doc, Pt, b)
 
     if payload.get("key_findings"):
         _h(doc, "Ключевые выводы", 1)
-        for b in payload["key_findings"]:
+        for b in _items(payload.get("key_findings")):
             _bullet(doc, Pt, b)
 
     _h(doc, "1. Профиль компании", 1)
     _table(doc, Pt, ["Параметр", "Значение", "Источник"],
            [[r.get("param", ""), r.get("value", ""), r.get("source", "")]
-            for r in (payload.get("profile_table") or [])])
+            for r in _rows(payload.get("profile_table"), "value")])
     if payload.get("financials"):
         _h(doc, "Финансовые показатели", 2)
-        for b in payload["financials"]:
+        for b in _items(payload.get("financials")):
             _bullet(doc, Pt, b)
     if payload.get("structure_qc"):
         _h(doc, "Филиалы, структура и контроль качества", 2)
-        for b in payload["structure_qc"]:
+        for b in _items(payload.get("structure_qc")):
             _para(doc, Pt, b)
     if payload.get("contracts_table"):
         _h(doc, "Ключевые госконтракты", 2)
         _table(doc, Pt, ["Год", "Предмет", "Сумма", "Источник"],
                [[r.get("year", ""), r.get("subject", ""), r.get("amount", ""), r.get("source", "")]
-                for r in payload["contracts_table"]])
+                for r in _rows(payload.get("contracts_table"), "subject")])
 
     _h(doc, "2. Карта бизнес-процессов (as-is) → боли → ИИ-решение → to-be", 1)
     # Полный каталог — весь спектр процессов, включая те, где ИИ не применим. Идёт ПЕРЕД
@@ -527,9 +589,9 @@ def _write_process_map_docx(payload: dict, path: str = None) -> str:
         _h(doc, "Полный каталог процессов (весь спектр деятельности)", 2)
         _table(doc, Pt, ["Блок", "Процесс", "Класс ИИ", "Комментарий"],
                [[r.get("group", ""), r.get("process", ""), r.get("ai_class", ""), r.get("note", "")]
-                for r in payload["process_catalog"]])
+                for r in _rows(payload.get("process_catalog"), "process")])
         _h(doc, "Детальные карточки приоритетных процессов", 2)
-    for pr in (payload.get("processes") or []):
+    for pr in _rows(payload.get("processes"), "title"):
         _h(doc, pr.get("title") or "Процесс", 3)
         _labeled(doc, Pt, "As-is", pr.get("as_is"))
         _labeled(doc, Pt, "Боли", pr.get("pains"))
@@ -540,26 +602,26 @@ def _write_process_map_docx(payload: dict, path: str = None) -> str:
         _h(doc, "3. Сводная таблица: процесс → боль → продукт → эффект", 1)
         _table(doc, Pt, ["Процесс", "Ключевая боль", "Продукт / решение", "Ожидаемый эффект"],
                [[r.get("process", ""), r.get("pain", ""), r.get("product", ""), r.get("effect", "")]
-                for r in payload["summary_table"]])
+                for r in _rows(payload.get("summary_table"), "process")])
 
     if payload.get("roadmap"):
         _h(doc, "4. Приоритизация и дорожная карта внедрения", 1)
-        for b in payload["roadmap"]:
+        for b in _items(payload.get("roadmap")):
             _para(doc, Pt, b)
 
     if payload.get("gov_sale"):
         _h(doc, "5. Специфика продажи госкомпании (44-ФЗ/223-ФЗ)", 1)
-        for b in payload["gov_sale"]:
+        for b in _items(payload.get("gov_sale")):
             _bullet(doc, Pt, b)
 
     if payload.get("recommendations"):
         _h(doc, "Рекомендации", 1)
-        for b in payload["recommendations"]:
+        for b in _items(payload.get("recommendations")):
             _bullet(doc, Pt, b)
 
     if payload.get("disclaimers"):
         _h(doc, "Оговорки по достоверности данных", 1)
-        for b in payload["disclaimers"]:
+        for b in _items(payload.get("disclaimers")):
             _bullet(doc, Pt, b)
 
     if not path:
@@ -713,12 +775,12 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
 
     if payload.get("tldr"):
         _h(doc, "Краткое резюме (TL;DR)", 1)
-        for b in payload["tldr"]:
+        for b in _items(payload.get("tldr")):
             _bullet(doc, Pt, b)
 
     if payload.get("org_basics"):
         _h(doc, "Базовые данные организации", 1)
-        for b in payload["org_basics"]:
+        for b in _items(payload.get("org_basics")):
             _bullet(doc, Pt, b)
 
     if payload.get("decision_centers_table"):
@@ -726,19 +788,19 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
         _table(doc, Pt, ["Функция", "Организация", "Тип центра", "Обоснование", "Статус", "Источник"],
                [[r.get("function", ""), r.get("organization", ""), r.get("type", ""),
                  r.get("rationale", ""), r.get("status", ""), r.get("source", "")]
-                for r in payload["decision_centers_table"]])
+                for r in _rows(payload.get("decision_centers_table"), "function")])
 
     if payload.get("corporate_graph_table"):
         _h(doc, "Корпоративный контур — граф организаций", 1)
         _table(doc, Pt, ["От", "К", "Связь", "Функции", "Статус", "Источник"],
                [[r.get("from", ""), r.get("to", ""), r.get("relation", ""),
                  r.get("functions", ""), r.get("status", ""), r.get("source", "")]
-                for r in payload["corporate_graph_table"]])
+                for r in _rows(payload.get("corporate_graph_table"), "from")])
 
     _h(doc, "1. Руководство центрального аппарата", 1)
     _table(doc, Pt, ["Должность", "ФИО", "Зона ответственности", "Статус / источник"],
            [[r.get("position", ""), r.get("fio", ""), r.get("responsibility", ""), r.get("status", "")]
-            for r in (payload.get("leadership_table") or [])])
+            for r in _rows(payload.get("leadership_table"), "fio")])
     if payload.get("leadership_note"):
         _para(doc, Pt, payload["leadership_note"])
 
@@ -753,12 +815,12 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
                   r.get("current_role", ""),
                   " / ".join(x for x in (r.get("publication_dates", ""), r.get("observed_at", "")) if x),
                   r.get("source", "")]
-                for r in payload["role_candidates_table"]])
+                for r in _rows(payload.get("role_candidates_table"), "fio")])
 
     _h(doc, "2. Профильные отделы — приоритет под внедрение ИИ", 1)
     _table(doc, Pt, ["Блок", "Контактное лицо / контакт", "Почему релевантен и через какую боль заходить"],
            [[r.get("block", ""), r.get("contact", ""), r.get("relevance", "")]
-            for r in (payload.get("departments_table") or [])])
+            for r in _rows(payload.get("departments_table"), "block")])
     if payload.get("project_institute"):
         _h(doc, "Профильное подразделение / проектный институт", 2)
         _para(doc, Pt, payload["project_institute"])
@@ -770,7 +832,7 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
         _table(doc, Pt, ["ФИО", "Должность", "Блок", "Роль в решении", "Контакт", "Источник"],
                [[r.get("fio", ""), r.get("position", ""), r.get("block", ""),
                  r.get("role", ""), r.get("contact", ""), r.get("source", "")]
-                for r in payload["contacts_table"]])
+                for r in _rows(payload.get("contacts_table"), "fio")])
 
     if payload.get("research_contacts_table"):
         _h(doc, "Контактные каналы и лучшее применение", 1)
@@ -781,14 +843,14 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
                   "\n".join(x for x in (r.get("outreach_policy", ""), r.get("best_use", "")) if x),
                  " / ".join(x for x in (r.get("candidate", ""), r.get("function", "")) if x),
                  r.get("organization", ""), r.get("status", ""), r.get("source", "")]
-                for r in payload["research_contacts_table"]])
+                for r in _rows(payload.get("research_contacts_table"), "contact")])
 
     if payload.get("ecosystem_table"):
         _h(doc, "Экосистема и вертикаль принятия решений", 1)
         _table(doc, Pt, ["Организация / орган", "Связь", "Ключевое лицо", "Контакт", "Почему важно"],
                [[r.get("entity", ""), r.get("relation", ""), r.get("person", ""),
                  r.get("contact", ""), r.get("note", "")]
-                for r in payload["ecosystem_table"]])
+                for r in _rows(payload.get("ecosystem_table"), "entity")])
 
     if payload.get("branches_table"):
         _h(doc, "3. Руководители филиалов", 1)
@@ -796,12 +858,12 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
             _para(doc, Pt, payload["branches_intro"])
         _table(doc, Pt, ["Филиал", "Директор", "Телефон"],
                [[r.get("branch", ""), r.get("director", ""), r.get("phone", "")]
-                for r in payload["branches_table"]])
+                for r in _rows(payload.get("branches_table"), "branch")])
         if payload.get("branches_note"):
             _para(doc, Pt, payload["branches_note"])
 
     _h(doc, "4. Официальные контакты компании", 1)
-    for b in (payload.get("official_contacts") or []):
+    for b in _items(payload.get("official_contacts")):
         _bullet(doc, Pt, b)
 
     if payload.get("research_evidence_table"):
@@ -813,7 +875,7 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
                   r.get("source_type", ""), r.get("status", ""), r.get("confidence", ""),
                   " / ".join(x for x in (r.get("publication_date", ""), r.get("observed_at", "")) if x),
                   r.get("source", "")]
-                for r in payload["research_evidence_table"]])
+                for r in _rows(payload.get("research_evidence_table"), "claim")])
 
     if payload.get("lpr_profile") or payload.get("why_candidate") or payload.get("risk_compliance"):
         _h(doc, "Дополнительный контекст", 1)
@@ -822,7 +884,7 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
             _para(doc, Pt, payload["lpr_profile"])
         if payload.get("why_candidate"):
             _h(doc, "Почему компания — сильный кандидат на on-premises LLM-платформу", 2)
-            for b in payload["why_candidate"]:
+            for b in _items(payload.get("why_candidate")):
                 _bullet(doc, Pt, b)
         if payload.get("risk_compliance"):
             _h(doc, "Риск-факторы и комплаенс", 2)
@@ -830,16 +892,16 @@ def _write_roles_contacts_docx(payload: dict, path: str = None) -> str:
 
     if payload.get("approach_plan"):
         _h(doc, "План захода (рекомендации)", 1)
-        for b in payload["approach_plan"]:
+        for b in _items(payload.get("approach_plan")):
             _para(doc, Pt, b)
     if payload.get("threshold_signals"):
         _h(doc, "Пороговые сигналы для смены тактики", 2)
-        for b in payload["threshold_signals"]:
+        for b in _items(payload.get("threshold_signals")):
             _bullet(doc, Pt, b)
 
     if payload.get("disclaimers"):
         _h(doc, "Оговорки по достоверности данных", 1)
-        for b in payload["disclaimers"]:
+        for b in _items(payload.get("disclaimers")):
             _bullet(doc, Pt, b)
 
     if not path:
