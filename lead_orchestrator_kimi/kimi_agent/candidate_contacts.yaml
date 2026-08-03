@@ -1,0 +1,9 @@
+version: 1
+agent:
+  name: candidate-contacts
+  system_prompt_path: ./candidate_contacts.md
+  tools:
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:

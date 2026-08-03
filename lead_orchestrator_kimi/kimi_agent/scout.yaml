@@ -1,0 +1,9 @@
+version: 1
+agent:
+  name: leadgen-scout
+  system_prompt_path: ./scout.md
+  tools:
+    - "leadgen_tools:LeadSearch"
+    - "leadgen_tools:LeadFetch"
+    - "leadgen_tools:LeadCrawl"
+  subagents:

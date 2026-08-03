@@ -1,0 +1,8 @@
+version: 1
+agent:
+  name: onepager
+  system_prompt_path: ./system.md
+  # Тулы НЕ подключаем осознанно: стадия чисто текстовая (модель отдаёт HTML в ответе).
+  # Дефолтный агент kimi-cli тянет kimi_cli.tools.web:SearchWeb/FetchURL, которые у
+  # кастомного провайдера не грузятся -> InvalidToolError. Пустой список это снимает.
+  tools: []

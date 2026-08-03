@@ -1,3 +1,11 @@
+# Корневой .gitignore. Внутри lead_orchestrator/ действует ещё свой — он не отменён,
+# правила gitignore применяются к своему поддереву.
+
+# Изолированное окружение Kimi-стадии: воспроизводится из lead_orchestrator_kimi/requirements.txt
+# + patches/apply_patches.py, весит сотни МБ и содержит патч в site-packages — в git ему делать
+# нечего. Со звёздочкой: правило ловит и бэкапы вида .venv_kimi_bak_1.48.
+lead_orchestrator_kimi/.venv_kimi*/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -5,27 +13,31 @@ __pycache__/
 .venv/
 venv/
 
-# Secrets / sessions — НЕ коммитим
-.rp_cookies.json
-.rp_profile/
-*.token
+# Локальные настройки инструментов (у каждого свои). Без ведущего слэша — правило
+# действует в ЛЮБОЙ подпапке, а не только в корне.
 settings.local.json
+
+# Секреты и данные Docker-запуска: .env/папка env с токенами и том ./docker-data —
+# в git им не место (см. DEPLOY_TIMEWEB.md: env/.env, никогда не коммитить).
 .env
+/env/
+docker-data/
 
-# Outputs / артефакты прогонов
-*.xlsx
-leads_*.json
-_*.json
-_*.html
-*.docx
+# Артефакты прогонов
+*.pdf
+*.log
+out.html
+raw.html
 
-# Ассеты презентации: фото человека + логотип кладутся локально (см. assets/README.md)
-assets/*.png
+# Локальные браузерные бинарники и операционные выгрузки лидов. Это не исходники:
+# архивы велики, а JSON/TXT могут содержать реальные компании и контакты.
+/.tools/
+/chromedriver-win64.zip
+/rusprofile_*.json
+/rusprofile_*.txt
+/lead_orchestrator/cit_lead.json
 
-# Образцы/данные лидов и мусорные файлы
-sample_*.json
-/Yandex
-
-# OS
+# Мусор от случайных редиректов/ОС (пустые файлы «Яндекс» завелись в обеих папках)
+Яндекс
 Thumbs.db
 desktop.ini
