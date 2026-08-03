@@ -79,35 +79,36 @@ def ensure_env(*, require_key: bool = False) -> None:
     require_key требует ключ АКТИВНОГО runtime: для kimi это KIMI_API_KEY/GPLLM_API_KEY;
     для claude env-ключ не обязателен (авторизация — логин Claude Code или ANTHROPIC_API_KEY).
     """
+    active = runtime()
     selected_model = model_name()
     key = api_key()
-    if require_key and runtime() == "kimi" and not key:
+    if require_key and active == "kimi" and not key:
         raise RuntimeError("не задан KIMI_API_KEY или GPLLM_API_KEY")
     if key:
         os.environ["KIMI_API_KEY"] = key
     os.environ.setdefault("KIMI_BASE_URL", DEFAULT_BASE_URL)
     os.environ["KIMI_MODEL_NAME"] = selected_model
     if kimi_only():
-        os.environ["DR_LLM_PROVIDER"] = "kimi"
+        os.environ["DR_LLM_PROVIDER"] = "kimi"      # аварийный режим перекрывает env жёстко
     else:
-        os.environ["ORQ_LLM_RUNTIME"] = runtime()
-        os.environ.setdefault(
-            "DR_LLM_PROVIDER", "claude" if runtime() == "claude" else "kimi")
+        os.environ["ORQ_LLM_RUNTIME"] = active
+        os.environ.setdefault("DR_LLM_PROVIDER", active)   # значения совпадают: kimi|claude
 
 
 def child_env(source: dict[str, str] | None = None, *, require_key: bool = True) -> dict[str, str]:
     """Копия окружения для собственного доверенного подпроцесса оркестратора."""
+    active = runtime()
     env = dict(os.environ if source is None else source)
     key = api_key()
-    if require_key and runtime() == "kimi" and not key:
+    if require_key and active == "kimi" and not key:
         raise RuntimeError("не задан KIMI_API_KEY или GPLLM_API_KEY")
     if key:
         env["KIMI_API_KEY"] = key
     env["KIMI_BASE_URL"] = base_url()
     env["KIMI_MODEL_NAME"] = model_name()
     env["ORQ_KIMI_ONLY"] = "1" if kimi_only() else "0"
-    env["ORQ_LLM_RUNTIME"] = runtime()
-    env["DR_LLM_PROVIDER"] = "kimi" if runtime() == "kimi" else "claude"
+    env["ORQ_LLM_RUNTIME"] = active
+    env["DR_LLM_PROVIDER"] = active                  # значения совпадают: kimi|claude
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env

@@ -62,28 +62,6 @@ KIMI_RESEARCH_CLI = KIMI_DIR / "research_enrichment_agent.py"
 ADAPTER_FILE = KIMI_DIR / "claude_kimi_adapter.py"
 RESEARCH_TOOL = HERE / "kimi_research_cli.py"
 
-
-def _runtime() -> str:
-    return KC.runtime()
-
-
-def _agent_python() -> pathlib.Path:
-    """Интерпретатор агентных подпроцессов: claude — ОСНОВНОЙ python (claude-agent-sdk
-    живёт здесь, CLI бандлится в пакет); kimi — python изолированного .venv_kimi."""
-    return pathlib.Path(sys.executable) if _runtime() == "claude" else KIMI_PY
-
-
-def _agent_files_missing(cli: pathlib.Path) -> list[str]:
-    required = [_agent_python(), cli, RESEARCH_TOOL]
-    if _runtime() == "claude":
-        required.append(ADAPTER_FILE)
-    return [str(p) for p in required if not p.is_file()]
-
-
-def _require_provider_key() -> None:
-    """Ключ нужен только kimi-runtime; Claude авторизуется логином Claude Code/ANTHROPIC_*."""
-    if _runtime() != "claude" and not kimi_key():
-        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
 # По умолчанию агенту не ставим общий дедлайн: реальный scout-ресёрч может быть долгим.
 # Положительное значение env возвращает опциональный предохранитель для оператора.
 AGENT_TIMEOUT = float(os.environ.get("KIMI_WRITER_AGENT_TIMEOUT", "0"))
@@ -123,14 +101,14 @@ def kimi_model(model: str | None = None) -> str:
     m = (model or "").strip()
     if m and m.lower() not in ("kimi", "kimi-writer", "claude", "claude-writer"):
         return m                                   # явное имя модели передали как есть
-    if _runtime() == "claude":
+    if KC.runtime() == "claude":
         return KC.claude_model("writer")
     return KC.model_name()
 
 
 def _enrich_model(model: str | None) -> str:
     """Модель пяти enrichment-ролей: у claude свой (дешёвый) тир, у kimi — общая K2.7."""
-    if _runtime() == "claude":
+    if KC.runtime() == "claude":
         return KC.claude_model("enrich")
     return kimi_model(model)
 
@@ -148,8 +126,28 @@ def is_claude(model: str | None) -> bool:
     return str(model or "").strip().lower() in ("claude", "claude-writer")
 
 
+def _agent_python() -> pathlib.Path:
+    """Интерпретатор агентных подпроцессов: claude — ОСНОВНОЙ python (claude-agent-sdk
+    живёт здесь, CLI бандлится в пакет); kimi — python изолированного .venv_kimi."""
+    return pathlib.Path(sys.executable) if KC.runtime() == "claude" else KIMI_PY
+
+
+def _agent_files_missing(cli: pathlib.Path) -> list[str]:
+    """Чего не хватает для запуска агентного подпроцесса (пусто — всё на месте)."""
+    required = [_agent_python(), cli, RESEARCH_TOOL]
+    if KC.runtime() == "claude":
+        required.append(ADAPTER_FILE)              # kimi-совместимый prompt() поверх SDK
+    return [str(p) for p in required if not p.is_file()]
+
+
+def _require_provider_key() -> None:
+    """Ключ нужен только kimi-runtime; Claude авторизуется логином Claude Code/ANTHROPIC_*."""
+    if KC.runtime() != "claude" and not kimi_key():
+        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
+
+
 def _agent_enabled() -> bool:
-    if _runtime() == "claude":
+    if KC.runtime() == "claude":
         return True     # у claude-runtime HTTP-фолбэка нет — только агентный писатель
     return os.environ.get("KIMI_WRITER_AGENT", "1").strip().lower() not in (
         "0", "false", "no", "off", "нет",
@@ -160,11 +158,13 @@ def _agent_env(api_model: str, share_dir: str) -> dict[str, str]:
     """Минимальное окружение агентного подпроцесса: без токенов Диска/Checko/Dadata.
     Для claude-runtime дополнительно проходят ANTHROPIC_*/CLAUDE_CODE_* из allowlist —
     авторизация Claude; ключи Kimi при этом ему не нужны, но и не мешают."""
+    runtime = KC.runtime()
     env = {k: v for k, v in os.environ.items() if k.upper() in _AGENT_ENV_ALLOW}
     env["KIMI_API_KEY"] = kimi_key()
     env["KIMI_BASE_URL"] = kimi_base_url()
-    env["KIMI_MODEL_NAME"] = api_model if _runtime() == "kimi" else KC.DEFAULT_MODEL
-    env["ORQ_LLM_RUNTIME"] = _runtime()
+    # У claude имя модели едет в request.json, а KIMI_MODEL_NAME остаётся валидным дефолтом.
+    env["KIMI_MODEL_NAME"] = api_model if runtime == "kimi" else KC.DEFAULT_MODEL
+    env["ORQ_LLM_RUNTIME"] = runtime
     env["PYTHONIOENCODING"] = "utf-8"
     env["ORQ_MAIN_PY"] = sys.executable
     env["ORQ_RESEARCH_TOOL"] = str(RESEARCH_TOOL)
@@ -738,7 +738,7 @@ async def write_two_docx(lead: dict, idx: int, findings_process: str, findings_r
     client = None if use_agent else _client()
     total_tokens = 0
     cost = 0.0
-    tag = _runtime()                         # 'kimi' | 'claude' — префикс строк лога
+    tag = KC.runtime()                       # 'kimi' | 'claude' — префикс строк лога
     try:
         for system, title, schema, extra, findings, render, path, label in jobs:
             user = _user_prompt(title, schema, name, inn, findings, extra)

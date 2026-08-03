@@ -104,31 +104,29 @@ def _prompt_fn():
     return prompt
 
 
-# Врезка режима: у kimi Task вместо Agent, у claude нет WebSearch/WebFetch. В обоих
-# runtime деливерабл один — финальный JSON-объект, который рендерит родительский процесс.
+# Врезка режима: у kimi Task вместо Agent, у claude нет WebSearch/WebFetch. Различается
+# только вводная про инструменты — деливерабл и обязательные роли у обоих runtime одни.
+_MODE_TAIL = (
+    "Вместо save_* финальным деливераблом является один JSON-объект: его отрендерит "
+    "родительский процесс. Сам решай, сколько scout нужно и как разделить направления; "
+    "независимые задачи запускай параллельно. До финала обязательно вызови critic по "
+    "черновому JSON. Для спорных фактов и каждого заявленного ЛПР вызывай verifier."
+)
 _MODE_NOTE_KIMI = (
     "===== РЕЖИМ KIMI AGENT =====\n"
     "Инструкции выше могли называть Claude-инструмент Agent и save_*_docx. Здесь их нет. "
-    "Вместо Agent используй Task с ролями scout/critic/verifier. Вместо save_* финальным "
-    "деливераблом является один JSON-объект: его отрендерит родительский процесс. "
-    "Сам решай, сколько scout нужно и как разделить направления; независимые задачи запускай "
-    "параллельно. До финала обязательно вызови critic по черновому JSON. Для спорных фактов "
-    "и каждого заявленного ЛПР вызывай verifier."
+    "Вместо Agent используй Task с ролями scout/critic/verifier. " + _MODE_TAIL
 )
 _MODE_NOTE_CLAUDE = (
     "===== РЕЖИМ CLAUDE AGENT =====\n"
     "Инструкции выше могли называть WebSearch/WebFetch и save_*_docx. Здесь их нет: веб "
     "открывай инструментами LeadSearch/LeadFetch/LeadCrawl, субагентов scout/critic/verifier "
-    "вызывай инструментом Agent. Вместо save_* финальным деливераблом является один "
-    "JSON-объект: его отрендерит родительский процесс. Сам решай, сколько scout нужно и как "
-    "разделить направления; независимые задачи запускай параллельно. До финала обязательно "
-    "вызови critic по черновому JSON. Для спорных фактов и каждого заявленного ЛПР вызывай "
-    "verifier."
+    "вызывай инструментом Agent. " + _MODE_TAIL
 )
 
 
-async def run_agent(request: dict, prompt_fn=None) -> dict:
-    prompt = prompt_fn or _prompt_fn()
+async def run_agent(request: dict) -> dict:
+    prompt = _prompt_fn()
 
     model = request.get("model") or os.environ.get("KIMI_MODEL_NAME")
     full_input = (

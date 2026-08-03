@@ -66,16 +66,16 @@ async def models() -> List[Dict[str, Any]]:
     """
     import kimi_config as _kc                  # лежит в пакете оркестратора (sys.path уже добавлен в leads.py)
     default = _kc.default_model_flag()
-    items = [
+    kimi = {"id": "kimi", "label": f"Kimi ({_kc.DEFAULT_MODEL})",
+            "billing": "provider", "default": default == "kimi"}
+    if _kc.kimi_only():                        # аварийный полный Kimi-режим: выбор один
+        return [kimi]
+    return [
         {"id": "claude",
          "label": f"Claude Agent SDK ({_kc.claude_model('writer')}+{_kc.claude_model('enrich')})",
          "billing": "sdk", "default": default == "claude"},
-        {"id": "kimi", "label": f"Kimi ({_kc.DEFAULT_MODEL})",
-         "billing": "provider", "default": default == "kimi"},
+        kimi,
     ]
-    if _kc.kimi_only():                        # аварийный полный Kimi-режим: выбор один
-        return [item for item in items if item["id"] == "kimi"]
-    return items
 
 
 @app.get("/api/regions")

@@ -205,13 +205,6 @@ async def _claude_plan(prompt: str, history: list[dict] | None = None) -> tuple[
     return _normalise_plan(_extract_json(text)), text
 
 
-async def _plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
-    """NL -> проверенный JSON-план активным runtime."""
-    if KC.runtime() == "claude":
-        return await _claude_plan(prompt, history)
-    return await _kimi_plan(prompt, history)
-
-
 async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
     """Один короткий вызов Kimi K2.7: NL -> JSON-план. Без tool calls и shell."""
     KC.ensure_env(require_key=True)
@@ -242,6 +235,13 @@ async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[di
     finally:
         await client.close()
     raise RuntimeError(f"Kimi controller не вернул план: {last_error}")
+
+
+async def _plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
+    """NL -> проверенный JSON-план активным runtime."""
+    if KC.runtime() == "claude":
+        return await _claude_plan(prompt, history)
+    return await _kimi_plan(prompt, history)
 
 
 def per_industry(plan: dict) -> int:

@@ -219,7 +219,7 @@ async def _generate_html_claude(user_content, model=None):
 
 
 async def generate_onepager_html(user_content, model=None, thinking=False):
-    """Вызвать Kimi по ONEPAGER_SYSTEM -> вернуть HTML-текст ответа.
+    """Вызвать модель активного runtime по ONEPAGER_SYSTEM -> вернуть HTML-текст ответа.
 
     Сигнатура prompt() и Message.extract_text() СВЕРЕНЫ по исходникам установленного
     kimi-agent-sdk 0.0.5. Нативного параметра system в prompt() НЕТ (задаётся через

@@ -336,13 +336,10 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     if KC.kimi_only() and not WK.is_kimi(model):
         raise RuntimeError(
             "Claude/Anthropic отключён: _research_one принимает только model='kimi'")
-    if WK.is_kimi(model):
-        return await _research_one_kimi(
-            lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
-    if WK.is_claude(model):
-        # Тот же текущий pipeline, но стадии работают на Claude Agent SDK (штат ветки).
-        # Ниже по файлу остаётся ДРУГАЯ архитектура — legacy «агент ресёрчит сам»,
-        # достижимая только явным именем модели (opus/sonnet) при ORQ_KIMI_ONLY=0.
+    # Оба псевдонима runtime ведут в ТЕКУЩИЙ pipeline: разница только в SDK под стадиями.
+    # Ниже по файлу остаётся ДРУГАЯ архитектура — legacy «агент ресёрчит сам», достижимая
+    # только явным именем модели (opus/sonnet) при ORQ_KIMI_ONLY=0.
+    if WK.is_kimi(model) or WK.is_claude(model):
         return await _research_one_kimi(
             lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
 
@@ -1219,8 +1216,9 @@ async def main():
     ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
                     help="не обогащать ЛПР прямыми контактами")
     a = ap.parse_args()
+    model_is_kimi = str(a.model or "").strip().lower().startswith("kimi")
     if KC.kimi_only():
-        if not str(a.model or "").strip().lower().startswith("kimi"):
+        if not model_is_kimi:
             raise SystemExit(
                 "Kimi-only режим: Claude/Anthropic отключён. Используй --model kimi "
                 "или явно задай ORQ_KIMI_ONLY=0 для аварийного legacy-отката.")
@@ -1230,20 +1228,19 @@ async def main():
     else:
         # Runtime на прогон определяет флаг --model: kimi* -> kimi (нужен ключ шлюза),
         # всё остальное -> claude. Дочерние процессы наследуют выбор через env.
-        flag_runtime = "kimi" if str(a.model or "").strip().lower().startswith("kimi") else "claude"
-        os.environ["ORQ_LLM_RUNTIME"] = flag_runtime
-        if flag_runtime == "kimi":
+        os.environ["ORQ_LLM_RUNTIME"] = "kimi" if model_is_kimi else "claude"
+        if model_is_kimi:
+            # Явный --model kimi сильнее унаследованного env: ensure_env ставит провайдера
+            # только через setdefault, а для claude он и так выставит "claude".
             os.environ["DR_LLM_PROVIDER"] = "kimi"
-        else:
-            os.environ.setdefault("DR_LLM_PROVIDER", "claude")
         KC.ensure_env(require_key=not a.dry_run)
-        if flag_runtime == "claude":
+        if model_is_kimi:
+            print(f"[LLM] Kimi runtime: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
+        else:
             print(f"[LLM] Claude Agent SDK: писатель={KC.claude_model('writer')}, "
                   f"роли={KC.claude_model('enrich')}, one-pager={KC.claude_model('onepager')}, "
                   f"extract={os.environ.get('DR_EXTRACT_MODEL', 'sonnet')} "
                   f"(DR_LLM_PROVIDER={os.environ.get('DR_LLM_PROVIDER')})")
-        else:
-            print(f"[LLM] Kimi runtime: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
     # Копия ВСЕГО вывода (stdout+stderr, включая трейсбеки) в файл: диагноз упавшего
     # прогона не должен зависеть от того, сохранил ли кто-то консоль.
     try:

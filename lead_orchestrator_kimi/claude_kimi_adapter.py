@@ -288,17 +288,18 @@ async def prompt(user_input: str, *, model=None, thinking=False, yolo=True,
         raise RuntimeError("claude_kimi_adapter.prompt: нужен agent_file со спекой роли")
     spec = load_spec(agent_file)
 
+    with_subagents = bool(spec["wants_subagents"] and spec["subagents"])
     allowed = [_MCP_PREFIX + t for t in spec["lead_tools"]]
-    mcp_servers = {SERVER: _build_lead_server()} if spec["lead_tools"] else {}
-    agents = None
     disallowed = list(_DISALLOWED_BUILTINS)
-    if spec["wants_subagents"] and spec["subagents"]:
+    agents = None
+    if with_subagents:
         agents = _subagent_definitions(spec, sdk)
         allowed.append("Agent")
-        # у субагентов свои Lead*-тулы -> сервер нужен даже если main без Lead*
-        mcp_servers.setdefault(SERVER, _build_lead_server())
     else:
         disallowed.append("Agent")
+    # У субагентов свои Lead*-тулы -> сервер нужен, даже если у главного агента их нет.
+    mcp_servers = ({SERVER: _build_lead_server()}
+                   if spec["lead_tools"] or with_subagents else {})
 
     turns = None
     if isinstance(max_steps_per_turn, int) and max_steps_per_turn > 0:
@@ -319,7 +320,7 @@ async def prompt(user_input: str, *, model=None, thinking=False, yolo=True,
 
     final_from_result = ""
     failure = ""
-    collected: list[_Msg] = []
+    last_plain: _Msg | None = None      # запасной финал, если SDK не отдал result
 
     async for message in sdk.query(prompt=user_input, options=options):
         if isinstance(message, sdk.AssistantMessage):
@@ -334,20 +335,18 @@ async def prompt(user_input: str, *, model=None, thinking=False, yolo=True,
                 elif isinstance(block, sdk.ToolUseBlock):
                     calls.append(_convert_call(block))
             msg = _Msg("assistant", "".join(text_parts).strip(), calls=calls)
-            if final_message_only:
-                collected.append(msg)
-            else:
+            if not final_message_only:
                 yield msg
+            elif msg.extract_text() and not msg.tool_calls:
+                last_plain = msg
         elif isinstance(message, sdk.UserMessage):
-            if getattr(message, "parent_tool_use_id", None):
+            if final_message_only or getattr(message, "parent_tool_use_id", None):
                 continue
-            content = message.content if isinstance(message.content, list) else []
-            for block in content:
+            blocks = message.content if isinstance(message.content, list) else []
+            for block in blocks:
                 if isinstance(block, sdk.ToolResultBlock):
-                    msg = _Msg("tool", _result_text(block.content),
+                    yield _Msg("tool", _result_text(block.content),
                                call_id=str(block.tool_use_id or ""))
-                    if not final_message_only:
-                        yield msg
         elif isinstance(message, sdk.ResultMessage):
             LAST_COST["usd"] = float(message.total_cost_usd or 0.0)
             if message.is_error:
@@ -360,11 +359,8 @@ async def prompt(user_input: str, *, model=None, thinking=False, yolo=True,
     if final_from_result:
         # Канонический финал SDK — гарантируем потребителю «assistant без tool_calls».
         yield _Msg("assistant", final_from_result)
-    elif final_message_only:
-        for msg in collected[::-1]:
-            if msg.role == "assistant" and msg.extract_text() and not msg.tool_calls:
-                yield msg
-                break
+    elif last_plain is not None:
+        yield last_plain
 
 
 def selftest() -> int:
