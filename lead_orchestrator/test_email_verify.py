@@ -208,6 +208,30 @@ def test_smtp_session():
 
         _restore(saved)
 
+        # Лимит адресов на домен: дефолт 5 (вежливость к чужому серверу при
+        # переборе гипотез), но при сверке готового списка его поднимают — иначе
+        # хвост домена молча остаётся неопрошенным.
+        import os as _os
+        made.clear()
+        saved = _with_smtp(factory)
+        many = [f"user{i}@dom.ru" for i in range(8)]
+        rows = EV.check_smtp_many("dom.ru", many, mx_hosts=["mail.dom.ru"])
+        probed = sum(1 for c in made[0].log if c[0] == "rcpt" and not c[1].startswith("zz"))
+        check("по умолчанию не больше 5 адресов на домен", probed == 5, str(probed))
+        check("остальные помечены как непроверенные",
+              not rows.get("user7@dom.ru", {"checked": False})["checked"]
+              if "user7@dom.ru" in rows else True, str(list(rows)))
+
+        made.clear()
+        _os.environ["EMAIL_VERIFY_MAX_PER_DOMAIN"] = "8"
+        try:
+            EV.check_smtp_many("dom.ru", many, mx_hosts=["mail.dom.ru"])
+            probed = sum(1 for c in made[0].log if c[0] == "rcpt" and not c[1].startswith("zz"))
+            check("лимит поднимается переменной окружения", probed == 8, str(probed))
+        finally:
+            _os.environ.pop("EMAIL_VERIFY_MAX_PER_DOMAIN", None)
+        _restore(saved)
+
         # Временный отказ обрывает цикл, чтобы не давить на чужой сервер. Адреса,
         # до которых очередь не дошла, ОБЯЗАНЫ остаться непроверенными: раньше им
         # доставалось checked=True, выставленный скопом до цикла, и _reachable

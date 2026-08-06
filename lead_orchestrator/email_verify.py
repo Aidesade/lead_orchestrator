@@ -112,6 +112,21 @@ def check_misc(email):
             "is_b2c": domain in EF.FREE_PROVIDERS}
 
 
+def _max_per_domain():
+    """Сколько адресов одного домена трогать за сессию.
+
+    Дефолт 5 — вежливость там, где проверяется ВЕЕР ГИПОТЕЗ: незачем перебирать
+    у чужого сервера десяток догадок. Но при сверке готового списка известных
+    адресов лимит вредит: у домена с 24 ящиками 19 не опрашиваются вовсе, а в
+    отчёте выглядят как «не смогли проверить» — то есть неотличимы от реального
+    отказа сервера. Для таких прогонов поднимается через EMAIL_VERIFY_MAX_PER_DOMAIN."""
+    try:
+        value = int(os.environ.get("EMAIL_VERIFY_MAX_PER_DOMAIN", "") or 5)
+    except ValueError:
+        return 5
+    return max(1, value)
+
+
 def _blank_smtp(reason=""):
     return {"can_connect_smtp": False, "is_deliverable": False, "is_catch_all": False,
             "has_full_inbox": False, "is_disabled": False, "policy_blocked": False,
@@ -142,7 +157,7 @@ def check_smtp_many(domain, addresses, mx_hosts=None, timeout=10, helo=None,
     """SMTP-стадия сразу для нескольких адресов ОДНОГО домена — одна сессия.
 
     Возвращает {адрес: smtp-словарь}. DATA не отправляется, письма не уходят."""
-    addresses = list(addresses or [])[:5]
+    addresses = list(addresses or [])[:_max_per_domain()]
     out = {a: _blank_smtp("проверка не выполнялась") for a in addresses}
     if not (domain and addresses):
         return out
