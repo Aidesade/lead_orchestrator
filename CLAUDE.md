@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Оркестратор лидогенерации для B2B-агентства, продающего корпоративную on-premises LLM-платформу
 **Telepatt** от **АО «ЦИТ РТ»** (RAG-база знаний, автономные ИИ-агенты, ИИ-Коуч «Наставник»).
-Корень репозитория — **`D:\lead_gen`**; ЭТА ветка — **`claude-sdk`** (генератор на Claude Agent
-SDK; ветка `kimi` — прежний полный Kimi-runtime, основная — `master`). Ядро пайплайна —
+Корень репозитория — **`D:\lead_gen`**; ЭТА ветка — **`outreach`** (рассылка: сбор → адрес ЛПР →
+письмо с ящика `@tatar.ru`; ответвлена от `claude-sdk` — генератора на Claude Agent SDK; ветка
+`kimi` — прежний полный Kimi-runtime, основная — `master`). Ядро пайплайна —
 `lead_orchestrator/`; агенты Фазы 2 — `lead_orchestrator_kimi/` (общие для обоих runtime; свой
 venv нужен только kimi); веб — `web/`; контейнеризация — `Dockerfile`/`docker-compose.yml`.
 Python 3.12, основная платформа Windows, прод-цель — Docker в Linux. Комментарии в коде — на русском.
@@ -53,6 +54,52 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 попутно. Текущий claude-runtime — это ТЕКУЩИЙ pipeline (движок→роли→писатель), просто на
 другом SDK.
 
+## Outreach-пайплайн (главное в ЭТОЙ ветке)
+
+Второй, **самостоятельный** пайплайн: не материалы для ручной рассылки, а письмо ЛПР целиком.
+Вход — `lead_orchestrator/outreach.py`, лаунчер — `run_outreach.cmd`. Порядок держит код,
+модель работает ровно в одном месте — текст письма.
+
+| # | Стадия | Где живёт |
+|---|---|---|
+| 1 | Реестр отработанных | `outreach_registry.py` — ключ ИНН, бэкфилл из `D:\deliverables` |
+| 2 | Парсинг RusProfile | `rusprofile_playwright.card_facts` / `parse_founders` |
+| 3 | One-pager по отрасли | `assets/onepagers/<отрасль>.pdf`, иначе `--generate-onepager` |
+| 4 | **Прекондишен** верификатора ЦИТ РТ | `EMAIL_VERIFIER_URL` → `email_verify.py --serve` |
+| 5 | **Прекондишен** ящика `@tatar.ru` | `outlook_send.check_ready` |
+| 6 | Адрес ЛПР | `email_guess.guess_for_company` + `outreach.pick_recipient` |
+| 7 | Письмо и отправка | `outreach_letter.py` + `outlook_send.send_message` |
+| 8 | Проверка прогона | `outreach.py --check` → `outreach_registry.audit` |
+
+**ФАЗА 2 старого пайплайна (дипресёрч, пять ролей, два `.docx`) сюда НЕ входит и не вызывается.**
+Она осталась рабочей и запускается прежней командой — outreach её просто не трогает.
+
+Инварианты, которые нельзя «упростить»:
+
+- **Дефолт — черновик, а не отправка.** `outlook_send.deliver(draft=True)` зовёт `mail.Save()`;
+  `mail.Send()` — только при явном `--send`. Тест `test_outlook_send.check_deliver` падает, если
+  дефолт поменяют. Плюс `--limit` и `--pace` (пауза, дефолт 30 с): без них репутация домена
+  `tatar.ru` сгорает на первой сотне писем.
+- **Подпись, контакты и строка отписки дописываются КОДОМ** (`outreach_letter.signature_block`),
+  модели они не отдаются, а её собственные контакты вырезаются `_strip_contacts`. Ровно тот же
+  урок, что в one-pager: модель выдумывала людям регалии и телефоны.
+- **Отвергнутый почтовым сервером адрес не рассылается никогда** (`_rank_rows` отбрасывает
+  `verdict == "no"` и `confidence` со «НЕ отправлять»). Неподтверждённая гипотеза уходит
+  ВМЕСТЕ с копией на общую почту компании (`build_recipients`).
+- **Стадии 4 и 5 — прекондишены до первой компании**, а не проверки по ходу: пайплайн, который
+  отработал сбор и подбор адресов и только потом упёрся в неподнятый верификатор, потратил
+  лимиты RusProfile впустую.
+- ⚠️ **Учредители и телефоны — платный раздел RusProfile, руководитель — бесплатный.** Проверено
+  вживую 2026-08-06: при закрытых контактах блок «Руководитель» (должность, ФИО, ИНН физлица
+  12 цифр) читается, а телефоны, почта и вся страница `/founders/<id>` замаскированы `░`.
+  Поэтому `card_facts` вызывается ВЫШЕ пейвол-гарда, а `enrich_leads(stop_when_locked=False)`
+  не прерывает обход. `parse_founders` при маске возвращает `locked=True` и ПУСТОЙ список:
+  «не раскрыты» и «нет» — разные вещи.
+- **Правовая рамка.** Ст. 18 ФЗ «О рекламе» требует предварительного согласия на рекламу по сетям
+  электросвязи. Безопасная форма — адресное деловое предложение конкретному ЛПР: живая подпись,
+  реквизиты ЦИТ РТ, рабочая строка отказа и полный лог отправок в реестре. Адреса из «пробива» и
+  утечек исключены конструктивно (`person_enrich.DENY_SOURCES`).
+
 ## Запуск
 
 Ярлык на рабочем столе **`new_orchestrator`** → `run_orchestrator.cmd` (канонический делегат) →
@@ -82,11 +129,26 @@ py orchestrator.py "D:\лиды\leads_mining.json" --no-presentation   # без 
 py orchestrator.py "D:\лиды\leads_mining.json" --no-upload         # файлы остаются в temp, путь печатается
 py orchestrator.py "D:\лиды\leads_mining.json" --dry-run --no-upload  # заглушки, без LLM и без следов
 py orchestrator.py sample_ryazanavtodor.json --no-upload           # разовый прогон одной компании
+# ВЕТКА outreach — рассылка (лаунчер run_outreach.cmd; БЕЗ --send письма ложатся в Черновики):
+py outreach.py --check                                 # стадия 8: кому писали, где застряли
+py outreach.py --industries mining --count 10          # сбор + весь цикл до черновиков
+py outreach.py "D:\лиды\leads_mining.json" --dry-run   # 8 стадий офлайн, без модели и Outlook
+py outreach.py "D:\лиды\leads_mining.json" --send --limit 5 --pace 45   # реальная отправка
+py outlook_send.py --check                             # жив ли Outlook и есть ли ящик @tatar.ru
+py verify_host_check.py                                # ЗАПУСКАТЬ НА СЕРВЕРЕ ЦИТ РТ: порт 25, PTR, SPF
+py email_verify.py --serve 8080                        # там же: верификатор для EMAIL_VERIFIER_URL
 # только официальная база контактов — детерминированно, без LLM и без .docx:
 py company_research_agent.py --contacts "АО Рязаньавтодор 6234065445"
 # разовый прямой контакт ЛПР (ФИО+ИНН -> рабочие email/телефоны, только легитимные источники).
 # ⚠️ standalone-дефолты ПРОТИВОПОЛОЖНЫ оркестраторным: SMTP-проба и соцпоиск ВКЛ:
 py person_enrich.py "Руденко Сергей Александрович" 6234065445 --no-verify --no-social
+# гипотезы почты ключевых сотрудников по домену компании (детерминированно, без LLM):
+py email_guess.py "Руденко Сергей Александрович" avtodor-rzn.ru
+py email_guess.py --leads "D:\лиды\leads_mining.json" --out "D:\лиды\emails_mining.json"
+py email_guess.py --leads leads.json --no-site --no-mx   # офлайн, только генерация гипотез
+# проверка существования ящика без отправки письма (нужны EMAIL_GUESS_HELO/MAIL_FROM):
+py email_verify.py ivanov@company.ru petrov@company.ru
+py email_verify.py --serve 8080        # HTTP-API, совместимый с Reacher (для EMAIL_VERIFIER_URL)
 # движок deep_research отдельно, БЕСПЛАТНО (regex-only, без LLM):
 DR_USE_LLM=0 py deep_research_engine.py --company "АО Рязаньавтодор" --inn 6234065445 --site https://avtodor-rzn.ru
 py deep_research_engine.py --crawl avtodor-rzn.ru      # отладка: только краул сайта (SiteCrawler)
@@ -132,7 +194,11 @@ py test_claude_runtime.py        # ШТАТ ветки: дефолт claude, д�
 py test_kimi_only.py             # откат ORQ_KIMI_ONLY=1: Kimi K2.7 runtime цел и запирает Claude
 py test_kimi_agent_freedom.py    # контракт свободного Agent loop писателя
 py test_research_enrichment.py   # scheduler/контракты/cache/DOCX-adapter пяти ролей (вкл. деградацию)
-py test_rusprofile_playwright.py # cookie-нормализация, порог 1 млрд, revenue-sort по убыванию
+py test_email_guess.py           # подбор почты: транслит, схема домена, привязка адреса к человеку
+py test_email_verify.py          # проверка ящика без отправки: коды SMTP, catch-all, «не проверили» ≠ «нет ящика»
+py test_rusprofile_playwright.py # cookie, порог 1 млрд, revenue-sort + разбор карточки (ЛПР под пейволом)
+py test_outreach.py              # ВЕТКА outreach: реестр, выбор адреса ЛПР, сборка письма
+py test_outlook_send.py          # ВЕТКА outreach: аккаунт tatar.ru, вложение, черновик vs отправка
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
 py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
@@ -140,6 +206,8 @@ py kimi_research_cli.py --selftest      # subprocess-мост URL-инструм
 py connectors\yadisk_mcp.py --selftest  # ядро Яндекс Диска офлайн
 py ..\web\api\test_events.py            # парсер stdout -> SSE на НАСТОЯЩИХ логах D:\orq_tmp\run_*.log
 py orchestrator.py sample_ryazanavtodor.json --dry-run --no-upload   # вся цепочка офлайн, заглушки
+py outreach.py sample_ryazanavtodor.json --dry-run   # ВЕТКА outreach: 8 стадий офлайн, без писем
+py outlook_send.py --check       # ВЕТКА outreach: жив ли Outlook и есть ли ящик @tatar.ru
 ```
 
 Агентные селфтесты: claude-режим — ОСНОВНЫМ python'ом
@@ -152,6 +220,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
 `test_source_ofdata.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
 `test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
+`test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_outlook_send.py`,
 `apply_patches.py --check` и импорт Kimi-стадии. Добавил тест — добавь его и в гейт.
 
 ⚠️ `web/api/test_events.py` гонять при ЛЮБОЙ правке печати в `orchestrator.py`: веб парсит именно
@@ -204,7 +273,15 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 2. **Обогащение ЛПР (`person_enrich`)** — тоже детерминированно, вне SDK-сессии: по `contact_person`+ИНН
    прямые рабочие контакты; блок дописывается к находкам прохода `roles` (в `process` не идёт).
    ВКЛ по умолчанию; тихо пропускается, если у лида нет `contact_person` или `_inn`.
-3. **Пять enrichment-ролей (подпроцесс: claude — основной python + адаптер, kimi — venv Kimi).**
+3. **Гипотезы почты ключевых сотрудников (`email_guess`)** — детерминированно, после прохода
+   `roles`: домен из общей почты лида (потом сайт) → люди (ЛПР из ЕГРЮЛ + `leadership`/закупки/
+   филиалы из находок движка + страницы `/rukovodstvo` сайта) → адреса по схеме домена. Если у
+   домена уже известен личный адрес — схема выводится из него и веер гипотез схлопывается до
+   одного-двух. Блок дописывается к находкам `roles` (`orchestrator._email_guess_block`).
+   ВЫКЛ — `EMAIL_GUESS=0`, без обхода сайта — `EMAIL_GUESS_SITE=0`. Сбой стадии компанию НЕ валит.
+   ⚠️ Адреса помечены уверенностью и НЕ выдаются за найденные контакты — «подтверждён» получает
+   только опубликованный адрес с однозначным владельцем.
+4. **Пять enrichment-ролей (подпроцесс: claude — основной python + адаптер, kimi — venv Kimi).**
    Граф
    `official_sources → (corporate_contour + secondary_sources) → role_candidates → candidate_contacts`.
    Контактник не видит общий seed персоналий — только структурированный список кандидатов.
@@ -219,7 +296,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
    не стартовал, а лог винил писателя («не сохранил .docx»). **Не возвращать `raise` в `run()`.**
    Родитель (`writer_kimi.run_research_subagents`) поднимает НАСТОЯЩУЮ причину из stdout, а не хвост
    stderr с шумом `authlib.jose` DeprecationWarning.
-4. **Писатель** — `writer_kimi.write_two_docx`: агент в подпроцессе (интерпретатор — по runtime),
+5. **Писатель** — `writer_kimi.write_two_docx`: агент в подпроцессе (интерпретатор — по runtime),
    на каждый документ свой главный писатель со свободным read-only веб-поиском + динамический
    веер `scout`/`verifier` + обязательный `critic`, свой системный промпт (`PROCESS_MAP_SYSTEM` /
    `ROLES_CONTACTS_SYSTEM` из CRA) и свои находки-seed со своего прохода → финальный JSON →
@@ -228,7 +305,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
    внутри MCP-тулов адаптера. Legacy HTTP-режим `KIMI_WRITER_AGENT=0` — только kimi.
    На Kimi долларовая вилка `[оценка]` не печатается (шлюз цену наружу не отдаёт → итог `$0`,
    не баг); на Claude стоимость сессий писателя отдаёт SDK и она попадает в итог.
-5. **Гард против болванок:** наружу идут только реальные `.docx` (>5000 байт, проверка в `process()`);
+6. **Гард против болванок:** наружу идут только реальные `.docx` (>5000 байт, проверка в `process()`);
    иначе компания = неуспех.
 
 ### Третья стадия — one-pager (`_onepager_one`, по умолчанию ВКЛ)
@@ -271,7 +348,13 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `kimi_research_cli.py` | subprocess-мост URL-инструментов (search/fetch/crawl) из venv Kimi в основной; `--selftest` |
 | `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры.** `PROCESS_MAP_SYSTEM`/`ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля НЕ загружает Claude SDK. Детерминированно дописывает таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
 | `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
-| `person_enrich.py` | ЛПР: ФИО+ИНН → прямой РАБОЧИЙ контакт (Dadata/Checko → домен с валидацией → email по шаблону+MX, телефоны; соцпрофили только с ИНН-контекстом). «Пробив»/утечки конструктивно исключены (`DENY_SOURCES`) |
+| `person_enrich.py` | ЛПР: ФИО+ИНН → прямой РАБОЧИЙ контакт (Dadata/Checko → домен с валидацией → email по шаблону+MX, телефоны; соцпрофили только с ИНН-контекстом). «Пробив»/утечки конструктивно исключены (`DENY_SOURCES`). Генерацию адресов НЕ реализует — делегирует `email_guess` |
+| `email_verify.py` | **проверка существования ящика БЕЗ отправки письма** — Python-порт ядра Reacher на голом stdlib (ни Docker, ни WSL, ни Rust-бинаря). Формат ответа совместим с Reacher (`is_reachable` + `syntax`/`mx`/`smtp`/`misc`), есть CLI и `--serve` (HTTP-API на том же контракте). ⚠️ Осознанное отличие от оригинала: у Reacher `invalid` означает и «нет ящика», и «не смог подключиться» — при закрытом порте 25 это вычеркнуло бы все живые адреса; здесь такой случай = `unknown`, а `550 5.7.x` (политика) отделён от `550 5.1.1` (нет адресата). Единственная SMTP-реализация в репо: `email_guess` и `person_enrich` зовут её |
+| `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов |
+| `outreach.py` | **главный вход ВЕТКИ** (asyncio): восемь стадий рассылки, прекондишены 4 и 5, `--check` = стадия 8. Дефолт — черновики, `--send` — реальная отправка |
+| `outreach_registry.py` | реестр отработанных по ИНН: атомарная запись, бэкфилл из `D:\deliverables`, `audit()` для стадии 8. «Отработана» = есть деливераблы ИЛИ отправлено письмо |
+| `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
+| `outreach_letter.py` | текст письма: `build_prompt` (только проверенные факты) → модель через `claude_kimi_adapter` со спекой `kimi_agent/outreach_letter.yaml` → `parse_reply` → подпись и отписка КОДОМ |
 | `source_rusprofile.py` / `rusprofile_playwright.py` / `rusprofile_session.py` | штатный источник Фазы 1: карта `INDUSTRY` (21), регион-фильтр с отрицанием; единая Playwright-context; создание cookie (`--login`, UC остался как `RUSPROFILE_BROWSER=uc`) |
 | `source_ofdata.py` / `source_checko.py` | API-пути (Docker и откат) |
 | `disk_organize.py` | пути/имена на Диске и в локальном хранилище поверх `connectors/yadisk_client` (`_mkdir`/`_upload` с ретраями на 423 и транзиентные сбои), заглушки .docx/.pdf (`_make_pdf` — голый stdlib-PDF, текст транслитерирован: базовые шрифты PDF кириллицу не несут) |
@@ -373,6 +456,31 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `KIMI_RESEARCH_CHECKPOINT_TTL_H` (72), `KIMI_TOOL_LOG_DIR`, `ORQ_KIMI_TOOL_TIMEOUT` (180 с на вызов),
 `ORQ_RESEARCH_TOOL` (путь к мосту).
 
+**Тумблеры подбора почты (`email_guess`):** `EMAIL_GUESS_HELO` / `EMAIL_GUESS_MAIL_FROM` —
+БЕЗ них SMTP-проба не выполняется вовсе (представляться чужим доменом нельзя: отказ по SPF
+неотличим от «ящика нет», и реальный контакт был бы выброшен); `EMAIL_GUESS_MAX_BYTES` (2 МиБ на
+страницу), `EMAIL_GUESS_SITE_BUDGET` (45 с — общий дедлайн обхода сайта на компанию; socket-таймаут
+от сервера, отдающего по байту, не спасает); `EMAIL_VERIFIER_URL` + `EMAIL_VERIFIER_KIND`
+(`aftership` | `reacher`) — адрес СВОЕГО (self-hosted) верификатора, если он поднят; облачные
+(ZeroBounce/Hunter/NeverBounce) не подключать — это выгрузка списка ЛПР третьей стороне.
+
+**Проверка существования ящика без отправки письма** (`email_guess.verify_addresses`) — вес
+вердикта задаёт не наш код, а приёмник почты домена: Яндекс 360 и Google Workspace отвечают
+честно (`full`), mail.ru и массовый хостинг — верить можно ТОЛЬКО отказу (`negative_only`),
+Microsoft 365 принимает почти всё и проверяет получателя после DATA (`none` — сессия не
+открывается вовсе). Отдельно различаются `550 5.1.1` (ящика нет) и `550 5.7.x` (политика/наш IP:
+об адресе не сказано ничего), catch-all (2 случайных адреса на домен) и «проба не состоялась».
+⚠️ Нужен открытый исходящий порт 25; с рабочей машины он открыт, в облаках обычно режется.
+
+**Тумблеры outreach-пайплайна:** `OUTREACH_FROM` (`tatar.ru` — подстрока адреса ящика-отправителя
+в профиле Outlook), `OUTREACH_SIGNER_NAME`/`OUTREACH_SIGNER_EMAIL`/`OUTREACH_SIGNER_PHONE`
+(подпись; дефолты — константы `VENDOR_*` из `onepager_kimi.py`), `OUTREACH_ONEPAGER_DIR`
+(`lead_orchestrator/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь к реестру, дефолт
+`<ORQ_DATA_ROOT>/orq_outreach/registry.json`), `ORQ_LETTER_MODEL` (`sonnet`).
+⚠️ Ящик отправителя в профиле — `Artur.Bayrashev@tatar.ru`, а контакт в подписи и в one-pager —
+`Ali.Shabanov@tatar.ru`: это РАЗНЫЕ люди. Ответ на письмо придёт Байрашеву, а звонить читателю
+предлагают Шабанову — если так не задумано, править `OUTREACH_SIGNER_*`.
+
 **Тумблеры ЛПР:** `PERSON_ENRICH` (1), `PERSON_VERIFY_EMAIL` (ВЫКЛ), `PERSON_SOCIAL` (ВЫКЛ) —
 последние два выключены, чтобы 200-прогон был быстрым и не долбил чужие серверы.
 ⚠️ Эти env читает ТОЛЬКО оркестратор; standalone `py person_enrich.py` по умолчанию делает и SMTP-пробу,
@@ -386,7 +494,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `PRESALE_PLATFORM_DESC`.
 
 **Служебные папки:** `D:\orq_cache` (кэш находок), `D:\orq_outbox` (недолитые файлы),
-`D:\orq_tmp` (temp + `run_*.log`).
+`D:\orq_tmp` (temp + `run_*.log`), `D:\orq_outreach` (реестр рассылки, ветка `outreach`).
 
 ## Подводные камни
 
@@ -407,6 +515,12 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
   «отличается только CRLF/LF». Синхронизировать её только осознанно. Удалять без бэкапа нельзя:
   там лежит Chrome-профиль ручного логина. Cookie рабочего проекта — в `env/rusprofile_cookies.json`;
   `~\.claude\skills\lead-finder\.rp_cookies.json` читается только как legacy fallback.
+- **⚠️ Профессиональный доступ RusProfile на 2026-08-06 НЕ активен.** `contacts_unlocked()` отдаёт
+  `False`: телефоны и почта приходят маской `░`, страница `/founders/<id>` закрыта целиком.
+  Значит ФАЗА 1 наберёт компании и руководителей, но БЕЗ контактов, а `email_guess` останется без
+  домена почты и будет строить гипотезы только от сайта. Лечится продлением подписки и
+  `py rusprofile_session.py --login` (cookie в `env/rusprofile_cookies.json`).
+  Проверить одной командой: `py rusprofile_session.py --check`.
 - **Порог выручки строгий:** компании без подтверждённой выручки или ниже порога отсекаются.
   Порядок ответа API сортировкой не считается: сначала читаются доступные страницы, затем применяется
   явная сортировка по убыванию. Регион, в отличие от выручки, фильтруется ТОЛЬКО клиентски.

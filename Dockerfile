@@ -86,6 +86,13 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator/rusprofile_session.py \
        lead_orchestrator/deep_research_engine.py \
        lead_orchestrator/company_research_agent.py \
+       lead_orchestrator/email_guess.py \
+       lead_orchestrator/email_verify.py \
+       lead_orchestrator/person_enrich.py \
+       lead_orchestrator/outreach.py \
+       lead_orchestrator/outreach_registry.py \
+       lead_orchestrator/outreach_letter.py \
+       lead_orchestrator/outlook_send.py \
        lead_orchestrator_kimi/onepager_kimi.py \
        lead_orchestrator_kimi/writer_kimi_agent.py \
        lead_orchestrator_kimi/research_enrichment_agent.py \
@@ -99,6 +106,10 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
     && python lead_orchestrator/test_claude_runtime.py \
     && python lead_orchestrator/test_kimi_agent_freedom.py \
     && python lead_orchestrator/test_research_enrichment.py \
+    && python lead_orchestrator/test_email_guess.py \
+    && python lead_orchestrator/test_email_verify.py \
+    && python lead_orchestrator/test_outreach.py \
+    && python lead_orchestrator/test_outlook_send.py \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/patches/apply_patches.py --check \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/writer_kimi_agent.py --selftest \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/research_enrichment_agent.py --selftest \

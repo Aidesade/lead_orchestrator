@@ -51,6 +51,99 @@ def log(message):
     print(message, flush=True)
 
 
+# --------------------------------------------------------- факты карточки ----
+# Проверено на живой карточке 2026-08-06 при ЗАКРЫТЫХ контактах: блок «Руководитель»
+# (должность, ФИО, дата назначения) читается без профессионального доступа, а телефоны
+# и почта в это же время замаскированы. Поэтому разбор руководителя обязан идти ВЫШЕ
+# пейвол-гарда _contacts_from_current — иначе ЛПР теряется вместе с телефонами.
+_RE_MANAGER = re.compile(
+    r"Руководитель\s*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)", re.I)
+# В подвале карточки: «Генеральный директор ООО "X" - Иванов Иван Иванович (ИНН 123456789012)».
+# 12 цифр — ИНН физлица (у организаций 10), это и отличает ЛПР от самой компании.
+_RE_PERSON_INN = re.compile(r"\(ИНН\s*(\d{12})\)")
+_RE_CAPITAL = re.compile(r"Уставный капитал\s*\r?\n\s*([^\r\n]+)", re.I)
+
+
+def _masked(value):
+    """Строка целиком или частично закрыта пейволом."""
+    return _MASK in (value or "")
+
+
+def card_facts(text):
+    """Факты главной карточки, доступные БЕЗ платного доступа.
+
+    Возвращает ключи только для того, что реально прочиталось: пустые значения не
+    кладём, чтобы не затирать в лиде то, что уже нашли другие источники."""
+    facts = {}
+    manager = _RE_MANAGER.search(text or "")
+    if manager:
+        post, fio = manager.group(1).strip(), manager.group(2).strip()
+        # порядок строк на карточке: должность, затем ФИО; если должности нет,
+        # первой строкой идёт само ФИО — тогда пост остаётся пустым
+        if not _masked(post) and not _masked(fio):
+            facts["_ceo_post"] = post
+            facts["_ceo_fio"] = fio
+    person_inn = _RE_PERSON_INN.search(text or "")
+    if person_inn:
+        facts["_ceo_inn"] = person_inn.group(1)
+    capital = _RE_CAPITAL.search(text or "")
+    if capital and not _masked(capital.group(1)):
+        facts["_capital"] = capital.group(1).strip()
+    return facts
+
+
+def parse_founders(text):
+    """Страница ``/founders/<id>`` -> учредители.
+
+    Формат блока (проверен на живой странице): строка с ФИО/названием, затем
+    «Период: …», «Доля: …», «Руководитель: …», «Связи: …», «ИНН: …». Разделы
+    «Актуальные (N)» и «Исторические (N)» идут подряд — исторических владельцев
+    в outreach не используем, но факт их наличия сохраняем.
+
+    ⚠️ Состав учредителей — платный раздел RusProfile. Без профессионального доступа
+    ФИО приходят замаскированными (``░``). В этом случае возвращается ``locked=True``
+    и ПУСТОЙ список — «учредители не раскрыты» и «учредителей нет» это разные вещи,
+    и пайплайн не должен их путать."""
+    lines = [ln.strip() for ln in (text or "").replace("\r", "").split("\n")]
+    founders, historic, current = [], False, None
+    locked = False
+    for idx, line in enumerate(lines):
+        if line.startswith("Исторические ("):
+            historic = True
+            continue
+        if line.startswith("Актуальные ("):
+            historic = False
+            continue
+        if line.startswith("Период:"):
+            # ФИО — предыдущая непустая строка
+            name = ""
+            for back in range(idx - 1, max(-1, idx - 4), -1):
+                if lines[back]:
+                    name = lines[back]
+                    break
+            if _masked(name):
+                locked = True
+                current = None
+                continue
+            if not name:
+                continue
+            current = {"fio": name, "period": line.split(":", 1)[1].strip(),
+                       "historic": historic, "share": "", "inn": ""}
+            founders.append(current)
+            continue
+        if current is None:
+            continue
+        for prefix, key in (("Доля:", "share"), ("ИНН:", "inn")):
+            if line.startswith(prefix):
+                value = line.split(":", 1)[1].strip()
+                current[key] = "" if _masked(value) else value
+    if _MASK in (text or "") and not founders:
+        locked = True
+    return {"founders": [f for f in founders if not f["historic"]],
+            "historic": [f for f in founders if f["historic"]],
+            "locked": locked}
+
+
 def normalize_cookie_rows(rows, *, now=None):
     """Selenium JSON-cookie -> Playwright cookie; expired entries are skipped."""
     current = time.time() if now is None else float(now)
@@ -304,8 +397,13 @@ class RusProfilePlaywrightSession:
                 block,
             )
             website = ("http://" + match.group(1)) if match else ""
+        unique_phones = list(dict.fromkeys(phones))
         return {
-            "phone": ", ".join(dict.fromkeys(phones))[:90],
+            # phone — историческая одна строка, обрезанная под ширину таблиц Excel;
+            # phones — полный список, он и нужен рассылке (звонок по второму номеру,
+            # если по первому не дозвонились)
+            "phone": ", ".join(unique_phones)[:90],
+            "phones": unique_phones,
             "emails": list(dict.fromkeys(email.lower() for email in emails)),
             "website": website,
         }
@@ -331,7 +429,25 @@ class RusProfilePlaywrightSession:
         )
         if main_okved:
             contacts["_main_okved_id"] = main_okved.group(1)
+        # руководитель и его ИНН — БЕСПЛАТНАЯ часть карточки, поэтому добираются
+        # даже когда _contacts_from_current вернул {} из-за пейвола
+        contacts.update(card_facts(text))
         return contacts
+
+    def founders_by_url(self, link):
+        """Учредители компании — отдельная страница ``/founders/<id>``.
+
+        На главной карточке структурированного состава учредителей нет: там о них
+        говорится только прозой в саммари, поэтому нужен отдельный переход. Ссылку
+        строим из URL карточки: ``/id/<n>`` -> ``/founders/<n>``."""
+        url = str(link)
+        match = re.search(r"/id/(\d+)", url)
+        if not match:
+            return {"founders": [], "historic": [], "locked": False,
+                    "note": f"из ссылки {url[:60]} не выводится страница учредителей"}
+        founders_url = f"https://www.rusprofile.ru/founders/{match.group(1)}"
+        _u, _h, text, _c = self._snapshot(founders_url)
+        return parse_founders(text)
 
     def company_by_url(self, link):
         """Совместимый с прежним --urls-file --playwright плоский JSON карточки."""
@@ -373,8 +489,17 @@ class RusProfilePlaywrightSession:
             "website": contacts.get("website") or "",
         }
 
-    def enrich_leads(self, leads, only_missing=True, log=log, checkpoint=None):
-        """Открыть ровно выбранные карточки и заполнить сайт/телефон/email."""
+    def enrich_leads(self, leads, only_missing=True, log=log, checkpoint=None,
+                     stop_when_locked=True, need_facts=False, with_founders=False):
+        """Открыть ровно выбранные карточки и заполнить сайт/телефон/email.
+
+        ``need_facts`` — карточку открывать и ради ЛПР (должность, ФИО, ИНН физлица),
+        даже если контакты у лида уже есть: это разные разделы страницы.
+        ``stop_when_locked`` — прежнее поведение «нет платного доступа, дальше нет
+        смысла». Для рассылки его выключают: руководитель читается и без доступа,
+        и ради него карточки стоит дочитать до конца.
+        ``with_founders`` — дополнительно открыть страницу учредителей (ещё один
+        переход на компанию; без профессионального доступа состав замаскирован)."""
         try:
             from checko_enrich import _best_email
         except Exception:
@@ -387,6 +512,8 @@ class RusProfilePlaywrightSession:
                 if "/id/" in (lead.get("_revenue_source_url") or "") else "")
             if not url:
                 return None
+            if need_facts and not lead.get("_ceo_fio"):
+                return url
             if only_missing and (
                     lead.get("website") or lead.get("phone") or lead.get("email")):
                 return None
@@ -402,8 +529,8 @@ class RusProfilePlaywrightSession:
         todo = [(lead, needed_url(lead)) for lead in leads]
         todo = [(lead, url) for lead, url in todo if url]
         log(f"[RusProfile/Playwright] карточек к парсингу: {len(todo)}")
-        used = sites = phones = emails = failed = 0
-        locked = False
+        used = sites = phones = emails = failed = facts = 0
+        locked = warned_locked = False
         for lead, url in todo:
             used += 1
             try:
@@ -414,12 +541,39 @@ class RusProfilePlaywrightSession:
                     f"  [warn] карточка {used}/{len(todo)} не разобрана: "
                     f"{type(exc).__name__}")
                 continue
+            # Данные ЕГРЮЛ бесплатны и читаются даже при закрытых контактах —
+            # переносим их ДО проверки замка, иначе ЛПР терялся бы вместе с телефоном
+            for key in ("_ceo_post", "_ceo_fio", "_ceo_inn", "_capital"):
+                if contacts.get(key) and not lead.get(key):
+                    lead[key] = contacts[key]
+                    if key == "_ceo_fio":
+                        facts += 1
+            if contacts.get("_ceo_fio") and not lead.get("contact_person"):
+                lead["contact_person"] = contacts["_ceo_fio"]
+            if with_founders:
+                try:
+                    found = self.founders_by_url(url)
+                except Exception as exc:           # noqa: BLE001 — учредители не критичны
+                    found = {"founders": [], "locked": False,
+                             "note": f"{type(exc).__name__}"}
+                if found.get("founders"):
+                    lead["_founders"] = found["founders"]
+                elif found.get("locked"):
+                    lead["_founders_locked"] = True
+
             if self.last_contacts_locked:
                 locked = True
-                log(
-                    "[RusProfile/Playwright] контакты закрыты — cookie истекли "
-                    "или нет профессионального доступа")
-                break
+                if stop_when_locked:
+                    log(
+                        "[RusProfile/Playwright] контакты закрыты — cookie истекли "
+                        "или нет профессионального доступа")
+                    break
+                if not warned_locked:
+                    warned_locked = True
+                    log(
+                        "[RusProfile/Playwright] контакты закрыты (нет профессионального "
+                        "доступа) — телефоны и почта не читаются, продолжаем ради "
+                        "руководителя: он в бесплатной части карточки")
             main_okved = contacts.get("_main_okved_id")
             if main_okved:
                 niche = re.sub(
@@ -432,7 +586,10 @@ class RusProfilePlaywrightSession:
                 sites += 1
             if contacts.get("phone") and not lead.get("phone"):
                 lead["phone"] = contacts["phone"]
+                lead["_phones"] = contacts.get("phones") or []
                 phones += 1
+            if contacts.get("emails"):
+                lead["_emails"] = contacts["emails"]
             if contacts.get("emails") and not lead.get("email"):
                 best, kind, is_target = _best_email(contacts["emails"])
                 if best:
@@ -449,13 +606,14 @@ class RusProfilePlaywrightSession:
         save_checkpoint()
         log(
             f"[RusProfile/Playwright] контакты: {used} карточек | "
-            f"сайт {sites} | тел {phones} | email {emails}"
+            f"сайт {sites} | тел {phones} | email {emails} | ЛПР {facts}"
             + (f" | ошибок {failed}" if failed else ""))
         return {
             "used": used,
             "site": sites,
             "phone": phones,
             "email": emails,
+            "facts": facts,
             "failed": failed,
             "locked": locked,
         }
