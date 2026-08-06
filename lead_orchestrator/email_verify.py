@@ -201,18 +201,23 @@ def check_smtp_many(domain, addresses, mx_hosts=None, timeout=10, helo=None,
         catch_all = accepted > 0
         for a in addresses:
             out[a]["is_catch_all"] = catch_all
-            out[a]["checked"] = True
         if catch_all:
             for a in addresses:
+                out[a]["checked"] = True
                 out[a]["reason"] = "домен принимает любой адрес (catch-all)"
             return out
 
-        for a in addresses:
+        # ⚠️ checked ставится ПОАДРЕСНО и только после реального ответа сервера.
+        # Пока он выставлялся всем скопом до цикла, адреса, до которых очередь не
+        # дошла (временный отказ -> break, обрыв связи -> except), выглядели как
+        # «подключились, ящик не принимает» и _reachable объявлял их несуществующими.
+        # Так живой ящик Artur.Bayrashev@tatar.ru получил вердикт «такого ящика нет».
+        for pos, a in enumerate(addresses):
             code, msg = session.rcpt(a)
             text = msg.decode("utf-8", "replace") if isinstance(msg, bytes) else str(msg)
             kind = EG._classify_rcpt(code, msg)
             row = out[a]
-            row.update(code=code, message=text[:200])
+            row.update(code=code, message=text[:200], checked=True)
             # «превышена квота» (552/452) — это НЕ временный сбой связи: ящик
             # существует, просто сейчас не примет письмо
             if code in (452, 552) and _FULL_INBOX.search(text):
@@ -231,7 +236,12 @@ def check_smtp_many(domain, addresses, mx_hosts=None, timeout=10, helo=None,
             else:
                 row["checked"] = False
                 row["reason"] = "временный отказ (greylisting или лимит)"
-                break                              # дальше не давим на чужой сервер
+                # дальше не давим на чужой сервер, но и молчать про остальные нельзя:
+                # непроверенный адрес обязан остаться непроверенным
+                for rest in addresses[pos + 1:]:
+                    out[rest]["reason"] = ("проверка прервана: сервер ответил "
+                                           "временным отказом на предыдущий адрес")
+                break
     except (OSError, socket.timeout, Exception) as exc:   # noqa: BLE001
         for a in addresses:
             if not out[a]["checked"]:

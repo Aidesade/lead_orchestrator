@@ -207,6 +207,34 @@ def test_smtp_session():
               and not rows["ivanov@dom.ru"]["is_deliverable"], str(rows["ivanov@dom.ru"]))
 
         _restore(saved)
+
+        # Временный отказ обрывает цикл, чтобы не давить на чужой сервер. Адреса,
+        # до которых очередь не дошла, ОБЯЗАНЫ остаться непроверенными: раньше им
+        # доставалось checked=True, выставленный скопом до цикла, и _reachable
+        # объявлял их несуществующими. На живом tatar.ru так был «похоронен»
+        # реальный ящик — сервер ответил 450 на первый адрес, а второй, который
+        # никто не спрашивал, получил вердикт «такого ящика нет».
+        def greylist(*a, **kw):
+            srv = FakeSMTP(*a, **kw)
+            srv.mode = "greylist"
+            return srv
+
+        saved = _with_smtp(greylist)
+        rows = EV.check_smtp_many("dom.ru", ["ivanov@dom.ru", "petrov@dom.ru"],
+                                  mx_hosts=["mail.dom.ru"])
+        first, second = rows["ivanov@dom.ru"], rows["petrov@dom.ru"]
+        check("временный отказ: первый адрес не проверен", not first["checked"],
+              str(first))
+        check("временный отказ: остальные адреса тоже не проверены",
+              not second["checked"], str(second))
+        state, why = EV._reachable(second, EV.check_misc("petrov@dom.ru"),
+                                   {"_state": True, "accepts_mail": True})
+        check("непроверенный адрес не выдаётся за несуществующий",
+              state == "unknown", f"{state}: {why}")
+        check("у непроверенного адреса объяснена причина",
+              "прервана" in second["reason"], str(second))
+
+        _restore(saved)
         saved = _with_smtp(lambda *a, **kw: (_ for _ in ()).throw(OSError("timed out")))
         rows = EV.check_smtp_many("dom.ru", ["ivanov@dom.ru"], mx_hosts=["mail.dom.ru"])
         check("недоступный сервер: проверка не состоялась",
