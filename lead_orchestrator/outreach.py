@@ -98,10 +98,11 @@ def check_verifier(required=True):
 
     import email_guess as EG
     # Контрольный адрес на домене, который заведомо принимает почту: нам важен не
-    # его вердикт, а сам факт, что сервис отвечает.
+    # его вердикт, а сам факт, что сервис отвечает. «Ящика нет» — тоже ответ.
     probe = EG.external_verify("postmaster@yandex.ru", url=url)
-    alive = probe.get("verdict") != "unknown" or "недоступен" not in (probe.get("note") or "")
-    if not alive:
+    unreachable = (probe.get("verdict") == "unknown"
+                   and "недоступен" in (probe.get("note") or ""))
+    if unreachable:
         raise SystemExit(f"[стадия 4] верификатор {url} не отвечает: {probe.get('note')}")
     log(f"[стадия 4] верификатор: {url} — отвечает")
     return {"url": url, "alive": True}
@@ -130,7 +131,7 @@ def collect_leads(args):
     if args.leads:
         with open(args.leads, "r", encoding="utf-8") as fh:
             leads = json.load(fh)
-        leads = [l for l in leads if l.get("name")]
+        leads = [lead for lead in leads if lead.get("name")]
         log(f"[стадия 2] лиды из файла: {len(leads)} — {args.leads}")
         return leads
 
@@ -199,8 +200,9 @@ async def stage_onepager(lead, idx, tmp_dir, generate=False):
     if proc.returncode != 0 or not os.path.isfile(out):
         tail = (stdout or b"").decode("utf-8", "replace").strip()[-300:]
         return "", f"генерация one-pager не удалась: {tail or proc.returncode}"
-    if os.path.getsize(out) < REAL_PDF_MIN:
-        return "", f"one-pager подозрительно мал ({os.path.getsize(out)} байт) — не прикладываем"
+    size = os.path.getsize(out)
+    if size < REAL_PDF_MIN:
+        return "", f"one-pager подозрительно мал ({size} байт) — не прикладываем"
     return out, ""
 
 
@@ -258,9 +260,12 @@ async def stage_email(lead, idx, dry_run=False):
     цепочку стадий, а не доступность чужих серверов (и ничего им не стоит)."""
     import email_guess as EG
 
+    online = not dry_run
     guess = await asyncio.to_thread(
-        EG.guess_for_company, lead, "", None, not dry_run, not dry_run, 3,
-        _flag("EMAIL_GUESS_SITE") and not dry_run, lambda *a: None)
+        EG.guess_for_company, lead,
+        check_mx=online, smtp=online, per_person=3,
+        use_site=online and _flag("EMAIL_GUESS_SITE"),
+        log=lambda *a: None)
     picked = pick_recipient(guess, lead)
     if not picked:
         note = "; ".join(guess.get("notes") or []) or "адресов не построено"
@@ -271,6 +276,10 @@ async def stage_email(lead, idx, dry_run=False):
 
 # ============================================================== СТАДИЯ 7 ======
 def industry_cfg(lead):
+    """Карточка отрасли (label/pain/offer) из карты сбора — или пустой dict.
+
+    Импорт ленивый и под except: при работе по готовому JSON лидов Фаза 1 не нужна
+    вовсе, а тянуть ради трёх строк источник с playwright — нет."""
     try:
         import source_rusprofile as RP
         return RP.INDUSTRY.get((lead.get("_industry") or "").strip()) or {}
@@ -291,15 +300,19 @@ def build_recipients(picked, lead):
     return to, general, f"копия на общую почту {general} — адрес ЛПР расчётный"
 
 
-async def stage_letter(lead, idx, picked, dry_run=False):
-    """Стадия 7а: текст письма."""
+async def stage_letter(lead, idx, onepager="", dry_run=False):
+    """Стадия 7а: текст письма.
+
+    ``onepager`` нужен не для отправки, а для промпта: без файла модели прямо
+    запрещается писать «во вложении» — иначе получатель ищет несуществующий файл."""
     if dry_run:
         return {"subject": f"[dry-run] {lead.get('name')}",
                 "body": "Заглушка dry-run.\n\n" + LETTER.signature_block()}, ""
+    cfg = industry_cfg(lead)
     try:
         letter = await LETTER.write_letter(
-            lead, pain=industry_cfg(lead).get("pain", ""),
-            industry_cfg=industry_cfg(lead), log=lambda m: log(f"  {m}"))
+            lead, pain=cfg.get("pain", ""), industry_cfg=cfg,
+            has_attachment=bool(onepager), log=lambda m: log(f"  {m}"))
     except LETTER.LetterError as exc:
         return None, f"письмо не написано: {exc}"
     except Exception as exc:                        # noqa: BLE001 — модель не должна валить прогон
@@ -326,24 +339,33 @@ def stage_send(lead, idx, picked, letter, onepager, send=False, dry_run=False):
 
 
 # ============================================================== ОБРАБОТКА =====
+# Как называется остановка в логе и чем она оборачивается для счётчиков прогона.
+_STOP = {REG.SKIP: ("пропуск", "skip"), REG.FAIL: ("сбой", "fail")}
+
+
 async def process(lead, idx, reg, args, tmp_dir):
     """Одна компания: стадии 3, 6, 7. Сбой любой из них не валит прогон."""
     inn = str(lead.get("_inn") or "").strip()
-    name = lead.get("name") or ""
-    log(f"[{idx}] {name} (ИНН {inn or '—'})")
+    log(f"[{idx}] {lead.get('name') or ''} (ИНН {inn or '—'})")
     if not inn:
         log("    пропуск: у лида нет ИНН — в реестр писать нечего")
         return "skip"
     reg.upsert(lead)
 
-    # стадия 2 засчитывается по факту наличия адресата
-    if lead.get("contact_person"):
-        reg.mark(inn, "parsed", REG.OK)
-    else:
-        reg.mark(inn, "parsed", REG.SKIP, "руководитель не определён — писать некому")
+    def stop(stage, status, reason):
+        """Остановиться на стадии. Причина уходит и в реестр (её читает стадия 8),
+        и в лог — и это ОДНА причина: два разных объяснения одного пропуска
+        расходились бы по формулировкам."""
+        word, outcome = _STOP[status]
+        reg.mark(inn, stage, status, reason)
         reg.save()
-        log("    пропуск: не известен руководитель")
-        return "skip"
+        log(f"    {word}: {reason}")
+        return outcome
+
+    # стадия 2 засчитывается по факту наличия адресата
+    if not lead.get("contact_person"):
+        return stop("parsed", REG.SKIP, "руководитель не определён — писать некому")
+    reg.mark(inn, "parsed", REG.OK)
 
     onepager, why = await stage_onepager(lead, idx, tmp_dir, generate=args.generate_onepager)
     reg.mark(inn, "onepager", REG.OK if onepager else REG.SKIP, "" if onepager else why)
@@ -352,27 +374,19 @@ async def process(lead, idx, reg, args, tmp_dir):
 
     picked, why = await stage_email(lead, idx, dry_run=args.dry_run)
     if not picked:
-        reg.mark(inn, "email", REG.SKIP, why)
-        reg.save()
-        log(f"    пропуск: {why}")
-        return "skip"
+        return stop("email", REG.SKIP, why)
     reg.mark(inn, "email", REG.OK,
              "" if picked["confirmed"] else "адрес расчётный, не подтверждён")
 
-    letter, why = await stage_letter(lead, idx, picked, dry_run=args.dry_run)
+    letter, why = await stage_letter(lead, idx, onepager=onepager, dry_run=args.dry_run)
     if not letter:
-        reg.mark(inn, "letter", REG.FAIL, why)
-        reg.save()
-        log(f"    сбой: {why}")
-        return "fail"
+        return stop("letter", REG.FAIL, why)
     reg.mark(inn, "letter", REG.OK)
 
     res, note = stage_send(lead, idx, picked, letter, onepager,
                            send=args.send, dry_run=args.dry_run)
     if not res:
-        reg.mark(inn, "sent", REG.FAIL, note)
-        reg.save()
-        return "fail"
+        return stop("sent", REG.FAIL, note)
     if args.dry_run:
         reg.mark(inn, "sent", REG.SKIP, "dry-run: письмо не создавалось")
     else:
@@ -423,7 +437,7 @@ async def run(args):
         except Exception as exc:                    # noqa: BLE001 — одна компания не валит прогон
             log(f"    [{idx}] сбой компании: {type(exc).__name__}: {str(exc)[:140]}")
             outcome = "fail"
-        stats[outcome] = stats.get(outcome, 0) + 1
+        stats[outcome] += 1
         if outcome == "ok" and idx < len(leads) and args.pace > 0 and not args.dry_run:
             await asyncio.sleep(args.pace)
 

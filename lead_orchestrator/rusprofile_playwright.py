@@ -72,24 +72,36 @@ def _masked(value):
 def card_facts(text):
     """Факты главной карточки, доступные БЕЗ платного доступа.
 
-    Возвращает ключи только для того, что реально прочиталось: пустые значения не
-    кладём, чтобы не затирать в лиде то, что уже нашли другие источники."""
+    Возвращает ключи только для того, что реально прочиталось: пустые и
+    замаскированные значения не кладём, чтобы не затирать в лиде то, что уже
+    нашли другие источники."""
+    text = text or ""
     facts = {}
-    manager = _RE_MANAGER.search(text or "")
+    manager = _RE_MANAGER.search(text)
     if manager:
+        # порядок строк в блоке фиксирован: «Руководитель», должность, ФИО
         post, fio = manager.group(1).strip(), manager.group(2).strip()
-        # порядок строк на карточке: должность, затем ФИО; если должности нет,
-        # первой строкой идёт само ФИО — тогда пост остаётся пустым
         if not _masked(post) and not _masked(fio):
             facts["_ceo_post"] = post
             facts["_ceo_fio"] = fio
-    person_inn = _RE_PERSON_INN.search(text or "")
+    person_inn = _RE_PERSON_INN.search(text)
     if person_inn:
         facts["_ceo_inn"] = person_inn.group(1)
-    capital = _RE_CAPITAL.search(text or "")
+    capital = _RE_CAPITAL.search(text)
     if capital and not _masked(capital.group(1)):
         facts["_capital"] = capital.group(1).strip()
     return facts
+
+
+def _name_above(lines, idx, depth=3):
+    """ФИО (или название) учредителя — ближайшая непустая строка над «Период:».
+
+    Смотрим на несколько строк вверх, а не ровно на одну: вёрстка вставляет между
+    ними пустые строки."""
+    for back in range(idx - 1, max(-1, idx - depth - 1), -1):
+        if lines[back]:
+            return lines[back]
+    return ""
 
 
 def parse_founders(text):
@@ -105,30 +117,25 @@ def parse_founders(text):
     и ПУСТОЙ список — «учредители не раскрыты» и «учредителей нет» это разные вещи,
     и пайплайн не должен их путать."""
     lines = [ln.strip() for ln in (text or "").replace("\r", "").split("\n")]
-    founders, historic, current = [], False, None
-    locked = False
+    founders, current = [], None
+    in_historic = locked = False
     for idx, line in enumerate(lines):
         if line.startswith("Исторические ("):
-            historic = True
+            in_historic = True
             continue
         if line.startswith("Актуальные ("):
-            historic = False
+            in_historic = False
             continue
         if line.startswith("Период:"):
-            # ФИО — предыдущая непустая строка
-            name = ""
-            for back in range(idx - 1, max(-1, idx - 4), -1):
-                if lines[back]:
-                    name = lines[back]
-                    break
+            name = _name_above(lines, idx)
             if _masked(name):
                 locked = True
-                current = None
+                current = None                     # блок закрыт — его «Доля»/«ИНН» не наши
                 continue
             if not name:
                 continue
             current = {"fio": name, "period": line.split(":", 1)[1].strip(),
-                       "historic": historic, "share": "", "inn": ""}
+                       "historic": in_historic, "share": "", "inn": ""}
             founders.append(current)
             continue
         if current is None:
@@ -137,7 +144,7 @@ def parse_founders(text):
             if line.startswith(prefix):
                 value = line.split(":", 1)[1].strip()
                 current[key] = "" if _masked(value) else value
-    if _MASK in (text or "") and not founders:
+    if _masked(text) and not founders:
         locked = True
     return {"founders": [f for f in founders if not f["historic"]],
             "historic": [f for f in founders if f["historic"]],
@@ -446,7 +453,7 @@ class RusProfilePlaywrightSession:
             return {"founders": [], "historic": [], "locked": False,
                     "note": f"из ссылки {url[:60]} не выводится страница учредителей"}
         founders_url = f"https://www.rusprofile.ru/founders/{match.group(1)}"
-        _u, _h, text, _c = self._snapshot(founders_url)
+        _url, _html, text, _combined = self._snapshot(founders_url)
         return parse_founders(text)
 
     def company_by_url(self, link):
@@ -463,11 +470,7 @@ class RusProfilePlaywrightSession:
         heading = (
             self.page.locator("h1").first.inner_text().strip()
             if self.page.locator("h1").count() else "")
-        manager = re.search(
-            r"Руководитель\s*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)",
-            text,
-            re.I,
-        )
+        manager = _RE_MANAGER.search(text)
         revenue = re.search(
             r"Основные показатели[^\r\n]*\r?\n(?:[^\r\n]*\r?\n){0,3}?"
             r"Выручка\s*\r?\n\s*([^\r\n]+)",
@@ -543,24 +546,22 @@ class RusProfilePlaywrightSession:
                 continue
             # Данные ЕГРЮЛ бесплатны и читаются даже при закрытых контактах —
             # переносим их ДО проверки замка, иначе ЛПР терялся бы вместе с телефоном
+            if contacts.get("_ceo_fio") and not lead.get("_ceo_fio"):
+                facts += 1
             for key in ("_ceo_post", "_ceo_fio", "_ceo_inn", "_capital"):
                 if contacts.get(key) and not lead.get(key):
                     lead[key] = contacts[key]
-                    if key == "_ceo_fio":
-                        facts += 1
             if contacts.get("_ceo_fio") and not lead.get("contact_person"):
                 lead["contact_person"] = contacts["_ceo_fio"]
             if with_founders:
                 try:
                     found = self.founders_by_url(url)
-                except Exception as exc:           # noqa: BLE001 — учредители не критичны
-                    found = {"founders": [], "locked": False,
-                             "note": f"{type(exc).__name__}"}
+                except Exception:                  # noqa: BLE001 — учредители не критичны
+                    found = {}
                 if found.get("founders"):
                     lead["_founders"] = found["founders"]
                 elif found.get("locked"):
                     lead["_founders_locked"] = True
-
             if self.last_contacts_locked:
                 locked = True
                 if stop_when_locked:

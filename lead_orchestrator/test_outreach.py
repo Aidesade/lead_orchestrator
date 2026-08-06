@@ -201,6 +201,11 @@ def check_letter() -> None:
     org_lead = dict(lead, contact_person='ООО "Управляющая компания Актив"')
     assert "Обращайся без имени" in LT.build_prompt(org_lead)
 
+    # без one-pager модели прямо запрещается писать «во вложении»: получатель иначе
+    # будет искать файл, которого в письме нет
+    assert "ВЛОЖЕНИЕ: НЕТ" in LT.build_prompt(lead, has_attachment=False)
+    assert "ВЛОЖЕНИЕ: есть" in LT.build_prompt(lead, has_attachment=True)
+
     body = "Здравствуйте.\n" + "Текст письма про платформу. " * 20
     reply = LT.parse_reply('```json\n' + json.dumps(
         {"subject": "Тема письма про ИИ", "body": body}, ensure_ascii=False) + '\n```')

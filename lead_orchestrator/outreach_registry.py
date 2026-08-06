@@ -94,6 +94,23 @@ def _inn_of(lead):
     return str((lead or {}).get("_inn") or (lead or {}).get("inn") or "").strip()
 
 
+def _two_real_docx(folder):
+    """Есть ли в папке компании ДВА .docx крупнее порога — то есть материалы сделаны.
+
+    Имена файлов не проверяем: они собираются из названия компании, а в папке
+    (её имя — ИНН) названия нет."""
+    real = 0
+    for fname in os.listdir(folder):
+        if not fname.lower().endswith(".docx"):
+            continue
+        try:
+            if os.path.getsize(os.path.join(folder, fname)) > REAL_DOCX_MIN:
+                real += 1
+        except OSError:                            # файл исчез между listdir и getsize
+            continue
+    return real >= 2
+
+
 class Registry:
     """Реестр в памяти + атомарное сохранение."""
 
@@ -135,23 +152,34 @@ class Registry:
     def get(self, inn):
         return self.companies.get(str(inn).strip())
 
+    def _record(self, inn):
+        """Запись компании; при первом обращении заводит пустую.
+
+        Инвариант «у записи всегда есть stages» держится здесь, а не в каждом из
+        трёх мест, которые в реестр пишут (upsert, mark, бэкфилл) — читает-то их
+        всех один audit."""
+        key = str(inn).strip()
+        rec = self.companies.setdefault(key, {"inn": key, "stages": {}})
+        rec.setdefault("stages", {})
+        return rec
+
     def upsert(self, lead):
         """Завести/обновить запись по лиду. Возвращает саму запись."""
         inn = _inn_of(lead)
         if not inn:
             raise ValueError("у лида нет ИНН — в реестр по названию не пишем")
-        rec = self.companies.setdefault(inn, {"inn": inn, "stages": {}})
+        rec = self._record(inn)
         rec["name"] = lead.get("name") or rec.get("name") or ""
         rec["industry"] = lead.get("_industry") or rec.get("industry") or ""
-        for key, field in (("site", "website"), ("phone", "phone")):
-            if lead.get(field):
-                rec[key] = lead[field]
+        if lead.get("website"):
+            rec["site"] = lead["website"]
+        if lead.get("phone"):
+            rec["phone"] = lead["phone"]
         for key in ("_phones", "_emails", "_founders"):
             if lead.get(key):
-                rec[key.lstrip("_")] = lead[key]
+                rec[key[1:]] = lead[key]           # служебный ключ лида -> обычный в реестре
         if lead.get("contact_person"):
             rec["ceo"] = {"fio": lead["contact_person"], "post": lead.get("_ceo_post") or ""}
-        rec.setdefault("stages", {})
         return rec
 
     def mark(self, inn, stage, status=OK, note=""):
@@ -161,15 +189,18 @@ class Registry:
             raise ValueError(f"неизвестная стадия: {stage}")
         if status in (SKIP, FAIL) and not note:
             raise ValueError(f"стадия {stage}: для статуса {status} нужна причина")
-        rec = self.companies.setdefault(str(inn).strip(), {"inn": str(inn).strip(), "stages": {}})
-        rec.setdefault("stages", {})[stage] = {"status": status, "at": _now(), "note": note}
+        rec = self._record(inn)
+        rec["stages"][stage] = {"status": status, "at": _now(), "note": note}
         return rec
 
     def mark_sent(self, inn, to, subject, draft=False, note=""):
         """Факт отправки — отдельным полем, а не только стадией: это единственное
         необратимое действие пайплайна, и его лог не должен зависеть от формата стадий."""
-        rec = self.mark(inn, "sent", OK if not draft else SKIP,
-                        note=note or ("черновик, не отправлено" if draft else ""))
+        if draft:
+            # черновик стадию НЕ закрывает: письмо ещё не ушло, компания в работе
+            rec = self.mark(inn, "sent", SKIP, note or "черновик, не отправлено")
+        else:
+            rec = self.mark(inn, "sent", OK, note)
         rec["sent"] = {"at": _now(), "to": to, "subject": subject, "draft": bool(draft)}
         return rec
 
@@ -205,8 +236,7 @@ class Registry:
         """Разово втянуть компании, по которым уже сделаны материалы.
 
         Смотрим ровно то же, что резюм оркестратора: два .docx больше REAL_DOCX_MIN
-        в папке <deliverables>/<ИНН>/. Имена файлов не проверяем — они зависят от
-        названия компании, а оно в папке не хранится."""
+        в папке <deliverables>/<ИНН>/."""
         root = root or deliverables_root()
         if not os.path.isdir(root):
             log(f"[реестр] папки деливераблов нет: {root} — бэкфилл пропущен")
@@ -218,25 +248,13 @@ class Registry:
             if not inn.isdigit():
                 continue
             comp = os.path.join(root, entry)
-            if not os.path.isdir(comp):
+            if not os.path.isdir(comp) or not _two_real_docx(comp):
                 continue
-            docx = []
-            for fname in os.listdir(comp):
-                if not fname.lower().endswith(".docx"):
-                    continue
-                try:
-                    if os.path.getsize(os.path.join(comp, fname)) > REAL_DOCX_MIN:
-                        docx.append(fname)
-                except OSError:
-                    continue
-            if len(docx) < 2:
-                continue
-            rec = self.companies.setdefault(inn, {"inn": inn, "stages": {}})
+            rec = self._record(inn)
             if not rec.get("deliverables"):
                 added += 1
             rec["deliverables"] = True
             rec.setdefault("name", "")
-            rec.setdefault("stages", {})
         log(f"[реестр] бэкфилл деливераблов: +{added} компаний (всего в реестре {len(self.companies)})")
         return added
 
@@ -255,15 +273,16 @@ class Registry:
             stages = rec.get("stages") or {}
             done, missing = [], []
             for sid in STAGE_IDS:
-                st = (stages.get(sid) or {}).get("status")
-                if st == OK:
+                info = stages.get(sid) or {}
+                status = info.get("status")
+                if status == OK:
                     done.append(sid)
                     continue
-                note = (stages.get(sid) or {}).get("note") or ""
-                missing.append({
-                    "stage": sid,
-                    "reason": f"{st}: {note or 'без причины'}" if st else "не выполнялась",
-                })
+                if status:
+                    reason = f"{status}: {info.get('note') or 'без причины'}"
+                else:
+                    reason = "не выполнялась"
+                missing.append({"stage": sid, "reason": reason})
             if not missing:
                 state = "готово"
             elif not stages:
@@ -292,19 +311,19 @@ def format_audit(rows):
     lines = [f"[стадия 8] компаний в реестре: {len(rows)}"]
     counts = {"готово": 0, "частично": 0, "ранее": 0, "не начата": 0}
     for row in rows:
-        counts[row["state"]] = counts.get(row["state"], 0) + 1
+        counts[row["state"]] += 1
         if row["state"] == "готово":
             lines.append(f"  ✓ {row['inn']} {row['name'][:40]}: все стадии пройдены")
         elif row["state"] == "частично":
-            last = STAGE_TITLE.get(row["last_ok"], "") if row["last_ok"] else "ничего"
+            last = STAGE_TITLE.get(row["last_ok"], "ничего")   # last_ok=None -> «ничего»
             lines.append(f"  • {row['inn']} {row['name'][:40]}\n      дошли до: {last}")
             for item in row["missing"]:
                 lines.append(f"      пропущено: {STAGE_TITLE.get(item['stage'], item['stage'])}"
                              f" — {item['reason']}")
-    if counts.get("ранее"):
+    if counts["ранее"]:
         lines.append(f"  … {counts['ранее']} компаний с готовыми материалами — "
                      f"рассылка по ним не запускалась")
-    if counts.get("не начата"):
+    if counts["не начата"]:
         lines.append(f"  … {counts['не начата']} компаний заведены, но не обрабатывались")
     lines.append(f"[стадия 8] пройдено полностью: {counts['готово']}, "
                  f"с пропусками: {counts['частично']}, из {len(rows)}")

@@ -73,7 +73,7 @@ def pick_account(accounts, needle=None):
     Точное совпадение адреса приоритетнее подстроки: если в профиле есть и
     ``mail@tatar.ru``, и ``mail@tatar.ru.example.com``, подстрока найдёт оба."""
     needle = (needle or DEFAULT_FROM).strip().lower()
-    found = []
+    by_substring = (None, "")
     for acc in accounts or []:
         addr = account_address(acc)
         if not addr:
@@ -81,9 +81,9 @@ def pick_account(accounts, needle=None):
         low = addr.lower()
         if low == needle:
             return acc, addr
-        if needle in low:
-            found.append((acc, addr))
-    return found[0] if found else (None, "")
+        if needle in low and by_substring[0] is None:
+            by_substring = (acc, addr)
+    return by_substring
 
 
 def validate(msg):
@@ -173,11 +173,12 @@ def accounts():
     return list(_outlook().Session.Accounts)
 
 
-def check_ready(needle=None):
-    """Прекондишен стадии 5. Возвращает dict; исключение — если ящика нет.
+def _require_account(needle=None):
+    """Аккаунт отправителя или ЖЁСТКАЯ ошибка со списком того, что есть в профиле.
 
-    Падаем ЖЁСТКО и до первой компании: пайплайн, который отработал сбор и ресёрч,
-    а потом не смог отправить, тратит деньги впустую."""
+    Общий вход и для прекондишена, и для отправки: перепутанный ящик обнаруживается
+    одинаково — до первой компании и перед каждым письмом.
+    Возвращает (аккаунт, адрес, все аккаунты профиля)."""
     needle = needle or DEFAULT_FROM
     every = accounts()
     acc, addr = pick_account(every, needle)
@@ -186,6 +187,15 @@ def check_ready(needle=None):
         raise OutlookError(
             f"в профиле Outlook нет аккаунта с «{needle}». Есть: {known}. "
             f"Добавь ящик или задай другой в OUTREACH_FROM")
+    return acc, addr, every
+
+
+def check_ready(needle=None):
+    """Прекондишен стадии 5. Возвращает dict; исключение — если ящика нет.
+
+    Падаем ЖЁСТКО и до первой компании: пайплайн, который отработал сбор и ресёрч,
+    а потом не смог отправить, тратит деньги впустую."""
+    _acc, addr, every = _require_account(needle)
     return {"account": addr, "accounts": [account_address(a) for a in every]}
 
 
@@ -195,11 +205,8 @@ def send_message(msg, draft=True, account=None):
     Возвращает dict с фактическим результатом — вызывающий обязан записать его
     в реестр, иначе повторный прогон напишет тому же человеку второй раз."""
     clean = validate(msg)
-    outlook = _outlook()
-    acc, addr = pick_account(outlook.Session.Accounts, account or DEFAULT_FROM)
-    if not acc:
-        raise OutlookError(f"нет аккаунта Outlook с «{account or DEFAULT_FROM}»")
-    mail = outlook.CreateItem(OL_MAIL_ITEM)
+    acc, addr, _every = _require_account(account)
+    mail = _outlook().CreateItem(OL_MAIL_ITEM)
     compose(mail, clean, acc)
     action = deliver(mail, draft=draft)
     return {

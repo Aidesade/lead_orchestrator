@@ -83,15 +83,23 @@ def salutation(fio):
 
 
 def _money(value):
+    """Выручка -> «4,3 млрд ₽». Нечисло и меньше миллиарда — пустая строка: в промпт
+    идут только величины, которые пайплайн подтвердил (порог отбора и так 1 млрд)."""
     try:
         billions = float(value) / 1e9
     except (TypeError, ValueError):
         return ""
-    return f"{billions:.1f} млрд ₽".replace(".", ",") if billions >= 1 else ""
+    if billions < 1:
+        return ""
+    return f"{billions:.1f} млрд ₽".replace(".", ",")
 
 
-def build_prompt(lead, pain="", industry_cfg=None):
-    """Факты для модели. Ровно те, что проверены — ни одного «примерно» и «вероятно»."""
+def build_prompt(lead, pain="", industry_cfg=None, has_attachment=True):
+    """Факты для модели. Ровно те, что проверены — ни одного «примерно» и «вероятно».
+
+    ``has_attachment`` обязателен: one-pager по отрасли может отсутствовать, а фраза
+    «во вложении — описание платформы» в письме БЕЗ вложения выглядит как ошибка
+    отправителя и провоцирует ответ «а где файл?»."""
     cfg = industry_cfg or {}
     fio = (lead.get("contact_person") or "").strip()
     person_ok = EG.is_person(fio)
@@ -110,13 +118,32 @@ def build_prompt(lead, pain="", industry_cfg=None):
     ]
     known = "\n".join(f"- {key}: {value}" for key, value in rows if value)
     unknown = [key for key, value in rows if not value]
-    text = ["Напиши письмо по этим фактам.", "", "ИЗВЕСТНО:", known]
+    if has_attachment:
+        attachment = ("есть — одной нейтральной фразой упомяни, что во вложении "
+                      "короткое описание платформы на одну страницу.")
+    else:
+        attachment = "НЕТ — не упоминай вложение, файл, презентацию и «во вложении»."
+    lines = ["Напиши письмо по этим фактам.", "", "ИЗВЕСТНО:", known,
+             "", "ВЛОЖЕНИЕ: " + attachment]
     if unknown:
-        text += ["", "НЕ ИЗВЕСТНО (не упоминай и не домысливай): " + ", ".join(unknown)]
+        lines += ["", "НЕ ИЗВЕСТНО (не упоминай и не домысливай): " + ", ".join(unknown)]
     if not person_ok and fio:
-        text += ["", f"Поле «руководитель» содержит «{fio}» — это не ФИО человека "
-                     f"(управляющая организация или должность). Обращайся без имени."]
-    return "\n".join(text)
+        lines += ["", f"Поле «руководитель» содержит «{fio}» — это не ФИО человека "
+                      f"(управляющая организация или должность). Обращайся без имени."]
+    return "\n".join(lines)
+
+
+def _strip_contacts(body):
+    """Убрать строки с телефоном/почтой, если модель всё-таки подписалась.
+
+    Промпт это запрещает, но нарушение стоит дорого: в письме оказались бы два
+    разных набора контактов — выдуманный моделью и настоящий из подписи."""
+    kept = []
+    for line in body.split("\n"):
+        if _ANY_EMAIL.search(line) or _ANY_PHONE.search(line):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def parse_reply(text):
@@ -147,19 +174,6 @@ def parse_reply(text):
     return {"subject": subject, "body": body}
 
 
-def _strip_contacts(body):
-    """Убрать строки с телефоном/почтой, если модель всё-таки подписалась.
-
-    Промпт это запрещает, но нарушение стоит дорого: в письме оказались бы два
-    разных набора контактов — выдуманный моделью и настоящий из подписи."""
-    kept = []
-    for line in body.split("\n"):
-        if _ANY_EMAIL.search(line) or _ANY_PHONE.search(line):
-            continue
-        kept.append(line)
-    return "\n".join(kept).strip()
-
-
 def signature_block():
     """Подпись и отказ — детерминированно, из констант."""
     return "\n".join([
@@ -173,22 +187,21 @@ def signature_block():
     ])
 
 
-def assemble(letter, lead=None):
+def assemble(letter):
     """Тело модели + подпись кода -> итоговое письмо."""
-    del lead
     return {"subject": letter["subject"],
             "body": letter["body"].rstrip() + "\n\n" + signature_block()}
 
 
 # ------------------------------------------------------------------ модель ----
-async def write_letter(lead, pain="", industry_cfg=None, model=None, log=print):
+async def write_letter(lead, pain="", industry_cfg=None, model=None, log=print,
+                       has_attachment=True):
     """Сходить к модели за письмом. Возвращает {"subject", "body"} уже с подписью."""
-    runtime = "claude"
     try:
         import kimi_config as KC
         runtime = KC.runtime()
-    except Exception:                              # noqa: BLE001 — дефолт ветки
-        pass
+    except Exception:                              # noqa: BLE001 — нет конфига = дефолт ветки
+        runtime = "claude"
     if runtime != "claude":
         raise LetterError(
             "стадия письма реализована для claude-runtime; для kimi запусти прогон с "
@@ -200,20 +213,23 @@ async def write_letter(lead, pain="", industry_cfg=None, model=None, log=print):
     except ImportError as exc:
         raise LetterError(f"адаптер Claude SDK недоступен: {str(exc)[:90]}") from exc
 
-    prompt = build_prompt(lead, pain=pain, industry_cfg=industry_cfg)
+    prompt = build_prompt(lead, pain=pain, industry_cfg=industry_cfg,
+                          has_attachment=has_attachment)
     chunks = []
     async for message in adapter.prompt(
             prompt, model=model or os.environ.get("ORQ_LETTER_MODEL") or "sonnet",
             agent_file=AGENT_FILE, final_message_only=True):
         try:
-            chunks.append(message.extract_text() or "")
+            text = message.extract_text() or ""
         except Exception:                          # noqa: BLE001 — служебные сообщения без текста
             continue
-    reply = "\n".join(c for c in chunks if c).strip()
+        if text:
+            chunks.append(text)
+    reply = "\n".join(chunks).strip()
     if not reply:
         raise LetterError("модель не вернула текста")
     log(f"    письмо: получено {len(reply)} знаков ответа")
-    return assemble(parse_reply(reply), lead)
+    return assemble(parse_reply(reply))
 
 
 def _demo_lead():
@@ -229,14 +245,13 @@ def _demo_lead():
 
 def main():
     ap = argparse.ArgumentParser(description="письмо ЛПР: промпт и сборка")
-    ap.add_argument("--demo", action="store_true", help="показать промпт и подпись на заглушке")
-    a = ap.parse_args()
-    if a.demo or True:
-        lead = _demo_lead()
-        print("=== ПРОМПТ ===")
-        print(build_prompt(lead, pain="Аварийность и простои оборудования"))
-        print("\n=== ПОДПИСЬ (дописывает код) ===")
-        print(signature_block())
+    ap.add_argument("--demo", action="store_true",
+                    help="показать промпт и подпись на заглушке (единственный режим CLI)")
+    ap.parse_args()
+    print("=== ПРОМПТ ===")
+    print(build_prompt(_demo_lead(), pain="Аварийность и простои оборудования"))
+    print("\n=== ПОДПИСЬ (дописывает код) ===")
+    print(signature_block())
     return 0
 
 
