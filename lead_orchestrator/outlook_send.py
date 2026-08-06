@@ -53,6 +53,11 @@ class OutlookError(RuntimeError):
     """Outlook не запущен, нет нужного аккаунта или COM отказал."""
 
 
+# Общее имя ошибки транспорта: outreach.py выбирает между этим модулем и mail_ews
+# (Exchange по EWS) и не должен знать, у какого из них как называется исключение.
+TransportError = OutlookError
+
+
 # ------------------------------------------------------------- чистая логика ----
 def account_address(acc):
     """Адрес аккаунта Outlook. У Exchange-аккаунтов SmtpAddress бывает пустым —
