@@ -50,9 +50,17 @@ from deep_research_engine import _text_belongs   # чистая ф-я: ИНН/н
 
 # Источники, которые МЫ НЕ ИСПОЛЬЗУЕМ (краденое/частная жизнь/недостоверно).
 # Список — для прозрачности в выводе; в коде этих источников нет.
+# Критерий: должностное качество + публичный источник/протокол ПО НАЗНАЧЕНИЮ + никакой
+# новой персональной характеристики сверх делового контакта + персданные не покидают
+# периметр. Нарушен любой пункт — источник сюда, а не в код. Запрещает не «краденый
+# источник», а РЕЗУЛЬТАТ: профиль частной жизни человека вместо способа связаться по работе.
 DENY_SOURCES = (
     "truecaller", "getcontact", "«пробив» номера", "breach/leak-базы (HIBP/Dehashed)",
     "people-search (Pipl/Spokeo)", "username-профайлинг (Sherlock/Maigret)",
+    "account enumeration по email — где ящик зарегистрирован (holehe и аналоги)",
+    "профилирование по email: Google-аккаунт и Gravatar-профиль (GHunt/Epieos)",
+    "облачные верификаторы email (ZeroBounce/Hunter/NeverBounce) — выгрузка списка ЛПР "
+    "третьей стороне",
 )
 
 _PHONE_RE = re.compile(r"(?:\+7|8)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}")
@@ -77,31 +85,19 @@ def _fio_match(a, b):
 
 
 # --------------------------------------------------- e-mail по шаблону ----
-def _tr1(token):
-    """Первичная (короткая) транслитерация одного токена ФИО."""
-    vs = EF._translit(token)
-    return sorted(vs, key=len)[0] if vs else ""
+def email_patterns(fio, domain, known=None):
+    """ФИО (Фамилия Имя [Отчество]) + домен -> кандидаты рабочей почты, лучшие первыми.
 
-
-def email_patterns(fio, domain):
-    """ФИО (Фамилия Имя [Отчество]) + домен -> список кандидатов рабочей почты."""
-    parts = _name_tokens(fio)
-    if len(parts) < 2 or not domain:
-        return []
-    sur, nam = _tr1(parts[0]), _tr1(parts[1])
-    pat = _tr1(parts[2]) if len(parts) > 2 else ""
-    ni, pi = (nam[:1] if nam else ""), (pat[:1] if pat else "")
-    raw = [
-        sur, nam, f"{ni}.{sur}", f"{ni}{sur}", f"{nam}.{sur}", f"{sur}.{nam}",
-        f"{nam}{sur}", f"{sur}{ni}", f"{ni}{pi}.{sur}" if pi else "",
-        f"{nam}.{sur}.{pi}" if pi else "",
-    ]
-    out = []
-    for local in raw:
-        local = local.strip(".")
-        if local and re.fullmatch(r"[a-z0-9.\-]+", local) and f"{local}@{domain}" not in out:
-            out.append(f"{local}@{domain}")
-    return out
+    Генерация живёт в email_guess: там каталог схем с эмпирическими рангами и
+    несколько профилей транслитерации. Здесь остаётся только адаптер к прежнему
+    контракту (список строк) — двух реализаций подбора в репозитории быть не должно.
+    known — уже известные адреса домена: по ним выводится его схема, и тогда вместо
+    веера гипотез возвращается один-два точных адреса."""
+    import email_guess as EG
+    scheme = EG.infer_scheme(known or []) or {}
+    return [c["email"] for c in EG.guess_emails(
+        fio, domain, scheme=scheme.get("scheme"), profile=scheme.get("profile"),
+        sep=scheme.get("sep"))]
 
 
 # ------------------------------------------------------------ MX / SMTP ----
@@ -123,27 +119,10 @@ def mx_hosts(domain, timeout=8):
         return []
 
 
-def smtp_probe(mx, addr, timeout=8):
-    """Best-effort SMTP RCPT-проверка: 'ok' | 'no' | 'unknown' (catch-all/блок → unknown).
-    Многие серверы грейлистят/блокируют проверку — 'unknown' это норма, не ошибка."""
-    import smtplib
-    domain = addr.split("@", 1)[1]
-    try:
-        s = smtplib.SMTP(timeout=timeout)
-        s.connect(mx)
-        s.helo("mail.example.com")
-        s.mail("verify@example.com")
-        code_real, _ = s.rcpt(addr)
-        # детект catch-all: заведомо несуществующий ящик
-        code_fake, _ = s.rcpt(f"nonexistent-xyz-{_digits(addr)[:6] or '0'}@{domain}")
-        s.quit()
-        if code_real in (250, 251) and code_fake not in (250, 251):
-            return "ok"                                # реальный принят, фейк отклонён
-        if code_real in (550, 551, 553):
-            return "no"
-        return "unknown"                               # catch-all или неоднозначно
-    except Exception:
-        return "unknown"
+# SMTP-проба живёт в email_guess.smtp_probe_domain: одна сессия на домен, HELO и
+# MAIL FROM только из EMAIL_GUESS_HELO/EMAIL_GUESS_MAIL_FROM. Прежняя проба «по
+# адресу» здесь не воскрешать — она открывала коннект на каждого кандидата и
+# представлялась example.com, из-за чего отказ по SPF читался как «ящика нет».
 
 
 # --------------------------------------------------- контакты с сайта ----
@@ -303,22 +282,32 @@ def enrich_person(fio, inn, *, domain=None, dadata_token=None, checko_token=None
             if ph not in [p["phone"] for p in res["contacts"]["work_phones"]]:
                 res["contacts"]["work_phones"].append({"phone": ph, "source": f"сайт {dom}"})
 
-        # шаблонные кандидаты + проверка MX (и best-effort SMTP)
-        pats = email_patterns(fio, dom)
+        # шаблонные кандидаты + проверка MX (и best-effort SMTP). Адреса, уже найденные
+        # на сайте, отдаём генератору: по ним выводится схема домена и веер гипотез
+        # схлопывается до одного-двух правдоподобных адресов.
+        import email_guess as EG
+        # только адреса САМОГО домена: чужая почта подрядчика со страницы контактов
+        # продиктовала бы домену несуществующую схему
+        own = EG.domain_of(dom)
+        known_here = [{"email": e["email"]} for e in site_emails
+                      if EG.domain_of(e["email"]) == own]
+        pats = email_patterns(fio, dom, known=known_here)
         if pats and verify_email:
             mx = mx_hosts(dom)
             if not mx:
                 res["notes"].append(f"у домена {dom} нет MX — шаблонные email не проверить")
             else:
                 have = {e["email"] for e in res["contacts"]["work_emails"]}
-                for addr in pats[:6]:              # кап: не долбить чужой SMTP десятком RCPT
-                    if addr in have:
-                        continue
-                    verdict = smtp_probe(mx[0], addr) if verify_email else "unknown"
+                probe = [a for a in pats[:3] if a not in have]
+                # ОДНА сессия на домен: раньше на каждого кандидата открывалось своё
+                # соединение (6 коннектов, 12 RCPT на человека) — это уже перебор ящиков
+                verdicts = EG.smtp_probe_domain(mx[0], probe)
+                for addr in probe:
+                    verdict = verdicts.get(addr, "unknown")
                     if verdict == "ok":
                         res["contacts"]["work_emails"].append(
                             {"email": addr, "kind": "рабочая (шаблон)", "source": f"шаблон+SMTP@{dom}",
-                             "confidence": "средняя-высокая (SMTP подтвердил)"})
+                             "confidence": "средняя-высокая (SMTP подтвердил; отправкой не проверен)"})
                     elif verdict == "unknown":
                         res["contacts"]["work_emails"].append(
                             {"email": addr, "kind": "рабочая (шаблон, не подтв.)",

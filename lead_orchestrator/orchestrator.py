@@ -237,6 +237,32 @@ async def _person_enrichment_block(lead, idx, enabled=True):
         return ""
 
 
+async def _email_guess_block(lead, idx, findings_roles, enabled=True):
+    """Гипотезы корпоративной почты КЛЮЧЕВЫХ СОТРУДНИКОВ (не только ЛПР).
+
+    Идёт после прохода roles: находки движка дают персоналий (leadership, закупки,
+    директора филиалов), а этот блок достраивает им адреса по схеме домена. Никогда
+    не роняет компанию — при любой ошибке возвращается пустая строка."""
+    if not enabled:
+        return ""
+    try:
+        import email_guess as EG
+        use_site = os.environ.get("EMAIL_GUESS_SITE", "1").strip().lower() not in (
+            "0", "false", "no", "off", "нет")
+        res = await asyncio.to_thread(
+            EG.guess_for_company, lead, findings_roles, check_mx=True, smtp=False,
+            per_person=3, use_site=use_site, log=lambda *a: None)
+        people = len(res.get("people") or [])
+        addrs = sum(len(p["emails"]) for p in res.get("people") or [])
+        print(f"    [{idx}] email_guess: домен {res.get('domain') or '—'}, "
+              f"сотрудников {people}, адресов {addrs}"
+              + (f", схема {res['scheme']['scheme']}" if res.get("scheme") else ""))
+        return EG.format_findings_block(res) if people else ""
+    except Exception as exc:                       # noqa: BLE001 — подбор почты не критичен
+        print(f"    [{idx}] email_guess пропущен: {str(exc)[:80]}")
+        return ""
+
+
 async def _research_one_kimi(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     """Полный ШТАТНЫЙ research/write-маршрут (текущий pipeline) для обоих runtime:
     движок двумя проходами -> person_enrich -> граф пяти enrichment-ролей -> агентный
@@ -276,6 +302,15 @@ async def _research_one_kimi(lead, idx, d_tmp, s_tmp, model, person_enrich=True)
 
     if pe_block:
         findings["roles"] = (findings.get("roles") or "") + "\n\n" + pe_block
+
+    # почта ключевых сотрудников считается ПОСЛЕ прохода roles: именно оттуда
+    # берутся персоналии, которым достраиваются адреса по схеме домена
+    eg_block = await _email_guess_block(
+        lead, idx, findings.get("roles", ""),
+        enabled=os.environ.get("EMAIL_GUESS", "1").strip().lower() not in (
+            "0", "false", "no", "off", "нет"))
+    if eg_block:
+        findings["roles"] = (findings.get("roles") or "") + "\n\n" + eg_block
 
     print(f"    [{idx}] research-субагенты: official → (contour + secondary) → roles → contacts")
     enrichment_path = _enrichment_cache_path(h["company_name"], h["inn"])
