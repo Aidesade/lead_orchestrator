@@ -74,42 +74,13 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 | 2 | Парсинг RusProfile | `rusprofile_playwright.card_facts` / `parse_founders` |
 | 3 | One-pager по отрасли | `assets/onepagers/<отрасль>.pdf`, иначе `--generate-onepager` |
 | 4 | **Прекондишен** верификатора ЦИТ РТ | `EMAIL_VERIFIER_URL` → `email_verify.py --serve` |
-| 5 | **Прекондишен** ящика `@tatar.ru` | `outreach.mail_transport().check_ready` |
+| 5 | **Прекондишен** ящика `@tatar.ru` | `outlook_send.check_ready` |
 | 6 | Адрес ЛПР | `email_guess.guess_for_company` + `outreach.pick_recipient` |
-| 7 | Письмо и отправка | `outreach_letter.py` + `<транспорт>.send_message` |
+| 7 | Письмо и отправка | `outreach_letter.py` + `outlook_send.send_message` |
 | 8 | Проверка прогона | `outreach.py --check` → `outreach_registry.audit` |
 
 **ФАЗА 2 старого пайплайна (дипресёрч, пять ролей, два `.docx`) сюда НЕ входит и не вызывается.**
 Она осталась рабочей и запускается прежней командой — outreach её просто не трогает.
-
-### Два транспорта письма — `OUTREACH_TRANSPORT`
-
-| Значение | Модуль | Чем платим |
-|---|---|---|
-| `outlook` (дефолт) | `outlook_send.py` — COM к ЗАПУЩЕННОМУ Outlook Desktop | только эта Windows-машина, Outlook Classic должен быть открыт; зато без пароля |
-| `ews` | `mail_ews.py` — Exchange `mail.tatar.ru` по HTTP | нужны логин и пароль ящика; зато headless, переносится на сервер и в Docker |
-
-EWS-путь опирается на **коннектор ЦИТ РТ `mcp-mail`** (`gitlab.dtc.tatar/starship/mcp-mail`).
-Берётся из него РОВНО ОДИН класс `EwsTransport`: он самодостаточен (тянет только `exchangelib`,
-их сервисный слой, BaseAgent и брокер учёток не подключаются). Их верхний уровень
-`operations.send_email_impl` сознательно не используем — это двухфазный plan/confirm с
-хранилищем планов и аудитом под MCP-сервис.
-
-Коннектор **не в нашем git** (у него своя история и CI): распаковать архив в `mcp_mail/`
-рядом с `lead_orchestrator/` либо задать `MCP_MAIL_DIR`. Папка в `.gitignore`.
-
-- ⚠️ **Их `create_draft` теряет вложения.** В `transports/ews.py` метод `send` перекладывает
-  вложения из MIME, а `create_draft` — нет (цикла `iter_attachments` в нём просто нет, это
-  зафиксировано их же тестом `tests/test_ews_drafts.py`). Для нас это неприемлемо: черновик
-  существует затем, чтобы человек проверил ТО ЖЕ письмо, которое уйдёт, а тихо пропавший
-  one-pager делает проверку обманом. Поэтому черновик собирает `mail_ews._save_draft` —
-  повторяет их `send`, но заканчивается `save()` вместо `send_and_save()`. **Не «упрощать»
-  обратно к вызову их `create_draft`** — `test_mail_ews.check_draft_keeps_attachment` на это и стоит.
-- ⚠️ Их `send` читает только `To` и `Cc`; **`Bcc` пропал бы молча**, поэтому `mail_ews.build_mime`
-  на скрытой копии падает с ошибкой.
-- `From` из MIME Exchange игнорирует — отправитель всегда сам ящик. Нам это и нужно.
-- Пароль живёт только в `OUTREACH_EWS_PASSWORD` и никуда больше не попадает: ни в аргументы,
-  ни в лог, ни в реестр.
 
 Инварианты, которые нельзя «упростить»:
 
@@ -236,7 +207,6 @@ py test_email_verify.py          # проверка ящика без отпра
 py test_rusprofile_playwright.py # cookie, порог 1 млрд, revenue-sort + разбор карточки (ЛПР под пейволом)
 py test_outreach.py              # ВЕТКА outreach: реестр, выбор адреса ЛПР, сборка письма
 py test_outlook_send.py          # ВЕТКА outreach: аккаунт tatar.ru, вложение, черновик vs отправка
-py test_mail_ews.py              # ВЕТКА outreach: EWS-транспорт, черновик СОХРАНЯЕТ вложение, bcc не теряется
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
 py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
@@ -259,8 +229,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `test_source_ofdata.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
 `test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
 `test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_outlook_send.py`,
-`test_mail_ews.py`, `apply_patches.py --check` и импорт Kimi-стадии.
-Добавил тест — добавь его и в гейт.
+`apply_patches.py --check` и импорт Kimi-стадии. Добавил тест — добавь его и в гейт.
 
 ⚠️ `web/api/test_events.py` гонять при ЛЮБОЙ правке печати в `orchestrator.py`: веб парсит именно
 эти русские префиксы, структурированных событий у оркестратора нет. Переименовал строку вывода —
@@ -392,8 +361,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов |
 | `outreach.py` | **главный вход ВЕТКИ** (asyncio): восемь стадий рассылки, прекондишены 4 и 5, `--check` = стадия 8. Дефолт — черновики, `--send` — реальная отправка |
 | `outreach_registry.py` | реестр отработанных по ИНН: атомарная запись, бэкфилл из `D:\deliverables`, `audit()` для стадии 8. «Отработана» = есть деливераблы ИЛИ отправлено письмо |
-| `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()` |
-| `mail_ews.py` | второй транспорт: Exchange `mail.tatar.ru` по EWS поверх коннектора ЦИТ РТ `mcp-mail` (класс `EwsTransport`). Сам собирает MIME и **свой черновик с вложением** — их `create_draft` вложения теряет. Вместе с `outlook_send` это единственные места, откуда письмо уходит наружу |
+| `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
 | `outreach_letter.py` | текст письма: `build_prompt` (только проверенные факты) → модель через `claude_kimi_adapter` со спекой `kimi_agent/outreach_letter.yaml` → `parse_reply` → подпись и отписка КОДОМ |
 | `source_rusprofile.py` / `rusprofile_playwright.py` / `rusprofile_session.py` | штатный источник Фазы 1: карта `INDUSTRY` (21), регион-фильтр с отрицанием; единая Playwright-context; создание cookie (`--login`, UC остался как `RUSPROFILE_BROWSER=uc`) |
 | `source_ofdata.py` / `source_checko.py` | API-пути (Docker и откат) |
@@ -512,17 +480,11 @@ Microsoft 365 принимает почти всё и проверяет пол�
 об адресе не сказано ничего), catch-all (2 случайных адреса на домен) и «проба не состоялась».
 ⚠️ Нужен открытый исходящий порт 25; с рабочей машины он открыт, в облаках обычно режется.
 
-**Тумблеры outreach-пайплайна:** `OUTREACH_TRANSPORT` (`outlook` дефолт | `ews`),
-`OUTREACH_FROM` (`tatar.ru` — подстрока адреса ящика-отправителя
+**Тумблеры outreach-пайплайна:** `OUTREACH_FROM` (`tatar.ru` — подстрока адреса ящика-отправителя
 в профиле Outlook), `OUTREACH_SIGNER_NAME`/`OUTREACH_SIGNER_EMAIL`/`OUTREACH_SIGNER_PHONE`
 (подпись; дефолты — константы `VENDOR_*` из `onepager_kimi.py`), `OUTREACH_ONEPAGER_DIR`
 (`lead_orchestrator/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь к реестру, дефолт
 `<ORQ_DATA_ROOT>/orq_outreach/registry.json`), `ORQ_LETTER_MODEL` (`sonnet`).
-**Тумблеры EWS-транспорта** (нужны только при `OUTREACH_TRANSPORT=ews`): `OUTREACH_EWS_ADDRESS`
-(сам ящик), `OUTREACH_EWS_USER` (доменный логин Outlook — `DOMAIN\user` или UPN),
-`OUTREACH_EWS_PASSWORD`, `OUTREACH_EWS_ENDPOINT` (дефолт `https://mail.tatar.ru/EWS/Exchange.asmx`),
-`MCP_MAIL_DIR` (папка распакованного коннектора; дефолт `<репо>/mcp_mail/mcp-mail-main`).
-
 ⚠️ Ящик отправителя в профиле — `Artur.Bayrashev@tatar.ru`, а контакт в подписи и в one-pager —
 `Ali.Shabanov@tatar.ru`: это РАЗНЫЕ люди. Ответ на письмо придёт Байрашеву, а звонить читателю
 предлагают Шабанову — если так не задумано, править `OUTREACH_SIGNER_*`.

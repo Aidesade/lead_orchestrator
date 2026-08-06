@@ -8,9 +8,9 @@ r"""Outreach-пайплайн: сбор -> адрес ЛПР -> письмо с 
   2. Парсинг RusProfile    — название, сайт, телефоны, ИНН, руководитель, учредители
   3. One-pager по отрасли  — готовый файл из assets/onepagers либо генерация стадией Kimi/Claude
   4. Верификатор ЦИТ РТ    — ПРЕКОНДИШЕН: email_verify --serve на хосте с PTR и SPF
-  5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: транспорт по OUTREACH_TRANSPORT
+  5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: Outlook Desktop и аккаунт отправителя
   6. Адрес ЛПР             — email_guess (гипотезы по схеме домена) + проверка без отправки
-  7. Письмо                — текст моделью, подпись кодом, отправка выбранным транспортом
+  7. Письмо                — текст моделью, подпись кодом, отправка через Outlook
   8. Проверка прогона      — какая стадия по какой компании пропущена и почему
 
 Стадии 4 и 5 — не шаги цикла, а прекондишены: проверяются ОДИН раз до первой компании
@@ -40,11 +40,7 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 try:
-    # и stdout, и stderr: консоль Windows работает в cp1251 и роняет кириллицу,
-    # а сообщения прекондишенов (SystemExit) уходят именно в stderr — без этого
-    # пользователь видит кракозябры ровно там, где ему объясняют, что чинить
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -55,6 +51,7 @@ except Exception:
 
 import outreach_registry as REG                     # noqa: E402
 import outreach_letter as LETTER                    # noqa: E402
+import outlook_send as MAIL                         # noqa: E402
 
 REPO_ROOT = os.path.dirname(SCRIPTS)
 KIMI_DIR = os.environ.get("KIMI_DIR") or os.path.join(REPO_ROOT, "lead_orchestrator_kimi")
@@ -75,26 +72,6 @@ def log(message):
 def _flag(name, default="1"):
     return (os.environ.get(name, default) or "").strip().lower() not in (
         "0", "false", "no", "off", "нет")
-
-
-def mail_transport():
-    """Модуль-транспорт стадии 7 по ``OUTREACH_TRANSPORT``.
-
-    ``outlook`` (по умолчанию) — COM к ЗАПУЩЕННОМУ Outlook Desktop: работает
-    только на этой Windows-машине, зато без пароля, на уже открытой сессии.
-    ``ews`` — Exchange ЦИТ РТ по HTTP через коннектор mcp-mail: работает headless,
-    переносится на сервер и в Docker, но требует логин и пароль от ящика.
-
-    Оба модуля дают одинаковый интерфейс: ``check_ready()``, ``send_message()``,
-    ``TransportError`` — поэтому дальше пайплайн о выборе не знает."""
-    kind = (os.environ.get("OUTREACH_TRANSPORT") or "outlook").strip().lower()
-    if kind == "ews":
-        import mail_ews
-        return mail_ews
-    if kind == "outlook":
-        import outlook_send
-        return outlook_send
-    raise SystemExit(f"неизвестный OUTREACH_TRANSPORT={kind!r}; допустимы: outlook, ews")
 
 
 # ============================================================ ПРЕКОНДИШЕНЫ ====
@@ -132,18 +109,15 @@ def check_verifier(required=True):
 
 
 def check_mailbox(required=True):
-    """Стадия 5: ящик отправителя (Outlook COM либо Exchange по EWS)."""
-    mail = mail_transport()
+    """Стадия 5: ящик отправителя в Outlook."""
     try:
-        info = mail.check_ready()
-    except mail.TransportError as exc:
+        info = MAIL.check_ready()
+    except MAIL.OutlookError as exc:
         if required:
             raise SystemExit(f"[стадия 5] {exc}") from exc
         log(f"[стадия 5] почта недоступна: {exc}")
         return {"account": "", "alive": False}
-    # endpoint отдаёт только EWS — по нему в логе видно, каким транспортом проверялись
-    log(f"[стадия 5] отправитель: {info['account']}"
-        + (f" через {info['endpoint']}" if info.get("endpoint") else ""))
+    log(f"[стадия 5] отправитель: {info['account']}")
     return {"account": info["account"], "alive": True}
 
 
@@ -354,10 +328,9 @@ def stage_send(lead, idx, picked, letter, onepager, send=False, dry_run=False):
            "attachments": [onepager] if onepager else []}
     if dry_run:
         return {"action": "dry-run", "to": to, "subject": letter["subject"]}, note
-    mail = mail_transport()
     try:
-        res = mail.send_message(msg, draft=not send)
-    except (mail.TransportError, ValueError) as exc:
+        res = MAIL.send_message(msg, draft=not send)
+    except (MAIL.OutlookError, ValueError) as exc:
         return None, f"отправка не удалась: {exc}"
     log(f"    [{idx}] [{res['action']}] -> {res['to']}"
         + (f" (копия {cc})" if cc else "")
@@ -423,14 +396,6 @@ async def process(lead, idx, reg, args, tmp_dir):
 
 
 async def run(args):
-    if args.check_mail:
-        # Спрашивается ВЫБРАННЫЙ транспорт, поэтому лаунчеру не нужно знать, Outlook
-        # это или EWS. Верификатор не жёстко: без него работать можно
-        # (--no-verify-server), а вот без ящика отправлять нечем.
-        check_verifier(required=False)
-        check_mailbox(required=True)
-        return 0
-
     reg = REG.Registry(args.registry)
     log(f"[стадия 1] реестр: {reg.path}")
     if args.check:
@@ -506,13 +471,11 @@ def main():
     ap.add_argument("--no-verify-server", dest="no_verify_server", action="store_true",
                     help="работать без верификатора ЦИТ РТ (адреса — непроверенные гипотезы)")
     ap.add_argument("--check", action="store_true", help="стадия 8: только отчёт по реестру")
-    ap.add_argument("--check-mail", dest="check_mail", action="store_true",
-                    help="прекондишены 4 и 5: верификатор и ящик выбранного транспорта")
     ap.add_argument("--registry", default=None, help="путь к файлу реестра")
     a = ap.parse_args()
 
-    if not (a.leads or a.industries or a.check or a.check_mail):
-        ap.error("нужен JSON лидов, --industries, --check или --check-mail")
+    if not (a.leads or a.industries or a.check):
+        ap.error("нужен JSON лидов, --industries или --check")
     if a.send and a.dry_run:
         ap.error("--send и --dry-run несовместимы")
     try:

@@ -33,11 +33,7 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 try:
-    # и stdout, и stderr: консоль Windows работает в cp1251 и роняет кириллицу,
-    # а сообщения прекондишенов (SystemExit) уходят именно в stderr — без этого
-    # пользователь видит кракозябры ровно там, где ему объясняют, что чинить
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -55,11 +51,6 @@ _local = threading.local()
 
 class OutlookError(RuntimeError):
     """Outlook не запущен, нет нужного аккаунта или COM отказал."""
-
-
-# Общее имя ошибки транспорта: outreach.py выбирает между этим модулем и mail_ews
-# (Exchange по EWS) и не должен знать, у какого из них как называется исключение.
-TransportError = OutlookError
 
 
 # ------------------------------------------------------------- чистая логика ----

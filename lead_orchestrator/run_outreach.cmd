@@ -29,9 +29,6 @@ if not defined LEAD_SOURCE set "LEAD_SOURCE=rusprofile"
 if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
 if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\env\rusprofile_cookies.json"
 if not defined OUTREACH_FROM set "OUTREACH_FROM=tatar.ru"
-rem Transport for stage 7: outlook = COM to a RUNNING Outlook Desktop (this machine only),
-rem ews = Exchange at mail.tatar.ru over HTTP via the CIT RT mcp-mail connector (headless).
-if not defined OUTREACH_TRANSPORT set "OUTREACH_TRANSPORT=outlook"
 
 title Outreach - collect, find LPR mailbox, letter from @tatar.ru
 
@@ -41,14 +38,14 @@ if not "%~1"=="" goto direct
 :menu
 echo.
 echo ==========================================================
-echo   Outreach pipeline   [transport: %OUTREACH_TRANSPORT%]
+echo   Outreach pipeline
 echo ==========================================================
 echo   [1] Report only - who was contacted, where runs stopped
 echo       (changes nothing, no network, no mail)
 echo   [2] Collect companies from RusProfile -^> DRAFT letters
 echo   [3] Use a ready leads JSON            -^> DRAFT letters
 echo   [4] SEND letters for real             (asks to type SEND)
-echo   [5] Preconditions check: sender mailbox and verifier
+echo   [5] Preconditions check: Outlook mailbox and verifier
 echo   [0] Exit
 echo.
 set "pick="
@@ -69,7 +66,7 @@ goto done
 
 :precheck_only
 call :warnings
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" --check-mail
+"%ORQ_MAIN_PY%" "%~dp0outlook_send.py" --check
 goto done
 
 :collect
@@ -112,7 +109,7 @@ echo.
 echo   *** REAL SENDING ***
 echo   Letters cannot be recalled. Review the drafts in Outlook first.
 echo   Sender resolved from OUTREACH_FROM="%OUTREACH_FROM%":
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" --check-mail
+"%ORQ_MAIN_PY%" "%~dp0outlook_send.py" --check
 if errorlevel 1 (
     echo   Sender mailbox is not available - nothing to send from.
     goto done
