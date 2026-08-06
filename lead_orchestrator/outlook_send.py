@@ -33,7 +33,11 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 try:
+    # и stdout, и stderr: консоль Windows работает в cp1251 и роняет кириллицу,
+    # а сообщения прекондишенов (SystemExit) уходят именно в stderr — без этого
+    # пользователь видит кракозябры ровно там, где ему объясняют, что чинить
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 

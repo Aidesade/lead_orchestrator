@@ -8,9 +8,9 @@ r"""Outreach-пайплайн: сбор -> адрес ЛПР -> письмо с 
   2. Парсинг RusProfile    — название, сайт, телефоны, ИНН, руководитель, учредители
   3. One-pager по отрасли  — готовый файл из assets/onepagers либо генерация стадией Kimi/Claude
   4. Верификатор ЦИТ РТ    — ПРЕКОНДИШЕН: email_verify --serve на хосте с PTR и SPF
-  5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: Outlook Desktop и аккаунт отправителя
+  5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: транспорт по OUTREACH_TRANSPORT
   6. Адрес ЛПР             — email_guess (гипотезы по схеме домена) + проверка без отправки
-  7. Письмо                — текст моделью, подпись кодом, отправка через Outlook
+  7. Письмо                — текст моделью, подпись кодом, отправка выбранным транспортом
   8. Проверка прогона      — какая стадия по какой компании пропущена и почему
 
 Стадии 4 и 5 — не шаги цикла, а прекондишены: проверяются ОДИН раз до первой компании
@@ -40,7 +40,11 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 try:
+    # и stdout, и stderr: консоль Windows работает в cp1251 и роняет кириллицу,
+    # а сообщения прекондишенов (SystemExit) уходят именно в stderr — без этого
+    # пользователь видит кракозябры ровно там, где ему объясняют, что чинить
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
@@ -84,10 +88,10 @@ def mail_transport():
     Оба модуля дают одинаковый интерфейс: ``check_ready()``, ``send_message()``,
     ``TransportError`` — поэтому дальше пайплайн о выборе не знает."""
     kind = (os.environ.get("OUTREACH_TRANSPORT") or "outlook").strip().lower()
-    if kind in ("ews", "exchange", "mcp-mail", "mcpmail"):
+    if kind == "ews":
         import mail_ews
         return mail_ews
-    if kind in ("outlook", "com", "desktop"):
+    if kind == "outlook":
         import outlook_send
         return outlook_send
     raise SystemExit(f"неизвестный OUTREACH_TRANSPORT={kind!r}; допустимы: outlook, ews")
@@ -137,8 +141,9 @@ def check_mailbox(required=True):
             raise SystemExit(f"[стадия 5] {exc}") from exc
         log(f"[стадия 5] почта недоступна: {exc}")
         return {"account": "", "alive": False}
-    where = f" через {info['endpoint']}" if info.get("endpoint") else ""
-    log(f"[стадия 5] отправитель: {info['account']}{where}")
+    # endpoint отдаёт только EWS — по нему в логе видно, каким транспортом проверялись
+    log(f"[стадия 5] отправитель: {info['account']}"
+        + (f" через {info['endpoint']}" if info.get("endpoint") else ""))
     return {"account": info["account"], "alive": True}
 
 
@@ -419,8 +424,9 @@ async def process(lead, idx, reg, args, tmp_dir):
 
 async def run(args):
     if args.check_mail:
-        # прекондишены 4 и 5 отдельно: проверяет ИМЕННО выбранный транспорт,
-        # поэтому годится и для Outlook, и для EWS без правки лаунчера
+        # Спрашивается ВЫБРАННЫЙ транспорт, поэтому лаунчеру не нужно знать, Outlook
+        # это или EWS. Верификатор не жёстко: без него работать можно
+        # (--no-verify-server), а вот без ящика отправлять нечем.
         check_verifier(required=False)
         check_mailbox(required=True)
         return 0
