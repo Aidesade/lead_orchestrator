@@ -856,9 +856,13 @@ def _mev_sandbox(fake=None, **env):
         shutil.rmtree(patch["ORQ_DATA_ROOT"], ignore_errors=True)
 
 
-def _mev_out(verdicts, domain="dom.ru"):
-    """Заготовка выхода verify_addresses с заданными вердиктами."""
+def _mev_out(verdicts, domain="dom.ru", trust="medium"):
+    """Заготовка выхода verify_addresses с заданными вердиктами.
+
+    `trust` задан всегда: пустой заставил бы _mev_fill лезть в DNS за приёмником
+    домена, а в тестах urlopen подменён — DoH-запрос съел бы ответ из очереди."""
     return {"domain": domain, "probed": False, "catch_all": None, "reason": "",
+            "trust": trust,
             "verdicts": {addr: {"verdict": verdict, "trusted": False, "note": ""}
                          for addr, verdict in verdicts.items()}}
 
@@ -887,17 +891,19 @@ def test_mev_read():
     soft = EG._mev_read({"Status": "Invalid", "Diagnosis": "Rejected by SMTP server"})
     check("Invalid без внятного диагноза -> unknown", soft["verdict"] == "unknown",
           str(soft))
-    check("и об этом сказано в ноте", "не приговор" in soft["note"], soft["note"])
+    check("диагноз сохранён в ноте дословно",
+          "Rejected by SMTP server" in soft["note"], soft["note"])
+    check("нота нейтральна — трактовку допишет _mev_fill",
+          "ящика нет" not in soft["note"], soft["note"])
 
     # ⚠️ Диагнозы уровня ДОМЕНА не должны превращаться в «ящика нет». Проверено
     # вживую 2026-08-07: сервис отвечает «Disposable or Toxic domain» на
     # info@vozr.ru и info@zaovad.com — опубликованные адреса живых дорожных
     # подрядчиков. «no» у нас необратим, поэтому такие ответы — только unknown.
-    for diag in ("Disposable or Toxic domain (UCE) (D7)", "Invalid email (D36) (D21)",
-                 "Known spam trap"):
+    for diag in ("Disposable or Toxic domain (UCE) (D7)", "Known spam trap"):
         got = EG._mev_read({"Status": "Invalid", "Diagnosis": diag})
         check(f"доменный диагноз не приговор: {diag[:34]}",
-              got["verdict"] == "unknown", str(got))
+              got["verdict"] == "unknown" and not got["soft_no"], str(got))
     dom = EG._mev_read({"Status": "Invalid",
                         "Diagnosis": "Disposable or Toxic domain (UCE) (D7)"})
     check("в ноте сказано, что забракован домен, а не ящик",
@@ -905,6 +911,39 @@ def test_mev_read():
     check("а мейлбокс-уровневый диагноз приговором остаётся",
           EG._mev_read({"Status": "Invalid",
                         "Diagnosis": "Mailbox does not exist (D5)"})["verdict"] == "no")
+
+    # Голое «Invalid email (D2)» — отказ ящику, но без причины. Сам по себе он не
+    # вердикт: вес ему назначает _mev_fill по приёмнику домена.
+    soft = EG._mev_read({"Status": "Invalid", "Diagnosis": "Invalid email (D2)"})
+    check("расплывчатый отказ помечен soft_no, а не вердиктом",
+          soft["verdict"] == "unknown" and soft["soft_no"], str(soft))
+
+
+def test_mev_soft_no():
+    """soft_no становится приговором только на честном приёмнике домена."""
+    reply = {"Status": "Invalid", "Diagnosis": "Invalid email (D2)"}
+    for provider, trust, expect in (("Yandex 360", "full", "no"),
+                                    ("mail.ru для бизнеса", "negative_only", "unknown"),
+                                    ("свой сервер", "medium", "unknown")):
+        fake = _FakeHTTP(reply)
+        out = _mev_out({"a@dom.ru": "unknown"})
+        out["trust"] = trust                       # готовый вес — DNS не трогаем
+        with _mev_sandbox(fake, ENABLE="1", API_KEY="K", URL="https://mev.test"):
+            EG._mev_fill(out, CIVIL)
+        got = out["verdicts"]["a@dom.ru"]
+        check(f"{provider} ({trust}) -> {expect}", got["verdict"] == expect,
+              f"{got['verdict']}: {got['note'][:70]}")
+        check(f"{provider}: пояснение записано", bool(got["note"]), str(got))
+
+    # Ноту обязаны видеть и у unknown — иначе «не подтверждён» ничего не объясняет
+    fake = _FakeHTTP({"Status": "Catch-all", "catch_all": 1})
+    out = _mev_out({"a@dom.ru": "unknown"})
+    out["trust"] = "full"
+    with _mev_sandbox(fake, ENABLE="1", API_KEY="K", URL="https://mev.test"):
+        EG._mev_fill(out, CIVIL)
+    check("catch-all: причина видна оператору",
+          "catch-all" in out["verdicts"]["a@dom.ru"]["note"],
+          str(out["verdicts"]["a@dom.ru"]))
 
     for status in ("Catch All", "Unknown", "Grey-listed"):
         got = EG._mev_read({"Status": status})
@@ -1048,7 +1087,8 @@ def main():
                  test_belongs_to, test_domain, test_mail_state, test_people,
                  test_people_from_site, test_company, test_review_regressions,
                  test_confidence, test_homonyms, test_no_crash,
-                 test_mev_read, test_mev_gate, test_mev_fill, test_mev_off_and_cache):
+                 test_mev_read, test_mev_soft_no, test_mev_gate, test_mev_fill,
+                 test_mev_off_and_cache):
         print(f"\n--- {test.__name__} ---")
         test()
     print()

@@ -945,18 +945,23 @@ _MEV_NO = (
 # nbssib.ru. Это оценка репутации домена по чужим блок-листам, о существовании
 # ящика она не говорит НИЧЕГО, а «no» у нас необратим: _rank_rows выбрасывает
 # такую строку без права апелляции. Сигнал сохраняем в ноте — решать человеку.
-# По той же причине сюда попал generic «Invalid email (D36)»: их «Invalid» на
-# российских доменах слишком часто означает «нам не понравился домен».
-_MEV_SUSPECT = ("disposable", "toxic", "spam trap", "spamtrap", "invalid email")
+# Голое «Invalid email» СЮДА НЕ ВХОДИТ: это отказ уровня ящика, просто без причины.
+# Его вес решает _mev_fill по приёмнику домена (soft_no), иначе мы выбросили бы и
+# честные отказы Яндекса — а именно там сервис единственно и полезен.
+_MEV_DOMAIN_NO = ("disposable", "toxic", "spam trap", "spamtrap")
 
 
 def _mev_read(data):
-    """Ответ MyEmailVerifier -> наш {verdict, trusted, note, raw}.
+    """Ответ MyEmailVerifier -> наш {verdict, trusted, note, soft_no, raw}.
 
     Маппинг намеренно асимметричный: `Valid` принимаем, `Invalid` — только с
-    внятным диагнозом. `_TRUST` (вес приёмника домена) здесь не применяется: сервис
-    пробует со своих IP, а роль доменного веса у него играют собственные флаги
-    catch_all и Greylisted."""
+    внятным диагнозом. Их `Invalid` покрывает три разных случая, и путать их нельзя:
+      * «mailbox does not exist» — настоящий отказ ящику    -> no;
+      * «Disposable or Toxic domain» — приговор ДОМЕНУ по чужим блок-листам,
+        о ящике не сказано ничего                            -> unknown;
+      * голое «Invalid email (D2)» без причины              -> soft_no.
+    `soft_no` разрешает _mev_fill: он один знает приёмника домена и по тому же
+    `_TRUST`, что и наша SMTP-проба, решает, приговор это или шум."""
     def flag(key):
         """Их булевы поля. ⚠️ Документация обещает строки "true"/"false", а API
         отдаёт ЧИСЛА 0/1 (проверено вживую 2026-08-07). Понимаем обе формы: разбор
@@ -968,14 +973,17 @@ def _mev_read(data):
     diag = str(data.get("Diagnosis") or "").strip()
     low = diag.lower()
     note = f"MyEmailVerifier: {diag or status or 'без диагноза'}"
+    soft_no = False
 
     if flag("catch_all") or status in ("catch all", "catch-all", "catchall"):
-        return {"verdict": "unknown", "trusted": False, "raw": data,
+        return {"verdict": "unknown", "trusted": False, "raw": data, "soft_no": False,
                 "note": "MyEmailVerifier: домен принимает любой адрес (catch-all)"}
     if status == "valid":
         verdict = "ok"
     elif status == "invalid":
-        if any(mark in low for mark in _MEV_SUSPECT):
+        if any(mark in low for mark in _MEV_DOMAIN_NO):
+            # Приговор ДОМЕНУ по чужим блок-листам. О ящике не сказано ничего, и
+            # даже на доверенном приёмнике это не повод вычёркивать контакт.
             verdict = "unknown"
             note = (f"MyEmailVerifier забраковал ДОМЕН, а не ящик ({diag}) — "
                     f"на российских корпоративных доменах это его известная "
@@ -983,16 +991,21 @@ def _mev_read(data):
         elif any(mark in low for mark in _MEV_NO):
             verdict = "no"
         else:
-            verdict = "unknown"
-            note = (f"MyEmailVerifier отклонил адрес, но не сказал, что ящика нет "
-                    f"({diag or 'без диагноза'}) — не приговор")
+            # Расплывчатое «Invalid email» без указания причины. Верить ему можно
+            # ровно настолько, насколько честен приёмник домена, — решает _mev_fill
+            # по тому же _TRUST, что и для нашей собственной пробы.
+            # Нота намеренно нейтральна: трактовку допишет _mev_fill, и склеенный
+            # текст обязан читаться связно в ОБЕ стороны.
+            verdict, soft_no = "unknown", True
+            note = f"MyEmailVerifier отклонил адрес: {diag or 'без диагноза'}"
     else:                                          # unknown, grey-listed и всё прочее
         verdict = "unknown"
     if flag("Role_Based"):
         note += "; ролевой адрес"
     if flag("Disposable_Domain"):
         note += "; одноразовый домен"
-    return {"verdict": verdict, "trusted": verdict != "unknown", "note": note, "raw": data}
+    return {"verdict": verdict, "trusted": verdict != "unknown", "note": note,
+            "soft_no": soft_no, "raw": data}
 
 
 def _mev_allowed(lead, domain):
@@ -1133,6 +1146,18 @@ def _mev_fill(out, lead=None, log=None):
             log(f"    MyEmailVerifier пропущен: {why}")
         return out
 
+    # Вес расплывчатого отказа задаёт приёмник домена — ровно как для нашей пробы.
+    # Yandex 360 и Google Workspace отвечают на RCPT честно, поэтому их «Invalid
+    # email» без причины стоит принять; на mail.ru и самохостинге то же самое
+    # означает лишь «нам не понравился отправитель». Считаем один раз на домен.
+    trust = out.get("trust")
+    if not trust:
+        try:
+            provider = mail_provider((mail_domain_state(out["domain"]).get("mx") or []))
+            trust = smtp_trust(provider) if provider else "unknown"
+        except Exception:                          # noqa: BLE001 — DNS не критичен
+            trust = "unknown"
+
     state = _mev_state()
     url = _mev_env("URL", MEV_URL_DEF).rstrip("/")
     asked = 0
@@ -1146,14 +1171,24 @@ def _mev_fill(out, lead=None, log=None):
                         "адреса остаются непроверенными")
                 break
             got = external_verify(addr, url=url, kind="myemailverifier")
-            row = {"verdict": got["verdict"], "note": got["note"], "ts": time.time()}
+            verdict, note = got["verdict"], got["note"]
+            if got.get("soft_no"):
+                if trust == "full":
+                    verdict = "no"
+                    note += " — причины не назвал, но приёмник домена отвечает честно"
+                else:
+                    note += (" — причины не назвал, а приёмнику этого домена такой "
+                             "отказ не доказательство")
+            row = {"verdict": verdict, "note": note, "ts": time.time()}
             _mev_remember(state, addr, row)
             asked += 1
-        if row["verdict"] == "unknown":
-            continue
-        out["verdicts"][addr] = {"verdict": row["verdict"], "trusted": True,
+        # Ноту пишем ВСЕГДА, даже для unknown: без неё оператор видит «не
+        # подтверждён» и не знает, catch-all это, блок-лист домена или отказ.
+        out["verdicts"][addr] = {"verdict": row["verdict"],
+                                 "trusted": row["verdict"] != "unknown",
                                  "note": row["note"]}
-        out["probed"] = True
+        if row["verdict"] != "unknown":
+            out["probed"] = True
     if asked:
         _mev_save(state)
         mark = f"добор MyEmailVerifier ({asked})"

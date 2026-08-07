@@ -220,6 +220,10 @@ def main():
     ap.add_argument("--run", action="store_true",
                     help="реально обращаться к сервису (без флага — сухой прогон)")
     ap.add_argument("--limit", type=int, default=0, help="максимум адресов за прогон")
+    ap.add_argument("--domains", default="",
+                    help="только эти домены (через запятую). Кредиты конечны, а вес "
+                         "вердикта задаёт приёмник домена: на самохостинге сервис "
+                         "слеп так же, как наша проба, и платить за него незачем")
     ap.add_argument("--out", help="куда сохранить размеченную копию (по умолчанию "
                                   "рядом, с суффиксом «_проверено»)")
     a = ap.parse_args()
@@ -230,6 +234,14 @@ def main():
         f"уникальных адресов: {len({item['email'] for item in rows})}")
 
     allowed, blocked = split_by_gate(rows, a.industry)
+
+    only = {d.strip().lower() for d in a.domains.split(",") if d.strip()}
+    if only:
+        allowed = [item for item in allowed if item["domain"] in only]
+        unseen = only - {item["domain"] for item in allowed}
+        log(f"[домены] отобрано {len(only) - len(unseen)} из {len(only)}"
+            + (f"; нет в файле (или отсечены гейтом): {', '.join(sorted(unseen))}"
+               if unseen else ""))
 
     if blocked:
         log(f"\n[гейт] НЕ выпускаются наружу ({sum(blocked.values())} строк):")
