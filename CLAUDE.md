@@ -73,7 +73,7 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 | 1 | Реестр отработанных | `outreach_registry.py` — ключ ИНН, бэкфилл из `D:\deliverables` |
 | 2 | Парсинг RusProfile | `rusprofile_playwright.card_facts` / `parse_founders` |
 | 3 | One-pager по отрасли | `assets/onepagers/<отрасль>.pdf`, иначе `--generate-onepager` |
-| 4 | **Прекондишен** верификатора ЦИТ РТ | `EMAIL_VERIFIER_URL` → `email_verify.py --serve` |
+| 4 | **Прекондишен** верификатора ЦИТ РТ (+ остаток кредитов облачного добора) | `EMAIL_VERIFIER_URL` → `email_verify.py --serve`; `outreach._check_mev` |
 | 5 | **Прекондишен** ящика `@tatar.ru` | `outlook_send.check_ready` |
 | 6 | Адрес ЛПР | `email_guess.guess_for_company` + `outreach.pick_recipient` |
 | 7 | Письмо и отправка | `outreach_letter.py` + `outlook_send.send_message` |
@@ -154,6 +154,7 @@ py person_enrich.py "Руденко Сергей Александрович" 623
 py email_guess.py "Руденко Сергей Александрович" avtodor-rzn.ru
 py email_guess.py --leads "D:\лиды\leads_mining.json" --out "D:\лиды\emails_mining.json"
 py email_guess.py --leads leads.json --no-site --no-mx   # офлайн, только генерация гипотез
+py email_guess.py --mev-credits        # остаток кредитов облачного добора (сам запрос бесплатен)
 # проверка существования ящика без отправки письма (нужны EMAIL_GUESS_HELO/MAIL_FROM):
 py email_verify.py ivanov@company.ru petrov@company.ru
 py email_verify.py --serve 8080        # HTTP-API, совместимый с Reacher (для EMAIL_VERIFIER_URL)
@@ -358,7 +359,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
 | `person_enrich.py` | ЛПР: ФИО+ИНН → прямой РАБОЧИЙ контакт (Dadata/Checko → домен с валидацией → email по шаблону+MX, телефоны; соцпрофили только с ИНН-контекстом). «Пробив»/утечки конструктивно исключены (`DENY_SOURCES`). Генерацию адресов НЕ реализует — делегирует `email_guess` |
 | `email_verify.py` | **проверка существования ящика БЕЗ отправки письма** — Python-порт ядра Reacher на голом stdlib (ни Docker, ни WSL, ни Rust-бинаря). Формат ответа совместим с Reacher (`is_reachable` + `syntax`/`mx`/`smtp`/`misc`), есть CLI и `--serve` (HTTP-API на том же контракте). ⚠️ Осознанное отличие от оригинала: у Reacher `invalid` означает и «нет ящика», и «не смог подключиться» — при закрытом порте 25 это вычеркнуло бы все живые адреса; здесь такой случай = `unknown`, а `550 5.7.x` (политика) отделён от `550 5.1.1` (нет адресата). Единственная SMTP-реализация в репо: `email_guess` и `person_enrich` зовут её |
-| `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов |
+| `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов. Последним слоем — `_mev_fill`: облачный добор MyEmailVerifier ТОЛЬКО по оставшимся `unknown` и только вне блок-листа отраслей (см. «Тумблеры подбора почты»), по умолчанию выключен |
 | `outreach.py` | **главный вход ВЕТКИ** (asyncio): восемь стадий рассылки, прекондишены 4 и 5, `--check` = стадия 8. Дефолт — черновики, `--send` — реальная отправка |
 | `outreach_registry.py` | реестр отработанных по ИНН: атомарная запись, бэкфилл из `D:\deliverables`, `audit()` для стадии 8. «Отработана» = есть деливераблы ИЛИ отправлено письмо |
 | `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
@@ -413,7 +414,8 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `ANTHROPIC_API_KEY`; ключ Kimi не нужен. Kimi-runtime (`ORQ_KIMI_ONLY=1`): `KIMI_API_KEY` →
 фолбэк `GPLLM_API_KEY` (обязателен). `OFDATA_API_KEY` — для ofdata-пути.
 Опционально: `DADATA_TOKEN`, `CHECKO_TOKEN` (+`_ALT`/`_2`/`_3`), `FIRECRAWL_API_KEY`,
-`YANDEX_DISK_TOKEN` (нужен только при `ORQ_STORE=disk`).
+`YANDEX_DISK_TOKEN` (нужен только при `ORQ_STORE=disk`), `EMAIL_MEV_API_KEY` (облачный добор
+проверки ящиков, ветка `outreach`; без него слой просто выключен).
 
 Секреты живут в gitignored `env/.env` (`.env.example` в репо нет); Docker подключает его через
 `env_file`, в build context папка не попадает.
@@ -469,8 +471,36 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 неотличим от «ящика нет», и реальный контакт был бы выброшен); `EMAIL_GUESS_MAX_BYTES` (2 МиБ на
 страницу), `EMAIL_GUESS_SITE_BUDGET` (45 с — общий дедлайн обхода сайта на компанию; socket-таймаут
 от сервера, отдающего по байту, не спасает); `EMAIL_VERIFIER_URL` + `EMAIL_VERIFIER_KIND`
-(`aftership` | `reacher`) — адрес СВОЕГО (self-hosted) верификатора, если он поднят; облачные
-(ZeroBounce/Hunter/NeverBounce) не подключать — это выгрузка списка ЛПР третьей стороне.
+(`aftership` | `reacher`) — адрес СВОЕГО (self-hosted) верификатора, если он поднят.
+
+**Облачный верификатор — только добор и только по разрешённым отраслям.** Подключать облака
+списком (ZeroBounce/Hunter/NeverBounce) по-прежнему НЕЛЬЗЯ: это выгрузка списка ЛПР третьей
+стороне. Единственное исключение — `MyEmailVerifier` третьим слоем в `email_guess._mev_fill`,
+и рамки держит код, а не намерение:
+
+- слой **ВЫКЛЮЧЕН по умолчанию** (`EMAIL_MEV_ENABLE=0`, плюс без `EMAIL_MEV_API_KEY` он мёртв);
+- работает ТОЛЬКО по адресам, которые локальная проба и верификатор ЦИТ РТ оставили `unknown`
+  — то есть ровно там, где мы слепы (Microsoft 365, отказ по политике, нет PTR);
+- **адреса ОПК/ВПК и госсектора наружу не уходят никогда.** Три независимых гейта в
+  `_mev_allowed`: отрасль (`EMAIL_MEV_DENY_INDUSTRIES`, дефолт `opk,government`), ОКВЭД и
+  ключевые слова в названии/описании. Третий гейт обязателен: коды `25.40` и `28.99` лежат
+  И в `INDUSTRY["opk"]`, И в `["processing"]`, поэтому оборонный завод штатно приезжает с
+  меткой `processing`. **Отрасль не определена → запрет** (fail-closed);
+- `Invalid` от сервиса становится вердиктом `no` ТОЛЬКО при внятном диагнозе из `_MEV_NO`
+  («ящика нет», спам-ловушка). Их `Invalid` покрывает и «сервер нас отшил» — тот же урок, что
+  `550 5.1.1` против `550 5.7.x`: `_rank_rows` отбрасывает `no` без права апелляции;
+- ключ идёт в query (так устроен их API) и потому вычищается из текстов ошибок (`_mev_safe`);
+- 30 запросов/мин, 100 бесплатных кредитов в сутки; вердикты кэшируются в
+  `<ORQ_DATA_ROOT>/orq_cache/mev_state.json`, иначе перезапуск той же командой сжигал бы квоту
+  заново. Остаток печатается прекондишеном стадии 4 и по `py email_guess.py --mev-credits`.
+
+Тумблеры: `EMAIL_MEV_ENABLE` (0), `EMAIL_MEV_API_KEY`, `EMAIL_MEV_URL`
+(`https://api.myemailverifier.com`), `EMAIL_MEV_DAILY_LIMIT` (100), `EMAIL_MEV_RPM` (30),
+`EMAIL_MEV_DENY_INDUSTRIES` (`opk,government`), `EMAIL_MEV_DENY_DOMAINS`
+(`gov.ru,mil.ru,mod.gov.ru,rosatom.ru,rostec.ru`), `EMAIL_MEV_CACHE_TTL_D` (30).
+⚠️ ToS сервиса требует «100% opt-in» списков и запрещает scraped/harvested адреса, а у нас
+расчётные гипотезы; юрисдикция — Нью-Джерси, США. Ещё одна причина держать наружу минимальный
+поток. Bulk-ручку (`/verifier/upload_file`) не подключать: она выгружает список целиком.
 
 **Проверка существования ящика без отправки письма** (`email_guess.verify_addresses`) — вес
 вердикта задаёт не наш код, а приёмник почты домена: Яндекс 360 и Google Workspace отвечают
@@ -501,7 +531,8 @@ Microsoft 365 принимает почти всё и проверяет пол�
 **Пресейл-брендинг (.docx):** `PRESALE_VENDOR` (строка «Подготовлено для», по умолчанию пусто),
 `PRESALE_PLATFORM_DESC`.
 
-**Служебные папки:** `D:\orq_cache` (кэш находок), `D:\orq_outbox` (недолитые файлы),
+**Служебные папки:** `D:\orq_cache` (кэш находок + `mev_state.json` — кредиты и вердикты
+облачного добора), `D:\orq_outbox` (недолитые файлы),
 `D:\orq_tmp` (temp + `run_*.log`), `D:\orq_outreach` (реестр рассылки, ветка `outreach`).
 
 ## Подводные камни

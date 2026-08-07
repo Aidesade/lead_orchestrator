@@ -10,12 +10,19 @@ r"""
     Петрова Ильи, а НЕ Сидорова Петра: имя «Пётр» входит в фамилию «Петров»);
   * схема домена, выведенная по известным адресам, схлопывает выдачу до 1-2
     гипотез — ради этого модуль и написан;
-  * подбор никогда не роняет компанию: нет домена/ФИО/DNS — меньше полей.
+  * подбор никогда не роняет компанию: нет домена/ФИО/DNS — меньше полей;
+  * облачный добор (MyEmailVerifier) выключен по умолчанию, не выпускает наружу
+    ОПК и госсектор и не превращает «сервер нас отшил» в «ящика нет».
 
 Запуск: py test_email_guess.py
 """
+import contextlib
+import json
+import os
 import pathlib
+import shutil
 import sys
+import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -790,12 +797,228 @@ def test_no_crash():
                                log=lambda *a: None)["people"] == [])
 
 
+# ------------------------------------------- облачный добор MyEmailVerifier ----
+class _FakeHTTP:
+    """Ответы MyEmailVerifier по очереди; считает и запоминает запросы.
+
+    Элемент очереди — dict (отдаётся как JSON) либо urllib.error.HTTPError."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.urls = []
+
+    def __call__(self, req, timeout=None):
+        self.urls.append(req.full_url)
+        reply = self.replies.pop(0) if self.replies else {"Status": "Unknown"}
+        if isinstance(reply, Exception):
+            raise reply
+        payload = json.dumps(reply).encode("utf-8")
+
+        class _Resp:
+            def read(self, *a):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        return _Resp()
+
+
+@contextlib.contextmanager
+def _mev_sandbox(fake=None, **env):
+    """Слой в песочнице: свои EMAIL_MEV_*, свой ORQ_DATA_ROOT (кэш и счётчик квоты
+    не должны утекать в рабочий D:\\orq_cache) и подменённый urlopen.
+
+    Значение None в env означает «переменной нет» — так проверяются дефолты."""
+    patch = {"EMAIL_MEV_" + key: value for key, value in env.items()}
+    patch["ORQ_DATA_ROOT"] = tempfile.mkdtemp(prefix="mev_")
+    saved = {name: os.environ.get(name) for name in patch}
+    saved_urlopen = EG.urllib.request.urlopen
+    try:
+        for name, value in patch.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        if fake is not None:
+            EG.urllib.request.urlopen = fake
+        EG._mev_last_call = 0.0                    # без паузы между кейсами
+        yield
+    finally:
+        EG.urllib.request.urlopen = saved_urlopen
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(patch["ORQ_DATA_ROOT"], ignore_errors=True)
+
+
+def _mev_out(verdicts, domain="dom.ru"):
+    """Заготовка выхода verify_addresses с заданными вердиктами."""
+    return {"domain": domain, "probed": False, "catch_all": None, "reason": "",
+            "verdicts": {addr: {"verdict": verdict, "trusted": False, "note": ""}
+                         for addr, verdict in verdicts.items()}}
+
+
+def _mev_run(fake, verdicts, lead, domain="dom.ru", **env):
+    """Прогнать _mev_fill на изолированном состоянии."""
+    base = dict(ENABLE="1", API_KEY="SECRET-KEY", DAILY_LIMIT="100")
+    base.update(env)
+    with _mev_sandbox(fake, **base):
+        return EG._mev_fill(_mev_out(verdicts, domain), lead)
+
+
+CIVIL = {"name": "АО Рязаньавтодор", "_industry": "construction",
+         "niche": "Строительство (ОКВЭД 42.11)"}
+
+
+def test_mev_read():
+    """Разбор ответа сервиса. Главное — асимметрия: Valid принимаем, Invalid — нет."""
+    ok = EG._mev_read({"Status": "Valid", "Diagnosis": "Mailbox Exists and Active"})
+    check("Valid -> ok", ok["verdict"] == "ok" and ok["trusted"], str(ok))
+
+    no = EG._mev_read({"Status": "Invalid", "Diagnosis": "Mailbox does not exist"})
+    check("Invalid + «ящика нет» -> no", no["verdict"] == "no", str(no))
+
+    # Их `Invalid` покрывает и «сервер нас отшил» — это НЕ приговор адресу.
+    soft = EG._mev_read({"Status": "Invalid", "Diagnosis": "Rejected by SMTP server"})
+    check("Invalid без внятного диагноза -> unknown", soft["verdict"] == "unknown",
+          str(soft))
+    check("и об этом сказано в ноте", "не приговор" in soft["note"], soft["note"])
+
+    trap = EG._mev_read({"Status": "Invalid", "Diagnosis": "Known spam trap"})
+    check("спам-ловушка -> no", trap["verdict"] == "no", str(trap))
+
+    for status in ("Catch All", "Unknown", "Grey-listed"):
+        got = EG._mev_read({"Status": status})
+        check(f"{status} -> unknown", got["verdict"] == "unknown", str(got))
+    flag = EG._mev_read({"Status": "Valid", "catch_all": "true"})
+    check("catch_all перебивает Valid", flag["verdict"] == "unknown", str(flag))
+
+    role = EG._mev_read({"Status": "Valid", "Role_Based": "true"})
+    check("ролевой адрес помечен", "ролевой" in role["note"], role["note"])
+
+
+def test_mev_gate():
+    """Комплаенс-гейт: чей адрес наружу не уходит вовсе."""
+    denied = [
+        ("отрасль opk", {"name": "З", "_industry": "opk", "niche": "ОПК"}),
+        ("госуправление", {"name": "З", "_industry": "government", "niche": "Гос"}),
+        ("ОКВЭД оборонный под меткой processing",
+         {"name": "З", "_industry": "processing", "niche": "Переработка (ОКВЭД 25.40)"}),
+        ("оборонный маркер в описании",
+         {"name": "З", "_industry": "processing", "niche": "Переработка (ОКВЭД 20.14)",
+          "_okved_descr": "Производство боеприпасов"}),
+        ("отрасль не определена", {"name": "З", "niche": ""}),
+        ("лида нет вовсе", None),
+    ]
+    for title, lead in denied:
+        fake = _FakeHTTP({"Status": "Valid"})
+        res = _mev_run(fake, {"a@dom.ru": "unknown"}, lead)
+        check(f"{title}: запрос не ушёл", fake.urls == [], str(fake.urls))
+        check(f"{title}: вердикт остался unknown",
+              res["verdicts"]["a@dom.ru"]["verdict"] == "unknown", str(res))
+
+    # Домен-блоклист работает даже когда отрасль сама по себе безобидна: у
+    # гражданского подрядчика почта может жить на ведомственном домене.
+    fake = _FakeHTTP({"Status": "Valid"})
+    _mev_run(fake, {"a@dep.gov.ru": "unknown"}, CIVIL, domain="dep.gov.ru",
+             URL="https://mev.test")
+    check("поддомен из блок-листа отсечён", fake.urls == [], str(fake.urls))
+
+    allowed = EG._mev_allowed(CIVIL, "avtodor-rzn.ru")
+    check("обычная гражданская компания пропущена", allowed[0] is True, str(allowed))
+
+
+def test_mev_fill():
+    """Поведение слоя: что спрашиваем, что не спрашиваем и как деградируем."""
+    fake = _FakeHTTP({"Status": "Valid", "Diagnosis": "Mailbox Exists and Active"})
+    res = _mev_run(fake, {"a@dom.ru": "unknown", "b@dom.ru": "no"}, CIVIL,
+                   URL="https://mev.test")
+    check("спрошен только неразрешённый адрес", len(fake.urls) == 1, str(fake.urls))
+    check("уже решённый вердикт не переписан",
+          res["verdicts"]["b@dom.ru"]["verdict"] == "no", str(res["verdicts"]))
+    check("добор дал ok", res["verdicts"]["a@dom.ru"]["verdict"] == "ok", str(res))
+    check("ключ ушёл в query", "apikey=SECRET-KEY" in fake.urls[0], fake.urls[0])
+    check("в reason видно, что был добор", "MyEmailVerifier" in res["reason"],
+          res["reason"])
+
+    # 429 -> ретрай, и ни при каких условиях не «ящика нет»
+    err = EG.urllib.error.HTTPError("u", 429, "Too Many", {}, None)
+    fake = _FakeHTTP(err, {"Status": "Valid"})
+    res = _mev_run(fake, {"a@dom.ru": "unknown"}, CIVIL, URL="https://mev.test", RPM="600")
+    check("429 отретраен", len(fake.urls) == 2, str(len(fake.urls)))
+    check("после ретрая вердикт получен",
+          res["verdicts"]["a@dom.ru"]["verdict"] == "ok", str(res))
+
+    fake = _FakeHTTP(err, err, err)
+    res = _mev_run(fake, {"a@dom.ru": "unknown"}, CIVIL, URL="https://mev.test", RPM="600")
+    check("исчерпанные ретраи дают unknown, а не no",
+          res["verdicts"]["a@dom.ru"]["verdict"] == "unknown", str(res))
+
+    # ключ не должен утечь в ноту вердикта через текст сетевой ошибки
+    fake = _FakeHTTP(RuntimeError("connect to ...?apikey=SECRET-KEY&email=a failed"))
+    res = _mev_run(fake, {"a@dom.ru": "unknown"}, CIVIL, URL="https://mev.test")
+    check("ключ не попал в ноту", "SECRET-KEY" not in str(res), str(res))
+
+    # суточная квота исчерпана — запроса нет, деградация мягкая
+    fake = _FakeHTTP({"Status": "Valid"})
+    res = _mev_run(fake, {"a@dom.ru": "unknown"}, CIVIL, URL="https://mev.test",
+                   DAILY_LIMIT="0")
+    check("квота исчерпана: запрос не ушёл", fake.urls == [], str(fake.urls))
+    check("квота исчерпана: вердикт unknown",
+          res["verdicts"]["a@dom.ru"]["verdict"] == "unknown", str(res))
+
+    # catch-all домен облаку не отдаём: наш слой уже доказал, что вердикта не будет
+    fake = _FakeHTTP({"Status": "Valid"})
+    out = _mev_out({"a@dom.ru": "unknown"})
+    out["catch_all"] = True
+    with _mev_sandbox(fake, ENABLE="1", API_KEY="K"):
+        EG._mev_fill(out, CIVIL)
+    check("catch-all домен облаку не отдан", fake.urls == [], str(fake.urls))
+
+
+def test_mev_off_and_cache():
+    """По умолчанию слой невидим; повтор не жжёт кредиты."""
+    with _mev_sandbox(ENABLE=None, API_KEY=None):
+        check("без EMAIL_MEV_ENABLE слой выключен", not EG.mev_enabled())
+    with _mev_sandbox(ENABLE="1", API_KEY=None):
+        check("включён без ключа — всё равно выключен", not EG.mev_enabled())
+
+    # Кэш живёт в ORQ_DATA_ROOT/orq_cache — два прогона подряд, один запрос
+    fake = _FakeHTTP({"Status": "Valid"}, {"Status": "Valid"})
+    with _mev_sandbox(fake, ENABLE="1", API_KEY="K", URL="https://mev.test",
+                      DAILY_LIMIT="100"):
+        for _ in range(2):
+            res = EG._mev_fill(_mev_out({"a@dom.ru": "unknown"}), CIVIL)
+    check("повторный прогон взял вердикт из кэша", len(fake.urls) == 1, str(fake.urls))
+    check("из кэша пришёл тот же вердикт",
+          res["verdicts"]["a@dom.ru"]["verdict"] == "ok", str(res))
+
+    # `unknown` — состояние временное (greylisted, «сервер отшил», сетевой сбой).
+    # Закэшировать его на месяц значит навсегда потерять адрес, который завтра
+    # разрешился бы; сервис за unknown кредит не берёт, повтор бесплатен.
+    fake = _FakeHTTP({"Status": "Grey-listed"}, {"Status": "Valid"})
+    with _mev_sandbox(fake, ENABLE="1", API_KEY="K", URL="https://mev.test",
+                      DAILY_LIMIT="100"):
+        for _ in range(2):
+            res = EG._mev_fill(_mev_out({"a@dom.ru": "unknown"}), CIVIL)
+    check("unknown в кэш не попал — адрес спрошен снова", len(fake.urls) == 2,
+          str(fake.urls))
+    check("на второй раз вердикт получен",
+          res["verdicts"]["a@dom.ru"]["verdict"] == "ok", str(res))
+
+
 def main():
     for test in (test_translit, test_split_fio, test_guess, test_parse_and_scheme,
                  test_separator, test_smtp_probe, test_verify_addresses,
                  test_belongs_to, test_domain, test_mail_state, test_people,
                  test_people_from_site, test_company, test_review_regressions,
-                 test_confidence, test_homonyms, test_no_crash):
+                 test_confidence, test_homonyms, test_no_crash,
+                 test_mev_read, test_mev_gate, test_mev_fill, test_mev_off_and_cache):
         print(f"\n--- {test.__name__} ---")
         test()
     print()

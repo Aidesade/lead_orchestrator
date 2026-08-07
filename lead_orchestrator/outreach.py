@@ -85,16 +85,20 @@ def check_verifier(required=True):
 
     На сервере: py email_verify.py --serve 8080
     Локально:   set EMAIL_VERIFIER_URL=http://<хост>:8080"""
+    mev = _check_mev()
     url = (os.environ.get("EMAIL_VERIFIER_URL") or "").strip()
     if not url:
-        if required:
+        # Облачный добор — самостоятельный слой: если он поднят, проверять ящики
+        # есть чем и без верификатора ЦИТ РТ, просто не для всех компаний.
+        if required and not mev["alive"]:
             raise SystemExit(
                 "[стадия 4] не задан EMAIL_VERIFIER_URL — проверять ящики неоткуда.\n"
                 "  На сервере ЦИТ РТ (там PTR и SPF): py email_verify.py --serve 8080\n"
                 "  Здесь: set EMAIL_VERIFIER_URL=http://<хост>:8080\n"
                 "  Пропустить осознанно: --no-verify-server (адреса пойдут как гипотезы)")
-        log("[стадия 4] верификатор не настроен — адреса пойдут как непроверенные гипотезы")
-        return {"url": "", "alive": False}
+        if not mev["alive"]:
+            log("[стадия 4] верификатор не настроен — адреса пойдут как непроверенные гипотезы")
+        return {"url": "", "alive": False, "mev": mev}
 
     import email_guess as EG
     # Контрольный адрес на домене, который заведомо принимает почту: нам важен не
@@ -105,7 +109,31 @@ def check_verifier(required=True):
     if unreachable:
         raise SystemExit(f"[стадия 4] верификатор {url} не отвечает: {probe.get('note')}")
     log(f"[стадия 4] верификатор: {url} — отвечает")
-    return {"url": url, "alive": True}
+    return {"url": url, "alive": True, "mev": mev}
+
+
+def _check_mev():
+    """Облачный добор MyEmailVerifier: остаток кредитов и блок-лист — ДО первой компании.
+
+    Не жёсткая ошибка: слой опциональный, и прогон без него просто отдаёт больше
+    непроверенных гипотез. Но остаток квоты надо видеть заранее — на 100 бесплатных
+    кредитов в сутки прогон на 200 компаний не влезает, и узнать об этом на сотой
+    компании хуже, чем до старта."""
+    import email_guess as EG
+
+    if not EG.mev_enabled():
+        return {"alive": False, "credits": None}
+    left, why = EG.mev_credits()
+    if left is None:
+        log(f"[стадия 4] MyEmailVerifier включён, но баланс не получен: {why} — "
+            f"добор работать не будет")
+        return {"alive": False, "credits": None}
+    policy = EG.mev_policy()
+    log(f"[стадия 4] MyEmailVerifier: {left} кредитов, "
+        f"суточный лимит {policy['daily_limit']}; не выпускаются отрасли "
+        f"{', '.join(policy['deny_industries'])} "
+        f"и домены {', '.join(policy['deny_domains'])}")
+    return {"alive": True, "credits": left}
 
 
 def check_mailbox(required=True):

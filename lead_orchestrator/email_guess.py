@@ -47,6 +47,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -771,9 +772,367 @@ def _classify_rcpt(code, message):
     return "temp"
 
 
+# ============================================================================
+# ОБЛАЧНЫЙ ВЕРИФИКАТОР MyEmailVerifier — ТОЛЬКО ДОБОР ПО НЕРАЗРЕШЁННОМУ
+# ============================================================================
+# Зачем он вообще нужен. Наша SMTP-проба идёт с рабочей машины, у которой нет ни
+# PTR, ни SPF под чужой домен, поэтому приёмная сторона отвечает отказом по политике
+# или молчит — и адрес остаётся `unknown`. MyEmailVerifier пробует со своей
+# инфраструктуры (свои IP, PTR, репутация) и закрывает ровно этот класс адресов.
+#
+# Чем он НЕ является: базой контактов. Сервис не отдаёт ни ФИО, ни должностей, ни
+# адресов — только отвечает «существует ли вот этот ящик». Источником данных по ЛПР
+# он быть не может.
+#
+# Границы, которые здесь держит код, а не благие намерения:
+#   * слой ВЫКЛЮЧЕН по умолчанию (EMAIL_MEV_ENABLE);
+#   * работает ТОЛЬКО по адресам, которые предыдущие слои оставили `unknown`;
+#   * адреса ОПК/ВПК и госсектора наружу не уходят никогда — режется ДО запроса,
+#     а неопределённая отрасль трактуется как запрет (fail-closed);
+#   * ключ идёт в query (так требует их API) и потому вычищается из текстов ошибок.
+# ToS сервиса требует «100% opt-in» списков, а у нас расчётные гипотезы — ещё одна
+# причина держать наружу минимальный поток, а не выгружать список целиком.
+MEV_URL_DEF = "https://api.myemailverifier.com"
+MEV_CREDITS_URL = "https://client.myemailverifier.com"
+
+# ОКВЭД-префиксы ОПК и госуправления. Намеренная копия из source_rusprofile.INDUSTRY
+# ("opk" и "government"): тот модуль импортирует undetected_chromedriver на верхнем
+# уровне, и тащить браузерную зависимость в email_guess (его грузят оркестратор и
+# person_enrich, в т.ч. в Docker без Chrome) ради двух списков нельзя.
+_MEV_DENY_OKVED = ("25.40", "30.30", "30.11", "30.12", "30.40", "20.51",
+                   "26.30", "26.51", "28.99", "84.1", "84.2", "84.3", "84.")
+# Отраслевые маркеры в названии/описании ОКВЭД. Третий гейт поверх _industry и
+# ОКВЭД: коды 25.40 и 28.99 лежат И в "opk", И в "processing", поэтому оборонный
+# завод штатно приезжает с меткой processing и обоими первыми гейтами не ловится.
+_MEV_DENY_WORDS = ("оруж", "боеприпас", "оборон", "военн", "вооруж", "ракет",
+                   "атомн", "ядерн", "росатом", "ростех", "спецназнач",
+                   "специального назначения", "гособорон")
+
+
+def _mev_env(name, default=""):
+    return (os.environ.get("EMAIL_MEV_" + name) or default).strip()
+
+
+def _mev_num(name, default):
+    """EMAIL_MEV_<name> числом. Мусор в переменной окружения не должен ронять прогон
+    посреди рассылки — молча берём дефолт."""
+    try:
+        return float(_mev_env(name, str(default)))
+    except ValueError:
+        return float(default)
+
+
+def _mev_list(name, default):
+    """EMAIL_MEV_<name> — список через запятую, нормализованный к нижнему регистру."""
+    return [part.strip().lower() for part in _mev_env(name, default).split(",")
+            if part.strip()]
+
+
+def mev_policy():
+    """Действующие границы слоя одной структурой.
+
+    Дефолты живут ровно здесь: по ним решает _mev_allowed, их же печатает прекондишен
+    стадии 4 в outreach — иначе лог рассказывал бы про свою копию списков."""
+    return {
+        "daily_limit": int(_mev_num("DAILY_LIMIT", 100)),
+        "deny_industries": _mev_list("DENY_INDUSTRIES", "opk,government"),
+        "deny_domains": _mev_list("DENY_DOMAINS",
+                                  "gov.ru,mil.ru,mod.gov.ru,rosatom.ru,rostec.ru"),
+    }
+
+
+def mev_enabled():
+    """Слой включён явно И есть ключ. Без ключа молча ничего не делаем."""
+    return (_mev_env("ENABLE", "0").lower() not in ("0", "false", "no", "off", "нет")
+            and bool(_mev_env("API_KEY")))
+
+
+def _mev_safe(text):
+    """Ключ уходит в query — значит попадает и в текст сетевых ошибок. Вычищаем,
+    иначе он утечёт в лог прогона (D:\\orq_tmp\\run_*.log) и в ноты вердиктов."""
+    out = str(text or "")
+    key = _mev_env("API_KEY")
+    if key:
+        out = out.replace(key, "<скрыто>")
+    return out[:160]
+
+
+_mev_last_call = 0.0
+
+
+def _mev_pace():
+    """Сервис отдаёт 429 после 30 запросов в минуту — держим интервал сами."""
+    global _mev_last_call
+    rpm = max(1.0, _mev_num("RPM", 30))
+    wait = (60.0 / rpm) - (time.monotonic() - _mev_last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _mev_last_call = time.monotonic()
+
+
+def _mev_request(url, timeout, retries=2):
+    """GET -> распарсенный JSON или {"_error": ...}. Ретраит 429 и 5xx с учётом
+    Retry-After (образец — source_ofdata.OfDataClient._call)."""
+    for attempt in range(retries + 1):
+        _mev_pace()
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read(1 << 20).decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
+                try:
+                    pause = float(exc.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    pause = 0.0
+                time.sleep(max(pause, 2.0 * (attempt + 1)))
+                continue
+            return {"_error": f"HTTP {exc.code}"}
+        except Exception as exc:                   # noqa: BLE001 — сеть/таймаут/битый JSON
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return {"_error": _mev_safe(exc)}
+    return {"_error": "нет ответа"}
+
+
+def _mev_payload(email, url, timeout):
+    """Сырой ответ MyEmailVerifier. Ключ — в query: так устроен их API."""
+    key = _mev_env("API_KEY")
+    if not key:
+        return {"_error": "не задан EMAIL_MEV_API_KEY"}
+    query = urllib.parse.urlencode({"apikey": key, "email": email})
+    data = _mev_request(f"{url}/api/validate_single.php?{query}", timeout)
+    if not isinstance(data, dict):                 # разбор ниже ждёт объект, а не список
+        return {"_error": "неожиданный ответ сервиса"}
+    if data.get("status") == "error":
+        # {"status":"error","error":"unauthorized","message":"User not found"}
+        return {"_error": _mev_safe(data.get("message") or data.get("error"))}
+    return data
+
+
+# Диагнозы, означающие «ящика нет» либо «слать нельзя». Всё, чего в списке НЕТ,
+# трактуется как `unknown`: у них `Invalid` покрывает и «нет адресата», и «сервер
+# нас отшил», а второе об адресате не говорит ничего. Тот же урок, что в
+# _classify_rcpt (550 5.1.1 против 550 5.7.x): наивный разбор вычеркнул бы живой
+# контакт ЛПР навсегда — _rank_rows такие строки отбрасывает без права апелляции.
+_MEV_NO = (
+    "does not exist", "doesn't exist", "not exist", "no such user", "user unknown",
+    "unknown user", "invalid mailbox", "mailbox not found", "recipient not found",
+    "invalid domain", "domain does not exist", "invalid syntax", "syntax error",
+    "invalid email", "spam trap", "spamtrap", "toxic",
+)
+
+
+def _mev_read(data):
+    """Ответ MyEmailVerifier -> наш {verdict, trusted, note, raw}.
+
+    Маппинг намеренно асимметричный: `Valid` принимаем, `Invalid` — только с
+    внятным диагнозом. `_TRUST` (вес приёмника домена) здесь не применяется: сервис
+    пробует со своих IP, а роль доменного веса у него играют собственные флаги
+    catch_all и Greylisted."""
+    def flag(key):                                 # булевы поля приходят строками "true"/"false"
+        return str(data.get(key) or "").strip().lower() == "true"
+
+    status = str(data.get("Status") or "").strip().lower()
+    diag = str(data.get("Diagnosis") or "").strip()
+    low = diag.lower()
+    note = f"MyEmailVerifier: {diag or status or 'без диагноза'}"
+
+    if flag("catch_all") or status in ("catch all", "catch-all", "catchall"):
+        return {"verdict": "unknown", "trusted": False, "raw": data,
+                "note": "MyEmailVerifier: домен принимает любой адрес (catch-all)"}
+    if status == "valid":
+        verdict = "ok"
+    elif status == "invalid":
+        verdict = "no" if any(mark in low for mark in _MEV_NO) else "unknown"
+        if verdict == "unknown":
+            note = (f"MyEmailVerifier отклонил адрес, но не сказал, что ящика нет "
+                    f"({diag or 'без диагноза'}) — не приговор")
+    else:                                          # unknown, grey-listed и всё прочее
+        verdict = "unknown"
+    if flag("Role_Based"):
+        note += "; ролевой адрес"
+    if flag("Disposable_Domain"):
+        note += "; одноразовый домен"
+    return {"verdict": verdict, "trusted": verdict != "unknown", "note": note, "raw": data}
+
+
+def _mev_allowed(lead, domain):
+    """Можно ли выпускать адреса этой компании во внешний сервис -> (bool, причина).
+
+    Fail-closed: не смогли определить отрасль — не выпускаем. Ошибка в эту сторону
+    стоит нескольких непроверенных адресов, в обратную — выгрузки контактов ЛПР
+    оборонного предприятия американскому подрядчику."""
+    policy = mev_policy()
+    dom = (domain or "").lower()
+    if any(dom == bad or dom.endswith("." + bad) for bad in policy["deny_domains"]):
+        return False, f"домен {domain} в блок-листе"
+    if not isinstance(lead, dict):
+        return False, "лид неизвестен — отрасль не определить"
+
+    industry = str(lead.get("_industry") or "").strip().lower()
+    if not industry:
+        return False, "отрасль компании не определена"
+    if industry in policy["deny_industries"]:
+        return False, f"отрасль «{industry}» в блок-листе"
+
+    # ОКВЭД Фаза 1 кладёт внутрь niche строкой «<отрасль> (ОКВЭД 25.40)»
+    found = re.search(r"ОКВЭД\s+(\d{2}(?:\.\d{1,2}){0,2})", str(lead.get("niche") or ""))
+    okved = found.group(1) if found else ""
+    if okved and any(okved.startswith(code) for code in _MEV_DENY_OKVED):
+        return False, f"ОКВЭД {okved} — оборонный или государственный"
+
+    blob = " ".join(str(lead.get(k) or "") for k in
+                    ("name", "niche", "_okved_descr")).lower()
+    hit = next((w for w in _MEV_DENY_WORDS if w in blob), "")
+    if hit:
+        return False, f"признак оборонного/госсектора в профиле («{hit}»)"
+    return True, ""
+
+
+# ---- бюджет кредитов и кэш вердиктов ---------------------------------------
+# Прогон рассчитан на перезапуск ТОЙ ЖЕ командой, поэтому без кэша повтор сжигал бы
+# суточную квоту заново на тех же адресах. Файл общий: и кэш, и счётчик за сутки.
+def _mev_state_path():
+    """ORQ_DATA_ROOT/orq_cache/mev_state.json -> D:\\orq_cache -> %TEMP%.
+
+    Намеренная копия orchestrator._work_base — ровно по той же причине, что и в
+    outreach_registry: импортировать оркестратор ради четырёх строк нельзя."""
+    data_root = (os.environ.get("ORQ_DATA_ROOT") or "").strip()
+    root = data_root or ("D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir())
+    return os.path.join(root, "orq_cache", "mev_state.json")
+
+
+def _mev_state():
+    try:
+        with open(_mev_state_path(), encoding="utf-8") as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {}
+    except Exception:                              # noqa: BLE001 — нет файла/битый JSON
+        return {}
+
+
+def _mev_save(state):
+    """Атомарно: прогон могут прервать Ctrl+C, а половина JSON хуже отсутствия."""
+    path = _mev_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:                              # noqa: BLE001 — кэш не критичен
+        pass
+
+
+def _mev_today():
+    """Ключ суточного счётчика. Общий для списания и для остатка: разойдись эти два
+    места в формате — квота считалась бы вечно нетронутой."""
+    return time.strftime("%Y-%m-%d")
+
+
+def _mev_remember(state, email, row):
+    """Списать кредит с суточного счётчика и, если вердикт окончательный, положить
+    его в кэш — одной операцией: вердикт без списания сжёг бы квоту молча.
+
+    `unknown` в кэш НЕ идёт. Он означает «greylisted», «сервер отшил» или сетевой
+    сбой — состояния временные, и запоминать их на месяц значит навсегда потерять
+    адрес, который завтра разрешился бы. Сам сервис за `unknown` кредит не берёт
+    (их FAQ), так что повторный вопрос ничего не стоит; счётчик всё равно
+    инкрементим — он считает запросы, а не списания, и это честнее к их лимиту."""
+    usage = state.setdefault("usage", {})
+    day = _mev_today()
+    usage[day] = int(usage.get(day, 0)) + 1
+    if row.get("verdict") != "unknown":
+        state.setdefault("verdicts", {})[email] = row
+
+
+def _mev_budget_left(state):
+    spent = int((state.get("usage") or {}).get(_mev_today(), 0))
+    return max(0, mev_policy()["daily_limit"] - spent)
+
+
+def _mev_cached(state, email):
+    row = (state.get("verdicts") or {}).get(email)
+    if not isinstance(row, dict) or not row.get("verdict"):
+        return None                                # битую строку кэша считаем отсутствующей
+    if time.time() - float(row.get("ts") or 0) > _mev_num("CACHE_TTL_D", 30) * 86400:
+        return None
+    return row
+
+
+def mev_credits(timeout=20):
+    """Остаток кредитов на счету (запрос баланса кредит не тратит) -> (int|None, текст)."""
+    key = _mev_env("API_KEY")
+    if not key:
+        return None, "не задан EMAIL_MEV_API_KEY"
+    base = _mev_env("CREDITS_URL", MEV_CREDITS_URL).rstrip("/")
+    data = _mev_request(f"{base}/verifier/getcredits/{urllib.parse.quote(key)}", timeout)
+    if isinstance(data, dict) and data.get("_error"):
+        return None, _mev_safe(data["_error"])
+    credits = data.get("credits") if isinstance(data, dict) else None
+    try:
+        return int(str(credits).strip()), ""
+    except (TypeError, ValueError):
+        return None, _mev_safe(f"неожиданный ответ: {data}")
+
+
+def _mev_fill(out, lead=None, log=None):
+    """Добрать облачным сервисом адреса, которые предыдущие слои не разрешили.
+
+    Вызывается на выходе verify_addresses и НИКОГДА не переписывает уже полученный
+    вердикт: трогаются только `unknown`."""
+    if not mev_enabled() or out.get("catch_all"):
+        return out
+    still = [addr for addr, row in out["verdicts"].items()
+             if row.get("verdict") == "unknown"]
+    if not still:
+        return out
+
+    allowed, why = _mev_allowed(lead, out.get("domain") or "")
+    if not allowed:
+        if log:
+            log(f"    MyEmailVerifier пропущен: {why}")
+        return out
+
+    state = _mev_state()
+    url = _mev_env("URL", MEV_URL_DEF).rstrip("/")
+    asked = 0
+    for addr in still:
+        row = _mev_cached(state, addr)
+        if row is None:
+            if _mev_budget_left(state) <= 0:
+                # если что-то уже спросили, итоговая строка сама покажет нулевой остаток
+                if log and not asked:
+                    log("    MyEmailVerifier: суточная квота исчерпана — "
+                        "адреса остаются непроверенными")
+                break
+            got = external_verify(addr, url=url, kind="myemailverifier")
+            row = {"verdict": got["verdict"], "note": got["note"], "ts": time.time()}
+            _mev_remember(state, addr, row)
+            asked += 1
+        if row["verdict"] == "unknown":
+            continue
+        out["verdicts"][addr] = {"verdict": row["verdict"], "trusted": True,
+                                 "note": row["note"]}
+        out["probed"] = True
+    if asked:
+        _mev_save(state)
+        mark = f"добор MyEmailVerifier ({asked})"
+        was = out.get("reason") or ""
+        out["reason"] = f"{was} | {mark}" if was else mark
+        if log:
+            log(f"    MyEmailVerifier: проверено {asked}, "
+                f"остаток квоты {_mev_budget_left(state)}")
+    return out
+
+
 def _external_payload(email, url, kind, timeout):
     """Сырой ответ внешнего верификатора (или None). Отдельно от разбора, чтобы
     ошибку сети было видно как ошибку, а не как «ящик не найден»."""
+    if kind == "myemailverifier":
+        return _mev_payload(email, url, timeout)
     helo = os.environ.get("EMAIL_GUESS_HELO", "").strip()
     mail_from = os.environ.get("EMAIL_GUESS_MAIL_FROM", "").strip()
     secret = os.environ.get("EMAIL_VERIFIER_SECRET", "").strip()
@@ -812,8 +1171,12 @@ def external_verify(email, url=None, kind=None, timeout=20):
       * AfterShip/email-verifier (Go, MIT) — GET  {url}/v1/{email}/verification
       * Reacher / check-if-email-exists (Rust, AGPL) — POST {url}/v1/check_email
     Сюда же можно направить наш собственный `email_verify.py --serve` — формат
-    ответа у него тот же. Облачные верификаторы (ZeroBounce, Hunter) сознательно не
-    подключены: это выгрузка списка ЛПР третьей стороне.
+    ответа у него тот же.
+
+    Третий kind — `myemailverifier` — облачный. Массово подключать облака нельзя
+    (ZeroBounce, Hunter, NeverBounce так и не подключены): это выгрузка списка ЛПР
+    третьей стороне. Этот вызывается только из _mev_fill, только по адресам, которые
+    не разрешили предыдущие слои, и только для компаний вне блок-листа отраслей.
 
     Возвращает {verdict, trusted, note, raw}. Именно dict, а не строка: «не смогли
     проверить» и «ящика нет» обязаны различаться, иначе недоступный сервис молча
@@ -830,6 +1193,9 @@ def external_verify(email, url=None, kind=None, timeout=20):
         return {"verdict": "unknown", "trusted": False,
                 "note": f"верификатор недоступен ({(data or {}).get('_error', 'нет ответа')})",
                 "raw": data}
+
+    if kind == "myemailverifier":
+        return _mev_read(data)                     # у облака свой формат, smtp-блока нет
 
     smtp = data.get("smtp") if isinstance(data.get("smtp"), dict) else {}
     if kind == "reacher":
@@ -850,7 +1216,7 @@ def external_verify(email, url=None, kind=None, timeout=20):
     return {"verdict": verdict, "trusted": verdict != "unknown", "note": note, "raw": data}
 
 
-def verify_addresses(domain, addresses, mail=None, timeout=10, log=None):
+def verify_addresses(domain, addresses, mail=None, timeout=10, log=None, lead=None):
     """Существуют ли ящики — БЕЗ отправки письма. Одна SMTP-сессия на домен.
 
     Возвращает dict с вердиктами и — главное — с честной оценкой их веса:
@@ -860,7 +1226,10 @@ def verify_addresses(domain, addresses, mail=None, timeout=10, log=None):
       catch_all   — домен принимает любой адрес (тогда вердикта нет ни у кого);
       verdicts    — {адрес: {"verdict": ok|no|unknown, "trusted": bool, "note": str}}.
     Пустой/неуверенный результат — норма: 20-25% корпоративных доменов не разрешаются
-    ничем, кроме реальной отправки."""
+    ничем, кроме реальной отправки.
+
+    `lead` нужен последнему слою (_mev_fill): по нему решается, можно ли выпускать
+    адреса этой компании во внешний сервис. Без лида облачный добор не работает."""
     out = {"domain": domain, "probed": False, "provider": "", "trust": "",
            "catch_all": None, "reason": "", "verdicts": {}}
     addresses = [a for a in (addresses or []) if "@" in a][:5]
@@ -881,7 +1250,7 @@ def verify_addresses(domain, addresses, mail=None, timeout=10, log=None):
             out["verdicts"][addr] = {k: got[k] for k in ("verdict", "trusted", "note")}
             if got["verdict"] != "unknown":
                 out["probed"] = True               # хоть один ответ получен — сервис жив
-        return out
+        return _mev_fill(out, lead, log)
 
     mail = mail or mail_domain_state(domain)
     if mail.get("accepts_mail") is False:
@@ -900,7 +1269,7 @@ def verify_addresses(domain, addresses, mail=None, timeout=10, log=None):
     if out["trust"] == "none":
         out["reason"] = (f"{out['provider']} принимает почту на любой адрес и проверяет "
                          f"получателя уже после приёма — проба ничего не докажет")
-        return out
+        return _mev_fill(out, lead, log)           # именно здесь облако и полезнее всего
 
     # сам SMTP-диалог живёт в email_verify (Python-порт ядра Reacher) — здесь остаётся
     # только доменная логика и перевод технических флагов в вес вердикта
@@ -951,7 +1320,7 @@ def verify_addresses(domain, addresses, mail=None, timeout=10, log=None):
     if log:
         log(f"    SMTP-проверка {domain}: {out['reason'] or 'выполнена'} "
             f"(провайдер: {out['provider'] or '—'}, доверие: {out['trust'] or '—'})")
-    return out
+    return _mev_fill(out, lead, log)
 
 
 # ============================================================================
@@ -1323,7 +1692,7 @@ def _persons_for_company(lead, findings_text, domain, use_site, log):
     return persons, site_emails, notes
 
 
-def _apply_smtp_verdicts(res, log=None):
+def _apply_smtp_verdicts(res, log=None, lead=None):
     """Проверить кандидатов без отправки письма и записать вердикты вместе с их весом.
 
     Вердикт меняет уверенность только если ему МОЖНО верить: у mail.ru «принято»
@@ -1331,7 +1700,8 @@ def _apply_smtp_verdicts(res, log=None):
     addrs = [r["email"] for p in res["people"] for r in p["emails"]
              if r["scheme"] != "опубликован"][:5]
     try:
-        check = verify_addresses(res["domain"], addrs, mail=res.get("mail"), log=log)
+        check = verify_addresses(res["domain"], addrs, mail=res.get("mail"), log=log,
+                                 lead=lead)
     except Exception:                              # noqa: BLE001 — проба не критична
         return
     res["smtp"] = {k: check[k] for k in
@@ -1438,7 +1808,7 @@ def guess_for_company(lead, findings_text="", people=None, check_mx=True, smtp=F
                               "source": person.get("source", ""), "emails": rows})
 
     if smtp and res["people"]:
-        _apply_smtp_verdicts(res, log=log)
+        _apply_smtp_verdicts(res, log=log, lead=lead)
     return res
 
 
@@ -1532,7 +1902,19 @@ def main():
                     help="не обходить страницы руководства сайта (быстрее, но меньше людей)")
     ap.add_argument("--smtp", action="store_true", help="+ SMTP-проба (медленно, часто unknown)")
     ap.add_argument("--per-person", type=int, default=3, help="сколько гипотез на человека (3)")
+    ap.add_argument("--mev-credits", action="store_true",
+                    help="остаток кредитов MyEmailVerifier (сам запрос кредит не тратит)")
     a = ap.parse_args()
+
+    if a.mev_credits:
+        left, why = mev_credits()
+        if left is None:
+            print(f"MyEmailVerifier: баланс не получен — {why}")
+            return
+        print(f"MyEmailVerifier: {left} кредитов на счету; "
+              f"суточный лимит прогона {mev_policy()['daily_limit']}, "
+              f"слой {'включён' if mev_enabled() else 'ВЫКЛЮЧЕН (EMAIL_MEV_ENABLE)'}")
+        return
 
     if a.leads:
         with open(a.leads, encoding="utf-8") as fh:
