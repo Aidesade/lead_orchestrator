@@ -45,7 +45,11 @@ except Exception:
     pass
 
 try:
-    import project_env                              # noqa: F401 — тихо подгружает env/.env
+    # Именно ВЫЗОВ, а не голый импорт: сам по себе модуль ничего не делает, и
+    # прежний `import project_env` оставлял пайплайн без env/.env — секреты
+    # (EMAIL_VERIFIER_URL, EMAIL_MEV_*, OUTREACH_*) молча подменялись дефолтами.
+    from project_env import load_project_env
+    load_project_env()
 except Exception:
     pass
 

@@ -889,8 +889,22 @@ def test_mev_read():
           str(soft))
     check("и об этом сказано в ноте", "не приговор" in soft["note"], soft["note"])
 
-    trap = EG._mev_read({"Status": "Invalid", "Diagnosis": "Known spam trap"})
-    check("спам-ловушка -> no", trap["verdict"] == "no", str(trap))
+    # ⚠️ Диагнозы уровня ДОМЕНА не должны превращаться в «ящика нет». Проверено
+    # вживую 2026-08-07: сервис отвечает «Disposable or Toxic domain» на
+    # info@vozr.ru и info@zaovad.com — опубликованные адреса живых дорожных
+    # подрядчиков. «no» у нас необратим, поэтому такие ответы — только unknown.
+    for diag in ("Disposable or Toxic domain (UCE) (D7)", "Invalid email (D36) (D21)",
+                 "Known spam trap"):
+        got = EG._mev_read({"Status": "Invalid", "Diagnosis": diag})
+        check(f"доменный диагноз не приговор: {diag[:34]}",
+              got["verdict"] == "unknown", str(got))
+    dom = EG._mev_read({"Status": "Invalid",
+                        "Diagnosis": "Disposable or Toxic domain (UCE) (D7)"})
+    check("в ноте сказано, что забракован домен, а не ящик",
+          "ДОМЕН" in dom["note"], dom["note"])
+    check("а мейлбокс-уровневый диагноз приговором остаётся",
+          EG._mev_read({"Status": "Invalid",
+                        "Diagnosis": "Mailbox does not exist (D5)"})["verdict"] == "no")
 
     for status in ("Catch All", "Unknown", "Grey-listed"):
         got = EG._mev_read({"Status": status})
@@ -900,6 +914,22 @@ def test_mev_read():
 
     role = EG._mev_read({"Status": "Valid", "Role_Based": "true"})
     check("ролевой адрес помечен", "ролевой" in role["note"], role["note"])
+
+    # ⚠️ Реальный ответ сервиса (снят вживую 2026-08-07): флаги — ЧИСЛА 0/1, а не
+    # строки "true"/"false", как обещает документация. Разбор только по "true"
+    # молча пропускал бы catch-all домены как обычные.
+    live_ok = EG._mev_read({
+        "Address": "postmaster@yandex.ru", "catch_all": 0, "Disposable_Domain": 0,
+        "Role_Based": 1, "Free_Domain": 1, "Greylisted": 0, "Status": "Valid",
+        "Diagnosis": "Mailbox exist and active. Safe to send (D28) (D21)"})
+    check("живой ответ Valid -> ok", live_ok["verdict"] == "ok", str(live_ok))
+    check("числовой Role_Based=1 распознан", "ролевой" in live_ok["note"],
+          live_ok["note"])
+    live_ca = EG._mev_read({"Status": "Valid", "catch_all": 1, "Role_Based": 0})
+    check("числовой catch_all=1 перебивает Valid",
+          live_ca["verdict"] == "unknown", str(live_ca))
+    check("числовой catch_all=0 вердикт не ломает",
+          EG._mev_read({"Status": "Valid", "catch_all": 0})["verdict"] == "ok")
 
 
 def test_mev_gate():

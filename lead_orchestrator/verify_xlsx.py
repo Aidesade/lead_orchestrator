@@ -39,7 +39,8 @@ except Exception:
     pass
 
 try:
-    import project_env                              # noqa: F401 — тихо подгружает env/.env
+    from project_env import load_project_env       # именно вызов: импорт сам по себе
+    load_project_env()                             # ничего не грузит (см. outreach.py)
 except Exception:
     pass
 

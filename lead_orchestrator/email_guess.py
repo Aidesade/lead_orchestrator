@@ -888,7 +888,11 @@ def _mev_request(url, timeout, retries=2):
     for attempt in range(retries + 1):
         _mev_pace()
         try:
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            # Без User-Agent их WAF отвечает 403 на всё, включая запрос баланса:
+            # дефолтный "Python-urllib/3.12" режется. Проверено вживую 2026-08-07.
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; lead-orchestrator/1.0)"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read(1 << 20).decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
@@ -932,8 +936,18 @@ _MEV_NO = (
     "does not exist", "doesn't exist", "not exist", "no such user", "user unknown",
     "unknown user", "invalid mailbox", "mailbox not found", "recipient not found",
     "invalid domain", "domain does not exist", "invalid syntax", "syntax error",
-    "invalid email", "spam trap", "spamtrap", "toxic",
 )
+# Диагнозы уровня ДОМЕНА, а не ящика. Держим отдельно и НЕ переводим в «no».
+# Проверено вживую 2026-08-07: сервис отвечает «Disposable or Toxic domain (UCE)»
+# на info@vozr.ru (АО ПО «Возрождение») и info@zaovad.com (АО «ВАД») — это
+# опубликованные общие адреса живых дорожных подрядчиков, никакие не одноразовые.
+# Там же в списке оказались tatavtodor.ru, kznvodokanal.ru, avtodorstroy.ru,
+# nbssib.ru. Это оценка репутации домена по чужим блок-листам, о существовании
+# ящика она не говорит НИЧЕГО, а «no» у нас необратим: _rank_rows выбрасывает
+# такую строку без права апелляции. Сигнал сохраняем в ноте — решать человеку.
+# По той же причине сюда попал generic «Invalid email (D36)»: их «Invalid» на
+# российских доменах слишком часто означает «нам не понравился домен».
+_MEV_SUSPECT = ("disposable", "toxic", "spam trap", "spamtrap", "invalid email")
 
 
 def _mev_read(data):
@@ -943,8 +957,12 @@ def _mev_read(data):
     внятным диагнозом. `_TRUST` (вес приёмника домена) здесь не применяется: сервис
     пробует со своих IP, а роль доменного веса у него играют собственные флаги
     catch_all и Greylisted."""
-    def flag(key):                                 # булевы поля приходят строками "true"/"false"
-        return str(data.get(key) or "").strip().lower() == "true"
+    def flag(key):
+        """Их булевы поля. ⚠️ Документация обещает строки "true"/"false", а API
+        отдаёт ЧИСЛА 0/1 (проверено вживую 2026-08-07). Понимаем обе формы: разбор
+        только по "true" молча считал бы catch-all домен обычным, и веер гипотез
+        по нему уехал бы наружу как подтверждённые адреса."""
+        return str(data.get(key) or "").strip().lower() in ("true", "1", "yes")
 
     status = str(data.get("Status") or "").strip().lower()
     diag = str(data.get("Diagnosis") or "").strip()
@@ -957,8 +975,15 @@ def _mev_read(data):
     if status == "valid":
         verdict = "ok"
     elif status == "invalid":
-        verdict = "no" if any(mark in low for mark in _MEV_NO) else "unknown"
-        if verdict == "unknown":
+        if any(mark in low for mark in _MEV_SUSPECT):
+            verdict = "unknown"
+            note = (f"MyEmailVerifier забраковал ДОМЕН, а не ящик ({diag}) — "
+                    f"на российских корпоративных доменах это его известная "
+                    f"ошибка, проверять вручную")
+        elif any(mark in low for mark in _MEV_NO):
+            verdict = "no"
+        else:
+            verdict = "unknown"
             note = (f"MyEmailVerifier отклонил адрес, но не сказал, что ящика нет "
                     f"({diag or 'без диагноза'}) — не приговор")
     else:                                          # unknown, grey-listed и всё прочее
