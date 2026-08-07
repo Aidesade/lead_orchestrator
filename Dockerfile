@@ -109,6 +109,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
     && python lead_orchestrator/test_email_guess.py \
     && python lead_orchestrator/test_email_verify.py \
     && python lead_orchestrator/test_outreach.py \
+    && python lead_orchestrator/test_verify_xlsx.py \
     && python lead_orchestrator/test_outlook_send.py \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/patches/apply_patches.py --check \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/writer_kimi_agent.py --selftest \

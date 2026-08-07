@@ -208,6 +208,7 @@ py test_email_verify.py          # проверка ящика без отпра
 py test_rusprofile_playwright.py # cookie, порог 1 млрд, revenue-sort + разбор карточки (ЛПР под пейволом)
 py test_outreach.py              # ВЕТКА outreach: реестр, выбор адреса ЛПР, сборка письма
 py test_outlook_send.py          # ВЕТКА outreach: аккаунт tatar.ru, вложение, черновик vs отправка
+py test_verify_xlsx.py           # добор по готовой .xlsx: зелёные не перепроверяются, ОПК не выпускается
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
 py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
@@ -229,7 +230,8 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
 `test_source_ofdata.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
 `test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
-`test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_outlook_send.py`,
+`test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_verify_xlsx.py`,
+`test_outlook_send.py`,
 `apply_patches.py --check` и импорт Kimi-стадии. Добавил тест — добавь его и в гейт.
 
 ⚠️ `web/api/test_events.py` гонять при ЛЮБОЙ правке печати в `orchestrator.py`: веб парсит именно
@@ -361,6 +363,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `email_verify.py` | **проверка существования ящика БЕЗ отправки письма** — Python-порт ядра Reacher на голом stdlib (ни Docker, ни WSL, ни Rust-бинаря). Формат ответа совместим с Reacher (`is_reachable` + `syntax`/`mx`/`smtp`/`misc`), есть CLI и `--serve` (HTTP-API на том же контракте). ⚠️ Осознанное отличие от оригинала: у Reacher `invalid` означает и «нет ящика», и «не смог подключиться» — при закрытом порте 25 это вычеркнуло бы все живые адреса; здесь такой случай = `unknown`, а `550 5.7.x` (политика) отделён от `550 5.1.1` (нет адресата). Единственная SMTP-реализация в репо: `email_guess` и `person_enrich` зовут её |
 | `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов. Последним слоем — `_mev_fill`: облачный добор MyEmailVerifier ТОЛЬКО по оставшимся `unknown` и только вне блок-листа отраслей (см. «Тумблеры подбора почты»), по умолчанию выключен |
 | `outreach.py` | **главный вход ВЕТКИ** (asyncio): восемь стадий рассылки, прекондишены 4 и 5, `--check` = стадия 8. Дефолт — черновики, `--send` — реальная отправка |
+| `verify_xlsx.py` | **добор по готовой выгрузке .xlsx** (ветка `outreach`): берёт НЕзелёные строки колонки «Почта» (зелёная заливка = уже подтверждён сервером) и гонит их через облачный слой `email_guess._mev_fill`. Отрасли в таблице нет, поэтому `--industry` обязателен, а гейт всё равно проверяет название компании — на реальной выгрузке под меткой `construction` лежали ФНПЦ «Титан-Баррикады», ГосНИИ «Кристалл» и ОКБ «Новатор». Дефолт — СУХОЙ прогон, реальный только по `--run`; на выходе копия книги с вердиктами |
 | `outreach_registry.py` | реестр отработанных по ИНН: атомарная запись, бэкфилл из `D:\deliverables`, `audit()` для стадии 8. «Отработана» = есть деливераблы ИЛИ отправлено письмо |
 | `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
 | `outreach_letter.py` | текст письма: `build_prompt` (только проверенные факты) → модель через `claude_kimi_adapter` со спекой `kimi_agent/outreach_letter.yaml` → `parse_reply` → подпись и отписка КОДОМ |
