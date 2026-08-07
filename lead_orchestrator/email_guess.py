@@ -1008,7 +1008,12 @@ def people_from_findings(findings_text):
 MGMT_PATHS = (
     # порядок важен: обход обрывается по лимиту попыток, поэтому впереди страницы,
     # которые чаще всего существуют и несут и ФИО, и личные адреса
-    "/rukovodstvo", "/management", "/kontakty", "/contacts", "/team", "/komanda",
+    # «/kontaktyi» и «/kontakti» — не опечатки: так «контакты» транслитерируют
+    # плагины Cyr-to-Lat (WordPress) и Bitrix. На talspecstroi.ru именно по такому
+    # адресу лежала страница с восемью личными адресами и схемой домена, а обход
+    # с одним лишь «/kontakty» возвращал ноль людей и ноль адресов
+    "/rukovodstvo", "/management", "/kontakty", "/kontaktyi", "/kontakti",
+    "/contacts", "/team", "/komanda",
     "/struktura", "/administraciya", "/o-kompanii", "/structure", "/staff",
     "/sotrudniki", "/about/management", "/company/management",
 )
@@ -1080,6 +1085,46 @@ def _fetch_page(url, timeout=12):
         return raw.decode("utf-8", "replace"), final
 
 
+def _edit_distance_1(a, b):
+    """Строки различаются не больше чем одной правкой (вставка/замена/удаление)."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = diff = 0
+    while i < len(a) and j < len(b):
+        if a[i] == b[j]:
+            i, j = i + 1, j + 1
+            continue
+        diff += 1
+        if diff > 1:
+            return False
+        if len(a) == len(b):
+            i += 1
+        j += 1
+    return diff + (len(b) - j) + (len(a) - i) <= 1
+
+
+def _same_brand(old, new):
+    """Один и тот же бренд под разными доменами?
+
+    «svgc.ru» и «svgk.ru» — да: одна аббревиатура (СВГК), разная латиница, и почта
+    осталась на старом домене. «avtodor-rzn.ru» и «another-site.ru» — нет, это
+    просто увод на чужой сайт, данные оттуда к нашей компании не относятся.
+    Сходства домена мало для доказательства, но его ОТСУТСТВИЕ — достаточный повод
+    не верить редиректу, а именно это здесь и решается."""
+    a, b = old.split(".")[0], new.split(".")[0]
+    if not a or not b:
+        return False
+    if a == b:                                     # тот же бренд в другой зоне (.ru -> .рф)
+        return True
+    if len(a) < 3 or len(b) < 3:                   # двухбуквенные метки слишком близки друг к другу
+        return False
+    if a in b or b in a:                           # svgk -> svgk-group
+        return abs(len(a) - len(b)) <= 6
+    return _edit_distance_1(a, b)
+
+
 def people_from_site(domain, max_pages=10, timeout=12, budget_s=None, log=None):
     """Обойти страницы руководства сайта -> (люди, найденные адреса).
 
@@ -1094,6 +1139,9 @@ def people_from_site(domain, max_pages=10, timeout=12, budget_s=None, log=None):
     отдающего данные по байту, и одна мёртвая компания вешала бы прогон."""
     people, emails, seen_p, seen_e, tried = [], [], set(), set(), 0
     own = domain_of(domain)
+    # почту компания могла оставить на прежнем домене, даже переехав сайтом
+    mail_domains = {own} if own else set()
+    moved = False
     base = HIS._norm_url(domain).rstrip("/")
     deadline = time.monotonic() + (SITE_BUDGET_S if budget_s is None else budget_s)
     for path in MGMT_PATHS[:max_pages]:
@@ -1104,9 +1152,22 @@ def people_from_site(domain, max_pages=10, timeout=12, budget_s=None, log=None):
             html, final_url = _fetch_page(base + path, timeout=timeout)
         except Exception:
             continue                               # 404 на странице — норма, не сбой
-        # редирект увёл на другой хост: данные оттуда к нашей компании не относятся
-        if not html or (own and domain_of(final_url) != own):
+        if not html:
             continue
+        final_dom = domain_of(final_url)
+        if own and final_dom != own:
+            # Компания сменила домен сайта, а почту оставила на старом: у СВГК
+            # svgc.ru редиректит на svgk.ru, и почта при этом svgc@svgc.ru.
+            # Прежняя проверка отбрасывала такой сайт целиком — обход возвращал
+            # ноль людей и ноль адресов. Переезд принимаем однократно и только
+            # когда это тот же бренд на собственном сайте: одного is_own_site мало,
+            # он пропускает и увод на сайт совершенно другой компании.
+            if moved or not (final_dom and HIS.is_own_site(final_url)
+                             and _same_brand(own, final_dom)):
+                continue
+            moved = True
+            own, base = final_dom, "https://" + final_dom
+            mail_domains.add(final_dom)
         text = re.sub(r"\s+", " ", EF._strip_tags(html))
         for m in _RE_FIO.finditer(text):
             fio = f"{m.group(1)} {m.group(2)} {m.group(3)}"
@@ -1124,7 +1185,7 @@ def people_from_site(domain, max_pages=10, timeout=12, budget_s=None, log=None):
                            "source": final_url})
         for cand in EF.extract_candidates(html, path or "/"):
             email = cand["email"]
-            if email in seen_e or EF.is_junk(email) or domain_of(email) != own:
+            if email in seen_e or EF.is_junk(email) or domain_of(email) not in mail_domains:
                 continue
             seen_e.add(email)
             emails.append({"email": email, "fio": ""})

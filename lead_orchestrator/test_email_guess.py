@@ -621,6 +621,24 @@ def test_people_from_site():
         check("данные с чужого хоста после редиректа отброшены",
               people == [] and emails == [], f"{people} / {emails}")
 
+        # переезд на свой же домен: у СВГК svgc.ru редиректит на svgk.ru, а почта
+        # осталась на svgc.ru. Раньше обход отбрасывал такой сайт целиком.
+        moved_html = ('<p>Начальник Киреев Владимир Борисович</p>'
+                      '<p>svgc@svgc.ru</p><p>kireevvb@svgk.ru</p>'
+                      '<p>partner@other.ru</p>')
+        EG._fetch_page = lambda url, timeout=12: (moved_html, "https://svgk.ru/kontakty")
+        people, emails = EG.people_from_site("svgc.ru")
+        addrs = [e["email"] for e in emails]
+        check("переезд на домен того же бренда принят",
+              [p["fio"] for p in people] == ["Киреев Владимир Борисович"], str(people))
+        check("почта на прежнем домене сохранена", "svgc@svgc.ru" in addrs, str(addrs))
+        check("адрес на новом домене тоже собран", "kireevvb@svgk.ru" in addrs, str(addrs))
+        check("чужой домен всё равно отсеян", "partner@other.ru" not in addrs, str(addrs))
+
+        check("непохожий домен не считается тем же брендом",
+              not EG._same_brand("avtodor-rzn.ru", "another-site.ru"), "")
+        check("одна буква разницы — тот же бренд", EG._same_brand("svgc.ru", "svgk.ru"), "")
+
         # человек без должности рядом — не обязательно сотрудник
         EG._fetch_page = lambda url, timeout=12: (
             "<p>Поздравляем ветерана Ветрова Илью Петровича с юбилеем</p>", url)
