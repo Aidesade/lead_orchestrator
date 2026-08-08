@@ -17,6 +17,7 @@ Python 3.12, основная платформа Windows, прод-цель — 
 **Сателлитные доки — здесь НЕ дублируются, читать по ссылке:**
 `lead_orchestrator_kimi/CLAUDE.md` (патчи venv, канон блоков one-pager, реальный API Kimi SDK,
 вёрстка полосы метрик), `web/README.md` (ручки API и решения веба), `DEPLOY_TIMEWEB.md` (прод),
+`DEPLOY_VERIFIER.md` (ВМ верификатора ящиков для стадии 4 outreach),
 `AUDIT_KIMI.md` (аудит Kimi-стадии).
 
 ## Runtime: Claude Agent SDK (ветка claude-sdk)
@@ -73,7 +74,7 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 | 1 | Реестр отработанных | `outreach_registry.py` — ключ ИНН, бэкфилл из `D:\deliverables` |
 | 2 | Парсинг RusProfile | `rusprofile_playwright.card_facts` / `parse_founders` |
 | 3 | One-pager по отрасли | `assets/onepagers/<отрасль>.pdf`, иначе `--generate-onepager` |
-| 4 | **Прекондишен** верификатора ЦИТ РТ (+ остаток кредитов облачного добора) | `EMAIL_VERIFIER_URL` → `email_verify.py --serve`; `outreach._check_mev` |
+| 4 | **Прекондишен** верификатора на своей ВМ (+ остаток кредитов облачного добора) | `EMAIL_VERIFIER_URL` → `email_verify.py --serve`; `outreach._check_mev`; развёртывание — `DEPLOY_VERIFIER.md` |
 | 5 | **Прекондишен** ящика `@tatar.ru` | `outlook_send.check_ready` |
 | 6 | Адрес ЛПР | `email_guess.guess_for_company` + `outreach.pick_recipient` |
 | 7 | Письмо и отправка | `outreach_letter.py` + `outlook_send.send_message` |
@@ -143,8 +144,9 @@ py outreach.py --industries mining --count 10          # сбор + весь ц�
 py outreach.py "D:\лиды\leads_mining.json" --dry-run   # 8 стадий офлайн, без модели и Outlook
 py outreach.py "D:\лиды\leads_mining.json" --send --limit 5 --pace 45   # реальная отправка
 py outlook_send.py --check                             # жив ли Outlook и есть ли ящик @tatar.ru
-py verify_host_check.py                                # ЗАПУСКАТЬ НА СЕРВЕРЕ ЦИТ РТ: порт 25, PTR, SPF
+py verify_host_check.py                                # ЗАПУСКАТЬ НА ВМ ВЕРИФИКАТОРА: порт 25, PTR, SPF, чёрные списки
 py email_verify.py --serve 8080                        # там же: верификатор для EMAIL_VERIFIER_URL
+run_verify_tunnel.cmd verifier@<IP>                    # здесь: SSH-туннель к нему (DEPLOY_VERIFIER.md)
 # только официальная база контактов — детерминированно, без LLM и без .docx:
 py company_research_agent.py --contacts "АО Рязаньавтодор 6234065445"
 # разовый прямой контакт ЛПР (ФИО+ИНН -> рабочие email/телефоны, только легитимные источники).
@@ -475,6 +477,10 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 страницу), `EMAIL_GUESS_SITE_BUDGET` (45 с — общий дедлайн обхода сайта на компанию; socket-таймаут
 от сервера, отдающего по байту, не спасает); `EMAIL_VERIFIER_URL` + `EMAIL_VERIFIER_KIND`
 (`aftership` | `reacher`) — адрес СВОЕГО (self-hosted) верификатора, если он поднят.
+⚠️ Верификатор живёт на ОТДЕЛЬНОЙ ВМ со своим доменом (PTR ↔ A ↔ SPF), а не на рабочей машине и
+не на домене `citrt.ru`; доступ — SSH-туннелем (`run_verify_tunnel.cmd`), поэтому URL всегда
+`http://127.0.0.1:<порт>`. Порт наружу не публикуется: у HTTP-API нет авторизации. Развёртывание
+и приёмка — `DEPLOY_VERIFIER.md`.
 
 **Облачный верификатор — только добор и только по разрешённым отраслям.** Подключать облака
 списком (ZeroBounce/Hunter/NeverBounce) по-прежнему НЕЛЬЗЯ: это выгрузка списка ЛПР третьей
@@ -482,7 +488,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 и рамки держит код, а не намерение:
 
 - слой **ВЫКЛЮЧЕН по умолчанию** (`EMAIL_MEV_ENABLE=0`, плюс без `EMAIL_MEV_API_KEY` он мёртв);
-- работает ТОЛЬКО по адресам, которые локальная проба и верификатор ЦИТ РТ оставили `unknown`
+- работает ТОЛЬКО по адресам, которые локальная проба и свой верификатор оставили `unknown`
   — то есть ровно там, где мы слепы (Microsoft 365, отказ по политике, нет PTR);
 - **адреса ОПК/ВПК и госсектора наружу не уходят никогда.** Три независимых гейта в
   `_mev_allowed`: отрасль (`EMAIL_MEV_DENY_INDUSTRIES`, дефолт `opk,government`), ОКВЭД и

@@ -7,7 +7,7 @@ r"""Outreach-пайплайн: сбор -> адрес ЛПР -> письмо с 
   1. Реестр отработанных   — outreach_registry: кому уже писали и по кому есть материалы
   2. Парсинг RusProfile    — название, сайт, телефоны, ИНН, руководитель, учредители
   3. One-pager по отрасли  — готовый файл из assets/onepagers либо генерация стадией Kimi/Claude
-  4. Верификатор ЦИТ РТ    — ПРЕКОНДИШЕН: email_verify --serve на хосте с PTR и SPF
+  4. Верификатор ящиков    — ПРЕКОНДИШЕН: email_verify --serve на ВМ с PTR и SPF
   5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: Outlook Desktop и аккаунт отправителя
   6. Адрес ЛПР             — email_guess (гипотезы по схеме домена) + проверка без отправки
   7. Письмо                — текст моделью, подпись кодом, отправка через Outlook
@@ -80,25 +80,29 @@ def _flag(name, default="1"):
 
 # ============================================================ ПРЕКОНДИШЕНЫ ====
 def check_verifier(required=True):
-    """Стадия 4: верификатор почты на сервере ЦИТ РТ.
+    """Стадия 4: верификатор почты на отдельной ВМ.
 
     Проверка ящиков идёт SMTP-диалогом до RCPT TO. Приёмная сторона смотрит на PTR
     и SPF отправителя, поэтому с обычной рабочей машины почти всё возвращается как
     «не смогли проверить» (это и показал verify_host_check). Отсюда требование
-    гонять пробу с хоста ЦИТ РТ: там PTR и SPF настроены.
+    гонять пробу с ВМ, где PTR ↔ A ↔ SPF сходятся на СВОЁМ домене — расширять SPF
+    корпоративного домена ради этого не нужно (подробности в DEPLOY_VERIFIER.md).
 
-    На сервере: py email_verify.py --serve 8080
-    Локально:   set EMAIL_VERIFIER_URL=http://<хост>:8080"""
+    На ВМ:    py email_verify.py --serve 8080
+    Локально: run_verify_tunnel.cmd verifier@<IP>, затем
+              set EMAIL_VERIFIER_URL=http://127.0.0.1:8080"""
     mev = _check_mev()
     url = (os.environ.get("EMAIL_VERIFIER_URL") or "").strip()
     if not url:
         # Облачный добор — самостоятельный слой: если он поднят, проверять ящики
-        # есть чем и без верификатора ЦИТ РТ, просто не для всех компаний.
+        # есть чем и без своего верификатора, просто не для всех компаний.
         if required and not mev["alive"]:
             raise SystemExit(
                 "[стадия 4] не задан EMAIL_VERIFIER_URL — проверять ящики неоткуда.\n"
-                "  На сервере ЦИТ РТ (там PTR и SPF): py email_verify.py --serve 8080\n"
-                "  Здесь: set EMAIL_VERIFIER_URL=http://<хост>:8080\n"
+                "  На ВМ (там PTR и SPF): py email_verify.py --serve 8080\n"
+                "  Здесь: run_verify_tunnel.cmd verifier@<IP>, затем\n"
+                "         set EMAIL_VERIFIER_URL=http://127.0.0.1:8080\n"
+                "  Как поднять ВМ — DEPLOY_VERIFIER.md\n"
                 "  Пропустить осознанно: --no-verify-server (адреса пойдут как гипотезы)")
         if not mev["alive"]:
             log("[стадия 4] верификатор не настроен — адреса пойдут как непроверенные гипотезы")
@@ -501,7 +505,7 @@ def main():
     ap.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="без модели и без Outlook — проверить цепочку")
     ap.add_argument("--no-verify-server", dest="no_verify_server", action="store_true",
-                    help="работать без верификатора ЦИТ РТ (адреса — непроверенные гипотезы)")
+                    help="работать без своего верификатора (адреса — непроверенные гипотезы)")
     ap.add_argument("--check", action="store_true", help="стадия 8: только отчёт по реестру")
     ap.add_argument("--registry", default=None, help="путь к файлу реестра")
     a = ap.parse_args()

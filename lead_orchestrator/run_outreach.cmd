@@ -8,9 +8,10 @@ rem        run_outreach.cmd "D:\leads\leads_mining.json" --send --limit 5
 rem
 rem  DRAFTS BY DEFAULT. Real sending needs an explicit --send, and the menu
 rem  asks for a typed confirmation before it.
-rem  Mailbox verification (stage 4) runs on the CIT RT host where PTR and SPF
-rem  are configured: start "python email_verify.py --serve 8080" there and set
-rem  EMAIL_VERIFIER_URL here.
+rem  Mailbox verification (stage 4) runs on a dedicated VM where PTR and SPF
+rem  are configured: start "python email_verify.py --serve 8080" there, open
+rem  the tunnel with run_verify_tunnel.cmd and set EMAIL_VERIFIER_URL here.
+rem  Setup guide: DEPLOY_VERIFIER.md in the repository root.
 rem  NOTE: keep this file ASCII + CRLF - cmd.exe garbles UTF-8/LF batch files.
 rem ==========================================================================
 chcp 65001 >nul
@@ -159,8 +160,9 @@ exit /b 0
 :warnings
 if not defined EMAIL_VERIFIER_URL (
     echo [WARN] EMAIL_VERIFIER_URL is not set - mailbox existence cannot be proven.
-    echo        On the CIT RT host: python email_verify.py --serve 8080
-    echo        Here:               set EMAIL_VERIFIER_URL=http://HOST:8080
+    echo        On the verifier VM: python email_verify.py --serve 8080
+    echo        Here:               run_verify_tunnel.cmd verifier@IP
+    echo                            set EMAIL_VERIFIER_URL=http://127.0.0.1:8080
     echo        Or pass --no-verify-server to accept unverified guesses.
 )
 if not exist "%RUSPROFILE_COOKIES_FILE%" (
