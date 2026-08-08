@@ -753,18 +753,35 @@ def smtp_trust(provider):
     return _TRUST.get(provider, "medium")
 
 
+# Прямое утверждение сервера об АДРЕСАТЕ. Проверено вживую 2026-08-08: Яндекс 360
+# на несуществующий ящик отвечает «550 5.7.1 No such user!» — код про политику, текст
+# про адресата. Без этого списка такой ответ уходил в policy, и вердикт «ящика нет»
+# терялся на 15% адресов выгрузки (все домены на Яндекс 360).
+_NO_MAILBOX_TEXT = re.compile(
+    r"no such (user|mailbox|recipient|address)|user (unknown|not found|doesn'?t exist)"
+    r"|mailbox (unavailable|not found|does not exist)|recipient (unknown|not found|rejected)"
+    r"|unknown user|invalid (recipient|mailbox|address)|no mailbox here"
+    r"|адресат неизвестен|пользовател[ья] (не найден|не существует)", re.I)
+
+
 def _classify_rcpt(code, message):
     """Ответ на RCPT -> ok | no | policy | temp.
 
     Отделять policy от no обязательно: 550 бывает и «нет такого ящика» (5.1.1), и
     «ваш IP мне не нравится» (5.7.1). Во втором случае об адресате не сказано ничего,
-    а наивный разбор пометил бы живой контакт несуществующим."""
+    а наивный разбор пометил бы живой контакт несуществующим.
+
+    Обратная ошибка так же реальна: часть серверов ставит код политики, но прямым
+    текстом говорит про адресата («5.7.1 No such user»). Верить надо тексту, когда
+    он однозначен, — иначе честный отказ пропадает в «не проверили»."""
     text = message.decode("utf-8", "replace") if isinstance(message, bytes) else str(message or "")
     if code in (250, 251):
         return "ok"
     if code in (421, 450, 451, 452, 503, 452):
         return "temp"
     if code in (550, 551, 553, 554):
+        if _NO_MAILBOX_TEXT.search(text):
+            return "no"                            # сервер сам назвал причину — адресат
         if re.search(r"5\.7\.\d", text) or re.search(
                 r"policy|blocked|blacklist|spam|denied|not allowed|reputation", text, re.I):
             return "policy"
