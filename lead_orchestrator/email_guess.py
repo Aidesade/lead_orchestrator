@@ -1963,6 +1963,16 @@ def _findings_for(lead):
 
 
 def main():
+    try:
+        # Только в CLI: библиотечный импорт из оркестратора и email_verify не должен
+        # лезть в файлы. Без этого документированный `--mev-credits` отвечал «не задан
+        # EMAIL_MEV_API_KEY» при живом ключе в env/.env — ровно та же ловушка, что
+        # чинили в outreach.py: импорт project_env сам по себе ничего не грузит.
+        from project_env import load_project_env
+        load_project_env()
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(
         description="Гипотезы корпоративной почты сотрудников по ФИО и домену компании")
     ap.add_argument("fio", nargs="?", help="ФИО (Фамилия Имя Отчество)")
