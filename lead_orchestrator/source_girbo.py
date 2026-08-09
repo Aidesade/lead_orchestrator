@@ -319,7 +319,10 @@ def _cli(argv):
                              "часто нужно пересобрать отдельно")
     parser.add_argument("--out", default=None)
     parser.add_argument("--contacts", action="store_true",
-                        help="добрать сайт/телефон/почту через OfData /company")
+                        help="добрать сайт/телефон/почту по карточке компании")
+    parser.add_argument("--contacts-source", default="ofdata", choices=("ofdata", "checko"),
+                        help="чьей карточкой добирать: у обоих свой суточный лимит, "
+                             "и когда один исчерпан, добор продолжают вторым")
     parser.add_argument("--contacts-cap", type=int, default=0)
     parser.add_argument("--xlsx", default=None)
     args = parser.parse_args(argv)
@@ -335,9 +338,15 @@ def _cli(argv):
         leads = harvest(region=args.region, min_revenue=args.min_revenue, year=args.year,
                         industries=industries, limit=args.limit, out_path=args.out)
     if args.contacts and leads:
-        from source_ofdata import OfDataClient, ofdata_contacts_pass
+        if args.contacts_source == "checko":
+            from checko_enrich import CheckoClient, checko_contacts_pass
 
-        ofdata_contacts_pass(OfDataClient(), leads, cap=args.contacts_cap)
+            # cap у Checko — суточный free-лимит, 0 здесь означал бы «не спрашивать никого»
+            checko_contacts_pass(CheckoClient(), leads, cap=args.contacts_cap or 100)
+        else:
+            from source_ofdata import OfDataClient, ofdata_contacts_pass
+
+            ofdata_contacts_pass(OfDataClient(), leads, cap=args.contacts_cap)
         if args.out:
             with open(args.out, "w", encoding="utf-8") as handle:
                 json.dump(leads, handle, ensure_ascii=False, indent=1)
