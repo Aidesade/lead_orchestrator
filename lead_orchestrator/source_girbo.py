@@ -313,6 +313,10 @@ def _cli(argv):
     parser.add_argument("--industries", default="",
                         help="ключи INDUSTRY через запятую; пусто — все отрасли")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--from-json", default=None,
+                        help="взять готовую выгрузку вместо обхода региона: обход "
+                             "занимает десятки минут, а контакты и Excel к нему "
+                             "часто нужно пересобрать отдельно")
     parser.add_argument("--out", default=None)
     parser.add_argument("--contacts", action="store_true",
                         help="добрать сайт/телефон/почту через OfData /company")
@@ -321,8 +325,15 @@ def _cli(argv):
     args = parser.parse_args(argv)
 
     industries = [part.strip() for part in args.industries.split(",") if part.strip()]
-    leads = harvest(region=args.region, min_revenue=args.min_revenue, year=args.year,
-                    industries=industries, limit=args.limit, out_path=args.out)
+    if args.from_json:
+        with open(args.from_json, encoding="utf-8") as handle:
+            leads = json.load(handle)
+        if args.limit:
+            leads = leads[:args.limit]
+        log(f"=== Взято из {args.from_json}: {len(leads)} лидов (обход пропущен) ===")
+    else:
+        leads = harvest(region=args.region, min_revenue=args.min_revenue, year=args.year,
+                        industries=industries, limit=args.limit, out_path=args.out)
     if args.contacts and leads:
         from source_ofdata import OfDataClient, ofdata_contacts_pass
 
