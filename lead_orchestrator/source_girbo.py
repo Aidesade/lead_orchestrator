@@ -267,11 +267,15 @@ def parse_groups(spec):
             raise GirboSourceError(
                 f"группа «{chunk}» без кодов; формат: имя:19,20.1;имя2:41,42")
         name, _, codes = chunk.partition(":")
+        # «ключ=Человеческое название» — ключ уходит в _industry, а по нему
+        # outreach ищет вложение <ключ>.pdf в assets/onepagers. Поэтому ключ
+        # держим коротким и латиницей, а в отчёт идёт название.
+        key, _, label = name.strip().partition("=")
+        key, label = key.strip(), (label.strip() or key.strip())
         prefixes = tuple(code.strip() for code in codes.split(",") if code.strip())
         if not prefixes:
-            raise GirboSourceError(f"в группе «{name}» не осталось кодов ОКВЭД")
-        groups[name.strip()] = {"label": name.strip(), "okved": prefixes,
-                                "pain": "", "offer": ""}
+            raise GirboSourceError(f"в группе «{key}» не осталось кодов ОКВЭД")
+        groups[key] = {"label": label, "okved": prefixes, "pain": "", "offer": ""}
     return groups
 
 
