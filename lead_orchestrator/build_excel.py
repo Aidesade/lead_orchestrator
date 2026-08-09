@@ -46,11 +46,12 @@ def _confidence_label(ld):
     return f"{t} ({c})" if c is not None else t
 
 
-# цвет шрифта Email по типу почты: целевая зелёная/синяя, общая — оранжевая
+# цвет шрифта Email по типу почты: целевая зелёная/синяя, общая — оранжевая,
+# служебная — серая: это техподдержка или робот, работать по ней нельзя
 _EMAIL_COLOR = {
     "личная ЛПР": "FF1E7A34", "личная": "FF1E7A34", "руководитель": "FF1E7A34",
     "почта компании": "FF1F6FB2", "сотрудничество": "FF1F6FB2",
-    "общая": "FFC55A11",
+    "общая": "FFC55A11", "служебная": "FF808080",
 }
 
 
@@ -59,12 +60,16 @@ def _mark_email(cell, ld):
     color = _EMAIL_COLOR.get(kind)
     if color:
         cell.font = Font(name="Arial", size=10, color=color,
-                         bold=kind in ("личная ЛПР", "сотрудничество"))
+                         bold=kind in ("личная ЛПР", "сотрудничество"),
+                         italic=kind == "служебная")
     src = ld.get("_email_src", "")
     note = f"Тип почты: {kind}"
     if src:
         note += f"\nИсточник: {src}"
-    if not ld.get("_email_is_target"):
+    if kind == "служебная":
+        note += ("\n⚠ служебный ящик (техподдержка/робот) — НЕ контактный. "
+                 "Взят потому, что другого адреса у компании не нашлось")
+    elif not ld.get("_email_is_target"):
         note += "\n⚠ общая почта (не ЛПР) — целевой адрес на сайте не найден"
     if ld.get("_email_verified"):
         note += "\n✓ подтверждена на офиц. сайте"

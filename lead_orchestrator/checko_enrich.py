@@ -136,14 +136,32 @@ _OPERATOR_MAIL = re.compile(
     r"@(?:[\w.-]*\.)?(tensor\.ru|diadoc|sbis\.ru|taxcom|kontur|edisoft|esphere|ofd|astralnalog)",
     re.I)
 _COOP = ("zakup", "tender", "torg", "postavshik", "postavchik", "partner",
-         "sotrudnich", "opt", "sale", "b2b", "pr@", "prodazh")
+         "sotrudnich", "opt", "sale", "b2b", "prodazh")
 _GENERAL = ("info", "office", "mail", "priem", "secretar", "kancel", "kanc",
             "general", "company", "reception", "post", "obsh")
+# Служебные ящики: письмо попадёт в техподдержку, в робота или в системный
+# алиас, а не человеку, который принимает решения. Проверяется ПЕРВЫМ, иначе
+# support@ не попадает ни в один список ниже и уходит в «личная» — то есть
+# получает приоритет ВЫШЕ, чем info@, и вытесняет реальный контакт компании.
+# Отдельный список, а не email_finder.GENERIC_KW: тот шире и включает info,
+# office, mail — как раз те адреса, которые нам нужны.
+_SERVICE = ("support", "help", "hotline", "noreply", "no-reply", "donotreply",
+            "webmaster", "postmaster", "hostmaster", "abuse", "security",
+            "sysadmin", "service", "servis", "robot", "notif", "alert",
+            "billing", "podderzhka", "tehpodderzhka")
+# Короткие имена сравниваются ЦЕЛИКОМ: как подстроки они ловят чужое —
+# «it» сидит внутри «vitaly», «pr» внутри «prodazhi», «test» внутри «testov».
+# Сравнивается локальная часть, поэтому писать их с «@» бессмысленно.
+_SERVICE_EXACT = ("it", "it-support", "tech", "admin", "administrator", "root",
+                  "bot", "test", "edo", "sys", "smtp", "mailer")
+_COOP_EXACT = ("pr",)
 
 
 def _classify_email(addr):
     lp = (addr or "").split("@", 1)[0].lower()
-    if any(k in lp for k in _COOP):
+    if lp in _SERVICE_EXACT or any(k in lp for k in _SERVICE):
+        return "служебная", False
+    if lp in _COOP_EXACT or any(k in lp for k in _COOP):
         return "сотрудничество", True
     if any(lp.startswith(k) or k in lp for k in _GENERAL):
         return "общая", False
@@ -154,8 +172,10 @@ def _best_email(emails):
     cand = [e for e in (emails or []) if e and "@" in e and not _OPERATOR_MAIL.search(e)]
     if not cand:
         return None, "", False
-    # приоритет: сотрудничество > личная > общая
-    pr = {"сотрудничество": 0, "личная": 1, "общая": 2}
+    # приоритет: сотрудничество > личная > общая > служебная.
+    # Служебная — последняя осознанно: её берём, только если у компании вообще
+    # больше ничего нет, и в отчёт она идёт с пометкой «не контактная».
+    pr = {"сотрудничество": 0, "личная": 1, "общая": 2, "служебная": 3}
     scored = [(pr[_classify_email(e)[0]], e) for e in cand]
     scored.sort()
     best = scored[0][1]
