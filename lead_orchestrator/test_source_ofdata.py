@@ -273,6 +273,59 @@ class OfDataTests(unittest.TestCase):
         self.assertFalse(rejected)
         self.assertIn("42.11", codes)
 
+    def test_service_mailbox_never_wins_over_contact(self):
+        """Техподдержка не должна вытеснять контактную почту.
+
+        До правки support@ не попадал ни в один список и классифицировался как
+        «личная» — то есть получал приоритет ВЫШЕ info@ и уезжал в отчёт как
+        основной адрес компании."""
+        from checko_enrich import _best_email, _classify_email
+
+        for addr in ("support@x.ru", "help@x.ru", "noreply@x.ru", "it@x.ru",
+                     "admin@x.ru", "edo@x.ru", "postmaster@x.ru"):
+            self.assertEqual(_classify_email(addr)[0], "служебная", addr)
+        # короткие служебные имена сравниваются целиком, а не как подстрока
+        for addr in ("vitaly@x.ru", "testov@x.ru", "ivanov.ii@x.ru"):
+            self.assertEqual(_classify_email(addr)[0], "личная", addr)
+        self.assertEqual(_classify_email("prodazhi@x.ru")[0], "сотрудничество")
+        self.assertEqual(_classify_email("pr@x.ru")[0], "сотрудничество")
+
+        self.assertEqual(_best_email(["support@x.ru", "info@x.ru"])[0], "info@x.ru")
+        self.assertEqual(_best_email(["it@x.ru", "ivanov@x.ru"])[0], "ivanov@x.ru")
+        # других адресов нет — служебный берём, но помечаем «не контактный»
+        addr, kind, is_target = _best_email(["noreply@x.ru"])
+        self.assertEqual((addr, kind, is_target), ("noreply@x.ru", "служебная", False))
+
+    def _harvest_with_fake_industry(self, client, **kwargs):
+        fake_module = types.ModuleType("source_rusprofile")
+        fake_module.INDUSTRY = {
+            "_test": {"label": "Тестовая отрасль", "okved": ["42.11"],
+                      "pain": "pain", "offer": "offer"},
+        }
+        previous = sys.modules.get("source_rusprofile")
+        sys.modules["source_rusprofile"] = fake_module
+        try:
+            return OD.harvest(["_test"], per_industry=10, region="16",
+                              max_candidates=10, client=client, **kwargs)
+        finally:
+            if previous is None:
+                sys.modules.pop("source_rusprofile", None)
+            else:
+                sys.modules["source_rusprofile"] = previous
+
+    def test_revenue_year_filters_stale_reports(self):
+        """Выручка 2024-го — не ответ на вопрос «сколько заработали в 2025»."""
+        leads = self._harvest_with_fake_industry(_FakeClient(), revenue_year="2025")
+        self.assertEqual([lead["_inn"] for lead in leads], ["1000000001"])
+        # без фильтра по году проходит и компания с отчётностью за 2024
+        leads_any = self._harvest_with_fake_industry(_FakeClient())
+        self.assertIn("1000000003", [lead["_inn"] for lead in leads_any])
+
+    def test_limit_keeps_largest_by_revenue(self):
+        leads = self._harvest_with_fake_industry(_FakeClient(), limit=1)
+        self.assertEqual(len(leads), 1)
+        self.assertEqual(leads[0]["_inn"], "1000000003")     # 2.5 млрд — крупнейший
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

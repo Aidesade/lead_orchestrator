@@ -398,8 +398,14 @@ def _save(leads, out_path):
 
 def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=None,
             headless=False, out_path=None, exclude_regions=None, offscreen=False,
-            max_candidates=3000, client=None):
-    """Drop-in источник: ОКВЭД/регион -> /finances -> порог -> квота отрасли."""
+            max_candidates=3000, client=None, revenue_year=None, limit=0):
+    """Drop-in источник: ОКВЭД/регион -> /finances -> порог -> квота отрасли.
+
+    revenue_year: считать прошедшими только компании с отчётностью ЗА ЭТОТ год.
+    Без него порог применяется к последнему доступному году, а это разные вещи:
+    выручка 2019-го ничего не говорит о том, жив ли бизнес сейчас.
+    limit: общий потолок на выдачу (после сортировки по убыванию выручки).
+    """
     del headless, offscreen  # совместимость с браузерными источниками
     try:
         from source_rusprofile import INDUSTRY
@@ -497,12 +503,22 @@ def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=N
             else:
                 revenue_mode = "ofdata"
 
-    kept, no_report, below, broken = [], [], [], []
+    kept, no_report, below, broken, stale = [], [], [], [], []
+    want_year = str(revenue_year).strip() if revenue_year else ""
+
+    def _year_ok(lead):
+        """Отчётность именно за нужный год. Лид с более старой выручкой не
+        «ниже порога» и не «без отчётности» — про запрошенный год он молчит."""
+        if not want_year:
+            return True
+        return str(lead.get("_revenue_year") or "").strip() == want_year
+
     if revenue_mode == "girbo":
         from revenue_enrich import add_revenue
 
         log(f"=== ГИР БО ФНС: проверяем выручку {len(leads)} кандидатов; "
-            f"строгий порог >= {threshold / 1e9:g} млрд ₽ ===")
+            f"строгий порог >= {threshold / 1e9:g} млрд ₽"
+            + (f" за {want_year} год" if want_year else "") + " ===")
         add_revenue(leads, log=log)
         for lead in leads:
             lead["source"] = "OfData API (/search) + ГИР БО ФНС (выручка)"
@@ -512,6 +528,8 @@ def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=N
             revenue = _number(lead.get("_revenue"))
             if revenue is None or revenue <= 0:
                 no_report.append(lead)
+            elif not _year_ok(lead):
+                stale.append(lead)
             elif revenue >= threshold:
                 kept.append(lead)
             else:
@@ -538,7 +556,9 @@ def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=N
                 lead["_revenue_source_name"] = "OfData / ГИР БО ФНС, строка 2110"
                 lead["_revenue_source_url"] = FINANCES_DOC_URL
                 lead["source"] = "OfData API (/search + /finances)"
-                if revenue >= threshold:
+                if not _year_ok(lead):
+                    stale.append(lead)
+                elif revenue >= threshold:
                     kept.append(lead)
                 else:
                     below.append(lead)
@@ -548,7 +568,8 @@ def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=N
     kept.sort(key=lambda lead: -(lead.get("_revenue") or 0))
     log(f"=== Порог >= {threshold / 1e9:g} млрд: прошли {len(kept)} из {len(leads)} "
         f"(ниже: {len(below)}, нет отчётности/строки 2110: {len(no_report)}, "
-        f"сбой проверки: {len(broken)}) ===")
+        f"сбой проверки: {len(broken)}"
+        + (f", отчётность не за {want_year}: {len(stale)}" if want_year else "") + ") ===")
 
     output, per = [], {}
     for lead in kept:
@@ -557,6 +578,11 @@ def harvest(industries, min_revenue=MIN_REVENUE_FLOOR, per_industry=40, region=N
             continue
         per[industry] = per.get(industry, 0) + 1
         output.append(lead)
+
+    if limit and len(output) > int(limit):
+        log(f"=== Общий лимит {int(limit)}: оставлены крупнейшие по выручке "
+            f"(отброшено {len(output) - int(limit)}) ===")
+        output = output[:int(limit)]
 
     if out_path:
         _save(output, out_path)
@@ -579,7 +605,14 @@ def _cli(argv):
     parser.add_argument("--no-contacts", action="store_true")
     parser.add_argument("--print-json", action="store_true",
                         help="вывести итоговый JSON лидов в терминал (ключ не выводится)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="общий потолок компаний в выдаче (крупнейшие по выручке)")
+    parser.add_argument("--revenue-year", default="",
+                        help="год отчётности, например 2025: компании с выручкой только "
+                             "за более ранние годы отбрасываются")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--xlsx", default=None,
+                        help="сохранить результат ещё и в .xlsx (build_excel)")
     args = parser.parse_args(argv)
 
     from source_rusprofile import INDUSTRY
@@ -605,11 +638,21 @@ def _cli(argv):
     leads = harvest(
         industries, min_revenue=args.min_revenue, per_industry=args.per_industry,
         region=args.region, max_candidates=args.max_candidates, client=client,
+        revenue_year=args.revenue_year, limit=args.limit,
     )
     if not args.no_contacts:
         ofdata_contacts_pass(client, leads, cap=args.contacts_cap)
     if args.out:
         _save(leads, args.out)
+    if args.xlsx:
+        # Excel строится ПОСЛЕ контактов: иначе колонки «Сайт», «Телефон» и «Email»
+        # уедут пустыми, а тип почты — неразмеченным.
+        from build_excel import build
+
+        label = INDUSTRY.get(industries[0], {}).get("label", industries[0])
+        if len(industries) > 1:
+            label = ", ".join(industries)
+        log(f"=== Excel: {build(leads, label, args.xlsx)} ===")
     if args.print_json:
         log("\n=== JSON результата OfData (без API-ключа) ===")
         log(json.dumps(leads, ensure_ascii=False, indent=2))
