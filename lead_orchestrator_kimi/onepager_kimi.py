@@ -197,8 +197,16 @@ async def _generate_html_claude(user_content, model=None):
             "python'ом основного окружения") from e
 
     model = model or os.environ.get("ORQ_ONEPAGER_MODEL") or "opus"
+    # max_turns=1 требовал уместить весь самодостаточный HTML листа в ОДИН ход:
+    # если модель не успевала закрыть разметку, сессия падала с error_max_turns и
+    # стадия возвращала пустой PDF. Тулов у агента нет, лишние ходы взяться неоткуда —
+    # это запас на продолжение длинного ответа, а не свобода действий.
+    try:
+        max_turns = max(1, int(os.environ.get("ORQ_ONEPAGER_MAX_TURNS") or 4))
+    except ValueError:
+        max_turns = 4
     options = ClaudeAgentOptions(
-        model=model, system_prompt=ONEPAGER_SYSTEM, max_turns=1,
+        model=model, system_prompt=ONEPAGER_SYSTEM, max_turns=max_turns,
         allowed_tools=[],
         disallowed_tools=["Bash", "Edit", "Write", "NotebookEdit",
                           "WebSearch", "WebFetch", "Read", "Glob", "Grep"],
