@@ -210,6 +210,7 @@ py test_outreach.py              # ВЕТКА outreach: реестр, выбор
 py test_outlook_send.py          # ВЕТКА outreach: аккаунт tatar.ru, вложение, черновик vs отправка
 py test_verify_xlsx.py           # добор по готовой .xlsx: зелёные не перепроверяются, ОПК не выпускается
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
+py test_source_girbo.py          # ГИР БО-источник: префиксный матч ОКВЭД, регион, год, предел offset
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
 py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
 py kimi_research_cli.py --selftest      # subprocess-мост URL-инструментов
@@ -228,7 +229,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `... research_enrichment_agent.py --selftest`, плюс `patches/apply_patches.py --check`.
 
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
-`test_source_ofdata.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
+`test_source_ofdata.py`, `test_source_girbo.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
 `test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
 `test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_verify_xlsx.py`,
 `test_outlook_send.py`,
@@ -369,6 +370,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `outreach_letter.py` | текст письма: `build_prompt` (только проверенные факты) → модель через `claude_kimi_adapter` со спекой `kimi_agent/outreach_letter.yaml` → `parse_reply` → подпись и отписка КОДОМ |
 | `source_rusprofile.py` / `rusprofile_playwright.py` / `rusprofile_session.py` | штатный источник Фазы 1: карта `INDUSTRY` (21), регион-фильтр с отрицанием; единая Playwright-context; создание cookie (`--login`, UC остался как `RUSPROFILE_BROWSER=uc`) |
 | `source_ofdata.py` / `source_checko.py` | API-пути (Docker и откат) |
+| `source_girbo.py` | **перечисление РЕГИОНА через ГИР БО ФНС** — бесплатно, без ключа. Нужен потому, что OfData и Checko матчат ОКВЭД ТОЧНО, а крупный бизнес сидит на детализированных кодах (Татнефть `19.20.1`, КАМАЗ `29.10.4`) и по `19.20` не находится вовсе. Поиск ГИР БО принимает ПРЕФИКС ИНН, а первые 4 цифры ИНН — код инспекции, то есть регион; в каждой записи сразу ОКВЭД, регион и выручка (`bfo.gainSum`, в ТЫСЯЧАХ ₽). Отрасль сопоставляется у нас и потому ПРЕФИКСНО. Пределы (замерены, документации нет): `size`≤200, `page*size`<10000 (дальше HTTP 500 — префикс дробится на пятизначный), пустой `query` не работает. Контактов не даёт — их добирает `ofdata_contacts_pass` |
 | `disk_organize.py` | пути/имена на Диске и в локальном хранилище поверх `connectors/yadisk_client` (`_mkdir`/`_upload` с ретраями на 423 и транзиентные сбои), заглушки .docx/.pdf (`_make_pdf` — голый stdlib-PDF, текст транслитерирован: базовые шрифты PDF кириллицу не несут) |
 | `connectors/` | `yadisk_client.py` — ядро Яндекс Диска на официальном REST API (stdlib); `yadisk_mcp.py` — MCP-обёртка над ним |
 | `project_env.py` | тихая загрузка `env/.env` в desktop/CLI без печати значений (`ORQ_ENV_FILE` перекрывает путь) |

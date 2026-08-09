@@ -101,6 +101,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator_kimi/html_to_pdf.py \
     && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
     && python lead_orchestrator/test_source_ofdata.py \
+    && python lead_orchestrator/test_source_girbo.py \
     && python lead_orchestrator/test_rusprofile_playwright.py \
     && python lead_orchestrator/test_kimi_only.py \
     && python lead_orchestrator/test_claude_runtime.py \
