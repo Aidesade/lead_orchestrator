@@ -71,6 +71,13 @@ def _mark_email(cell, ld):
                  "Взят потому, что другого адреса у компании не нашлось")
     elif not ld.get("_email_is_target"):
         note += "\n⚠ общая почта (не ЛПР) — целевой адрес на сайте не найден"
+    # Проверка домена (source_girbo.check_mail): адрес, который не доставится,
+    # должен быть виден до рассылки, а не после отбойника
+    check = ld.get("_email_check")
+    if check:
+        note += f"\nПроверка домена: {check} — {ld.get('_email_note', '')}"
+        if check in ("не доставится", "битый", "одноразовый"):
+            cell.font = Font(name="Arial", size=10, color="FFC00000", strike=True)
     if ld.get("_email_verified"):
         note += "\n✓ подтверждена на офиц. сайте"
     cell.comment = Comment(note, "lead-finder")

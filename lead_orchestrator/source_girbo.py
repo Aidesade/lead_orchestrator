@@ -368,6 +368,72 @@ def harvest(region="16", min_revenue=1_000_000_000, year="", industries=None,
     return leads
 
 
+def check_mail(leads, log=log):
+    """Проверить адреса тем, что доступно без SMTP-сессии.
+
+    Полная проба ящика требует хоста с открытым 25 портом и корректными PTR/SPF.
+    Но три уровня работают всегда и ловят самый дорогой брак — адрес, который не
+    доставится в принципе: битый синтаксис, домен без MX и домен-опечатку
+    (`gmail.ru` вместо `gmail.com` встретился в реальной выгрузке).
+
+    Отдельно помечается публичный ящик: `mail.ru` у завода — рабочий адрес, но не
+    корпоративный домен, и это меняет и тон письма, и шанс дойти до ЛПР.
+    Результат кладётся в лид (`_email_check`, `_email_note`), чтобы попасть в Excel.
+    """
+    import collections
+    from concurrent.futures import ThreadPoolExecutor
+
+    import email_verify as EV
+
+    mailed = [lead for lead in leads if lead.get("email")]
+    domains = sorted({lead["email"].rsplit("@", 1)[-1].lower() for lead in mailed})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        mx_by_domain = dict(zip(domains, pool.map(EV.check_mx, domains)))
+
+    # DNS отвечает не всегда: два прогона подряд дали 5 и 9 «не резолвится» на одних
+    # и тех же данных. Молчание резолвера — это «не проверили», а не «домена нет»,
+    # поэтому неответившие переспрашиваются поодиночке, и только устойчивое молчание
+    # становится вердиктом.
+    unresolved = [name for name, mx in mx_by_domain.items() if mx.get("_state") is None]
+    for attempt in range(2):
+        if not unresolved:
+            break
+        time.sleep(1.0)
+        retried = []
+        for name in unresolved:
+            mx_by_domain[name] = EV.check_mx(name)
+            if mx_by_domain[name].get("_state") is None:
+                retried.append(name)
+        log(f"  повтор DNS ({attempt + 1}): было {len(unresolved)}, "
+            f"осталось без ответа {len(retried)}")
+        unresolved = retried
+
+    stats = collections.Counter()
+    for lead in mailed:
+        addr = lead["email"].strip().lower()
+        syntax = EV.check_syntax(addr)
+        mx = mx_by_domain.get(syntax["domain"], {})
+        misc = EV.check_misc(addr)
+        if not syntax["is_valid_syntax"]:
+            verdict, note = "битый", "синтаксис адреса невалиден"
+        elif mx.get("_state") is False:
+            verdict, note = "не доставится", "у домена нет MX"
+        elif mx.get("_state") is None:
+            # Не «домена нет», а «резолвер не ответил трижды» — разные вещи,
+            # и рассылать по такому адресу решает человек, а не молчание DNS
+            verdict, note = "не проверено", "DNS не ответил — проверить вручную"
+        elif misc["is_disposable"]:
+            verdict, note = "одноразовый", "одноразовый почтовый домен"
+        elif misc["is_b2c"]:
+            verdict, note = "публичный", "публичный сервис, а не домен компании"
+        else:
+            verdict = "домен принимает почту"
+            note = f"приёмник: {mx.get('provider') or 'свой сервер'}"
+        lead["_email_check"], lead["_email_note"] = verdict, note
+        stats[verdict] += 1
+    return dict(stats)
+
+
 def _cli(argv):
     parser = argparse.ArgumentParser(
         description="Лиды из ГИР БО ФНС: регион по префиксам ИНН + выручка")
@@ -394,6 +460,9 @@ def _cli(argv):
                         help="чьей карточкой добирать: у обоих свой суточный лимит, "
                              "и когда один исчерпан, добор продолжают вторым")
     parser.add_argument("--contacts-cap", type=int, default=0)
+    parser.add_argument("--check-mail", action="store_true",
+                        help="проверить почту без SMTP: синтаксис, MX домена, тип "
+                             "приёмника. Ловит опечатки в домене и умершие домены")
     parser.add_argument("--xlsx", default=None)
     args = parser.parse_args(argv)
 
@@ -449,6 +518,12 @@ def _cli(argv):
         if args.out:
             with open(args.out, "w", encoding="utf-8") as handle:
                 json.dump(leads, handle, ensure_ascii=False, indent=1)
+    if args.check_mail and leads:
+        stats = check_mail(leads)
+        log(f"=== Проверка почты (без SMTP): {stats} ===")
+        if args.out:
+            _save(leads, args.out)
+
     if args.xlsx and leads:
         from build_excel import build
 
