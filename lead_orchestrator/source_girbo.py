@@ -242,11 +242,72 @@ def industry_of(okved, industry_map):
     return best_key
 
 
+def _save(leads, out_path, log=log):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(leads, handle, ensure_ascii=False, indent=1)
+    log(f"=== Сохранено: {out_path} ({len(leads)} лидов) ===")
+    return out_path
+
+
+def parse_groups(spec):
+    """«нефтехимия:19,20.1;стройка:41,42» -> {ключ: {'label','okved'}}.
+
+    Категории классификатора не совпадают с бытовым смыслом отраслей, и это не
+    мелочь: раздел G («торговля») смешивает розницу с оптом, а класс 26
+    (производство компьютеров) лежит в обрабатывающих производствах рядом с
+    заводами, из-за чего сборщик техники приезжает как «промышленность».
+    Поэтому границы задаются прогоном, а не берутся из INDUSTRY."""
+    groups = {}
+    for chunk in str(spec or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise GirboSourceError(
+                f"группа «{chunk}» без кодов; формат: имя:19,20.1;имя2:41,42")
+        name, _, codes = chunk.partition(":")
+        prefixes = tuple(code.strip() for code in codes.split(",") if code.strip())
+        if not prefixes:
+            raise GirboSourceError(f"в группе «{name}» не осталось кодов ОКВЭД")
+        groups[name.strip()] = {"label": name.strip(), "okved": prefixes,
+                                "pain": "", "offer": ""}
+    return groups
+
+
+def quota_select(leads, per_group, limit):
+    """По per_group крупнейших из каждой группы, затем добор до limit.
+
+    Без квоты сортировка по выручке отдаёт список той отрасли, где обороты выше:
+    в первом прогоне оптовые трейдеры вытеснили заводы. Добор нужен потому, что
+    маленькая группа (нефтепереработки в регионе всего две) свою квоту не выберет."""
+    taken, per = [], {}
+    for lead in leads:                              # leads уже по убыванию выручки
+        key = lead.get("_industry")
+        if per_group and per.get(key, 0) >= per_group:
+            continue
+        per[key] = per.get(key, 0) + 1
+        taken.append(lead)
+        if limit and len(taken) >= limit:
+            return taken
+    if limit:
+        chosen = {id(lead) for lead in taken}
+        for lead in leads:                          # добор крупнейшими без оглядки на квоту
+            if len(taken) >= limit:
+                break
+            if id(lead) not in chosen:
+                taken.append(lead)
+    return taken
+
+
 def harvest(region="16", min_revenue=1_000_000_000, year="", industries=None,
-            limit=0, out_path=None, log=log):
+            limit=0, out_path=None, log=log, groups=None, per_group=0):
     """Компании региона с выручкой >= порога. Контакты не трогаются."""
     from source_rusprofile import INDUSTRY
 
+    if groups:
+        INDUSTRY = dict(INDUSTRY, **groups)         # noqa: F841 — локальная копия карты
+        industries = list(groups)
     wanted = [key for key in (industries or []) if key]
     unknown = [key for key in wanted if key not in INDUSTRY]
     if unknown:
@@ -292,15 +353,18 @@ def harvest(region="16", min_revenue=1_000_000_000, year="", industries=None,
         + (f" | вне заданных отраслей: {skipped_industry}" if wanted else "")
         + f" | чужой регион: {skipped_region} ===")
 
-    if limit and len(leads) > int(limit):
-        log(f"=== Лимит {int(limit)}: оставлены крупнейшие по выручке ===")
-        leads = leads[:int(limit)]
+    if per_group or (limit and len(leads) > int(limit)):
+        before = len(leads)
+        leads = quota_select(leads, int(per_group or 0), int(limit or 0))
+        counts = {}
+        for lead in leads:
+            counts[lead.get("_industry")] = counts.get(lead.get("_industry"), 0) + 1
+        log(f"=== Отбор: {before} -> {len(leads)}"
+            + (f" (квота {per_group} на группу + добор)" if per_group else " (крупнейшие)")
+            + f" | по группам: {counts} ===")
 
     if out_path:
-        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as handle:
-            json.dump(leads, handle, ensure_ascii=False, indent=1)
-        log(f"=== Сохранено: {out_path} ({len(leads)} лидов) ===")
+        _save(leads, out_path, log=log)
     return leads
 
 
@@ -312,6 +376,12 @@ def _cli(argv):
     parser.add_argument("--year", default="", help="год отчётности, например 2025")
     parser.add_argument("--industries", default="",
                         help="ключи INDUSTRY через запятую; пусто — все отрасли")
+    parser.add_argument("--groups", default="",
+                        help="свои границы отраслей вместо INDUSTRY: "
+                             "«нефтехимия:19,20.1;стройка:41,42,43»")
+    parser.add_argument("--per-group", type=int, default=0,
+                        help="максимум компаний из одной группы (остаток добирается "
+                             "крупнейшими из прочих)")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--from-json", default=None,
                         help="взять готовую выгрузку вместо обхода региона: обход "
@@ -328,15 +398,44 @@ def _cli(argv):
     args = parser.parse_args(argv)
 
     industries = [part.strip() for part in args.industries.split(",") if part.strip()]
+    groups = parse_groups(args.groups) if args.groups else None
     if args.from_json:
         with open(args.from_json, encoding="utf-8") as handle:
             leads = json.load(handle)
-        if args.limit:
-            leads = leads[:args.limit]
         log(f"=== Взято из {args.from_json}: {len(leads)} лидов (обход пропущен) ===")
+        if groups:
+            # Пересборка состава по готовому пулу: обход региона стоит 25 минут,
+            # а границы отраслей уточняются обычно уже по первому результату.
+            region_word = _region_keyword(f"{int(args.region):02d}")
+            rebuilt = []
+            for lead in leads:
+                key = industry_of(lead.get("_okved"), groups)
+                if not key:
+                    continue
+                if not _in_region({"region": lead.get("_region") or ""},
+                                  str(lead.get("_inn") or ""),
+                                  f"{int(args.region):02d}", region_word):
+                    continue
+                lead["_industry"] = key
+                lead["niche"] = groups[key]["label"]
+                rebuilt.append(lead)
+            rebuilt.sort(key=lambda item: -(item.get("_revenue") or 0))
+            log(f"=== Перегруппировка: {len(leads)} -> {len(rebuilt)} по своим границам ===")
+            leads = rebuilt
+        if args.per_group or args.limit:
+            leads = quota_select(leads, args.per_group, args.limit)
+            counts = {}
+            for lead in leads:
+                counts[lead.get("_industry")] = counts.get(lead.get("_industry"), 0) + 1
+            log(f"=== Отбор: {len(leads)} | по группам: {counts} ===")
+        if args.out:
+            # Сохраняем СРАЗУ после отбора, не дожидаясь контактов: добор упирается
+            # в суточные лимиты API и может оборваться, а состав уже готов.
+            _save(leads, args.out)
     else:
         leads = harvest(region=args.region, min_revenue=args.min_revenue, year=args.year,
-                        industries=industries, limit=args.limit, out_path=args.out)
+                        industries=industries, limit=args.limit, out_path=args.out,
+                        groups=groups, per_group=args.per_group)
     if args.contacts and leads:
         if args.contacts_source == "checko":
             from checko_enrich import CheckoClient, checko_contacts_pass
