@@ -148,12 +148,21 @@ _GENERAL = ("info", "office", "mail", "priem", "secretar", "kancel", "kanc",
 _SERVICE = ("support", "help", "hotline", "noreply", "no-reply", "donotreply",
             "webmaster", "postmaster", "hostmaster", "abuse", "security",
             "sysadmin", "service", "servis", "robot", "notif", "alert",
-            "billing", "podderzhka", "tehpodderzhka")
+            "billing", "podderzhka", "tehpodderzhka",
+            # Каналы, куда деловое предложение адресовать нельзя в принципе.
+            # Найдено на боевой рассылке: письмо ушло на corruption@ — ящик для
+            # сообщений о коррупции. Формально адрес «именной» по структуре, по
+            # сути — комплаенс-канал, и коммерческое предложение там неуместно.
+            "corrupt", "compliance", "komplaens", "antifraud", "whistle",
+            "ethics", "etika", "pretenz", "claim", "zhalob", "jalob",
+            # кадры: там читают резюме, а не предложения поставщиков
+            "vacan", "rabota", "career", "karyer", "resume", "personal")
 # Короткие имена сравниваются ЦЕЛИКОМ: как подстроки они ловят чужое —
 # «it» сидит внутри «vitaly», «pr» внутри «prodazhi», «test» внутри «testov».
 # Сравнивается локальная часть, поэтому писать их с «@» бессмысленно.
 _SERVICE_EXACT = ("it", "it-support", "tech", "admin", "administrator", "root",
-                  "bot", "test", "edo", "sys", "smtp", "mailer")
+                  "bot", "test", "edo", "sys", "smtp", "mailer",
+                  "hr", "kadry", "legal", "jurist", "urist")
 _COOP_EXACT = ("pr",)
 
 

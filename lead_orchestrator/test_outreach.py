@@ -227,6 +227,17 @@ def check_letter() -> None:
             continue
         raise AssertionError(f"должно было отвергнуться: {bad[:40]}")
 
+    # Стадия 6б: адрес должен отсеиваться ДО письма. Появилась после боевого
+    # прогона, где предложение ушло на corruption@ — ящик для сообщений о коррупции.
+    import checko_enrich as CE
+    for addr in ("corruption@x.ru", "compliance@x.ru", "hr@x.ru", "vacancy@x.ru",
+                 "pretenzii@x.ru", "legal@x.ru", "postmaster@x.ru"):
+        kind, _ = CE._classify_email(addr)
+        assert kind == "служебная", f"{addr} должен быть служебным, а не «{kind}»"
+    for addr in ("ivanov@x.ru", "eremin.a@x.ru", "zakupki@x.ru", "info@x.ru"):
+        kind, _ = CE._classify_email(addr)
+        assert kind != "служебная", f"{addr} ошибочно признан служебным"
+
     final = LT.assemble({"subject": "Тема", "body": "Тело письма."})
     assert LT.OPT_OUT in final["body"], "строка отказа обязательна в каждом письме"
     assert LT.VENDOR_REQUISITES in final["body"], "реквизиты обязательны"

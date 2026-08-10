@@ -55,7 +55,13 @@ except Exception:
 
 import outreach_registry as REG                     # noqa: E402
 import outreach_letter as LETTER                    # noqa: E402
-import outlook_send as MAIL                         # noqa: E402
+# Транспорт выбирается переменной, а не правкой кода: рассылка может идти как с
+# ящика в профиле Outlook, так и напрямую по SMTP с ящика, которого в профиле нет.
+# Контракт у модулей одинаковый (check_ready / send_message), стадии не ветвятся.
+if (os.environ.get("OUTREACH_TRANSPORT") or "outlook").strip().lower() == "yandex":
+    import yandex_send as MAIL                     # noqa: E402
+else:
+    import outlook_send as MAIL                    # noqa: E402
 
 REPO_ROOT = os.path.dirname(SCRIPTS)
 KIMI_DIR = os.environ.get("KIMI_DIR") or os.path.join(REPO_ROOT, "lead_orchestrator_kimi")
@@ -141,16 +147,19 @@ def _check_mev():
 
 
 def check_mailbox(required=True):
-    """Стадия 5: ящик отправителя в Outlook."""
+    """Стадия 5: ящик отправителя (Outlook или SMTP — по OUTREACH_TRANSPORT)."""
+    error_type = getattr(MAIL, "OutlookError", None) or getattr(MAIL, "YandexSendError")
     try:
         info = MAIL.check_ready()
-    except MAIL.OutlookError as exc:
+    except error_type as exc:
         if required:
             raise SystemExit(f"[стадия 5] {exc}") from exc
         log(f"[стадия 5] почта недоступна: {exc}")
         return {"account": "", "alive": False}
-    log(f"[стадия 5] отправитель: {info['account']}")
-    return {"account": info["account"], "alive": True}
+    # у Outlook ключ «account», у SMTP — «from»: адрес отправителя один и тот же смысл
+    account = info.get("account") or info.get("from") or ""
+    log(f"[стадия 5] отправитель: {account}")
+    return {"account": account, "alive": True}
 
 
 # ============================================================== СТАДИЯ 2 ======
@@ -285,11 +294,27 @@ def pick_recipient(guess, lead):
     return None
 
 
-async def stage_email(lead, idx, dry_run=False):
+async def stage_email(lead, idx, dry_run=False, use_lead_email=False):
     """Стадия 6: адрес ЛПР — гипотезы по схеме домена + проверка без отправки письма.
 
     В dry-run ни DNS, ни SMTP, ни обход сайта не выполняются: прогон проверяет
-    цепочку стадий, а не доступность чужих серверов (и ничего им не стоит)."""
+    цепочку стадий, а не доступность чужих серверов (и ничего им не стоит).
+
+    ``use_lead_email`` — брать адрес прямо из выгрузки и не строить гипотез вовсе.
+    Нужен, когда почта уже собрана из карточек ЕГРЮЛ: подбор в этом случае не только
+    лишний, но и вредный. Он тратит минуты на обход сайта и облачные проверки, а
+    затем предлагает РАСЧЁТНЫЙ адрес вместо официального — на боевом прогоне письмо
+    ушло на выдуманный `nu@tatneft.ru`, хотя в выгрузке лежал настоящий `tnr@`."""
+    if use_lead_email:
+        addr = (lead.get("email") or "").strip()
+        if not addr:
+            return None, "в выгрузке нет адреса, а подбор отключён (--use-lead-email)"
+        source = lead.get("_email_src") or "выгрузка"
+        picked = {"email": addr, "confirmed": True,
+                  "confidence": f"адрес из выгрузки ({source})"}
+        log(f"    [{idx}] адрес: {addr} — из выгрузки, подбор пропущен")
+        return picked, ""
+
     import email_guess as EG
 
     online = not dry_run
@@ -317,6 +342,45 @@ def industry_cfg(lead):
         return RP.INDUSTRY.get((lead.get("_industry") or "").strip()) or {}
     except Exception:                               # noqa: BLE001 — карта отраслей не критична
         return {}
+
+
+def check_recipient(address, lead):
+    """Стадия 6б: годится ли адрес для делового письма. -> (ok, причина).
+
+    Появилась после боевого прогона: письмо ушло на `corruption@` — ящик для
+    сообщений о коррупции. Адрес был взят из официальной карточки ЕГРЮЛ и
+    формально безупречен, но канал не тот: коммерческое предложение там читать
+    никто не будет, а выглядит оно неуместно.
+
+    Проверяем три вещи, каждая отсеивает свой класс брака:
+      * синтаксис — адрес с опечаткой не доставится;
+      * КАНАЛ — комплаенс, кадры, техподдержка, роботы: письмо уйдёт не тем людям;
+      * домен принимает почту (MX) — иначе гарантированный отбойник, а отбойники
+        с нового ящика портят его репутацию сильнее, чем польза от попытки.
+
+    Существование самого ящика тут не проверяется: для этого нужна SMTP-сессия
+    с хоста с корректными PTR/SPF, и это отдельная стадия (email_verify)."""
+    import checko_enrich as CE
+    import email_verify as EV
+
+    address = (address or "").strip()
+    syntax = EV.check_syntax(address)
+    if not syntax["is_valid_syntax"]:
+        return False, f"адрес не проходит синтаксическую проверку: {address}"
+
+    kind, _is_target = CE._classify_email(address)
+    if kind == "служебная":
+        return False, (f"адрес «{address}» — служебный канал (техподдержка, комплаенс, "
+                       f"кадры или робот): деловое письмо туда адресовать нельзя")
+
+    mx = EV.check_mx(syntax["domain"])
+    if mx.get("_state") is False:
+        return False, f"домен {syntax['domain']} не принимает почту (нет MX)"
+    if mx.get("_state") is None:
+        # молчание DNS — это «не проверили», а не «домена нет»: отправляем, но
+        # честно помечаем в реестре, чтобы отбойник потом не выглядел загадкой
+        return True, f"домен {syntax['domain']} не проверен: DNS не ответил"
+    return True, ""
 
 
 def build_recipients(picked, lead):
@@ -404,11 +468,25 @@ async def process(lead, idx, reg, args, tmp_dir):
     if not onepager:
         log(f"    one-pager: {why}")
 
-    picked, why = await stage_email(lead, idx, dry_run=args.dry_run)
+    picked, why = await stage_email(lead, idx, dry_run=args.dry_run,
+                                    use_lead_email=getattr(args, "use_lead_email", False))
     if not picked:
         return stop("email", REG.SKIP, why)
+
+    # Стадия 6б: проверка ДО генерации письма — незачем платить модели за текст,
+    # который уйдёт в комплаенс-ящик или на домен без MX.
+    if not args.dry_run:
+        ok, note = check_recipient(picked["email"], lead)
+        if not ok:
+            log(f"    [{idx}] адрес отклонён: {note}")
+            return stop("email", REG.SKIP, note)
+        if note:
+            log(f"    [{idx}] предупреждение: {note}")
+    else:
+        note = ""
+
     reg.mark(inn, "email", REG.OK,
-             "" if picked["confirmed"] else "адрес расчётный, не подтверждён")
+             note or ("" if picked["confirmed"] else "адрес расчётный, не подтверждён"))
 
     letter, why = await stage_letter(lead, idx, onepager=onepager, dry_run=args.dry_run)
     if not letter:
@@ -500,6 +578,9 @@ def main():
     ap.add_argument("--redo", action="store_true", help="не отсеивать уже отработанных")
     ap.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="без модели и без Outlook — проверить цепочку")
+    ap.add_argument("--use-lead-email", dest="use_lead_email", action="store_true",
+                    help="брать адрес прямо из выгрузки, не строить гипотез: почта уже "
+                         "собрана из карточек ЕГРЮЛ, а подбор предложит расчётный адрес")
     ap.add_argument("--no-verify-server", dest="no_verify_server", action="store_true",
                     help="работать без верификатора ЦИТ РТ (адреса — непроверенные гипотезы)")
     ap.add_argument("--check", action="store_true", help="стадия 8: только отчёт по реестру")
