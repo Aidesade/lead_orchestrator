@@ -229,7 +229,13 @@ def check_letter() -> None:
 
     final = LT.assemble({"subject": "Тема", "body": "Тело письма."})
     assert LT.OPT_OUT in final["body"], "строка отказа обязательна в каждом письме"
-    assert LT.SIGNER_EMAIL in final["body"] and LT.VENDOR_REQUISITES in final["body"]
+    assert LT.VENDOR_REQUISITES in final["body"], "реквизиты обязательны"
+    # В подписи ОБА контакта: письмо уходит с ящика одного человека (ответ придёт
+    # туда), а телефон в приложенном one-pager принадлежит другому. Один контакт
+    # означал бы, что адресат пишет одному, а звонит другому и не понимает, кто есть кто.
+    for value in (LT.CONTACT1_NAME, LT.CONTACT1_EMAIL, LT.CONTACT1_PHONE,
+                  LT.CONTACT2_NAME, LT.CONTACT2_EMAIL, LT.CONTACT2_PHONE):
+        assert value in final["body"], f"в подписи нет «{value}»"
 
 
 # ----------------------------------------------------- прекондишен стадии 4 ----

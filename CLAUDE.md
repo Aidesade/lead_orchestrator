@@ -516,13 +516,17 @@ Microsoft 365 принимает почти всё и проверяет пол�
 ⚠️ Нужен открытый исходящий порт 25; с рабочей машины он открыт, в облаках обычно режется.
 
 **Тумблеры outreach-пайплайна:** `OUTREACH_FROM` (`tatar.ru` — подстрока адреса ящика-отправителя
-в профиле Outlook), `OUTREACH_SIGNER_NAME`/`OUTREACH_SIGNER_EMAIL`/`OUTREACH_SIGNER_PHONE`
-(подпись; дефолты — константы `VENDOR_*` из `onepager_kimi.py`), `OUTREACH_ONEPAGER_DIR`
-(`lead_orchestrator/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь к реестру, дефолт
-`<ORQ_DATA_ROOT>/orq_outreach/registry.json`), `ORQ_LETTER_MODEL` (`sonnet`).
-⚠️ Ящик отправителя в профиле — `Artur.Bayrashev@tatar.ru`, а контакт в подписи и в one-pager —
-`Ali.Shabanov@tatar.ru`: это РАЗНЫЕ люди. Ответ на письмо придёт Байрашеву, а звонить читателю
-предлагают Шабанову — если так не задумано, править `OUTREACH_SIGNER_*`.
+в профиле Outlook), `OUTREACH_SIGNER_NAME` (`Булат Замалиев`) + `OUTREACH_SIGNER_POST`,
+`OUTREACH_CONTACT1_NAME`/`_EMAIL`/`_PHONE` (Шабанов — тот же контакт, что напечатан в one-pager)
+и `OUTREACH_CONTACT2_NAME`/`_EMAIL`/`_PHONE` (Байрашев — владелец ящика рассылки),
+`OUTREACH_ONEPAGER_DIR` (`lead_orchestrator/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь
+к реестру, дефолт `<ORQ_DATA_ROOT>/orq_outreach/registry.json`), `ORQ_LETTER_MODEL` (`sonnet`).
+⚠️ Подписывает письмо ОДИН человек (Замалиев), а контактов в подписи ДВА, и это осознанно:
+письмо уходит с ящика Байрашева — ответ придёт туда, — а телефон во вложенном one-pager
+принадлежит Шабанову. С одним контактом адресат писал бы одному, а звонил другому.
+⚠️ Приветствие адресовано КОМПАНИИ («Здравствуйте, уважаемые коллеги из АО «ТАНЕКО»!»), а не
+ЛПР по имени-отчеству: письмо идёт на общий ящик организации, и читает его не обязательно тот,
+чьё ФИО значится в реестре. Правило и эталон тона — в `kimi_agent/outreach_letter.md`.
 
 **Тумблеры ЛПР:** `PERSON_ENRICH` (1), `PERSON_VERIFY_EMAIL` (ВЫКЛ), `PERSON_SOCIAL` (ВЫКЛ) —
 последние два выключены, чтобы 200-прогон был быстрым и не долбил чужие серверы.

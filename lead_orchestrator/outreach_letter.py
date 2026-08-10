@@ -40,11 +40,20 @@ KIMI_DIR = os.environ.get("KIMI_DIR") or os.path.join(
     os.path.dirname(SCRIPTS), "lead_orchestrator_kimi")
 AGENT_FILE = os.path.join(KIMI_DIR, "kimi_agent", "outreach_letter.yaml")
 
-# Отправитель. Дефолты — те же константы, что в one-pager (VENDOR_*), но ящик
-# рассылки может отличаться от контакта в CTA, поэтому подпись переопределяема.
-SIGNER_NAME = os.environ.get("OUTREACH_SIGNER_NAME") or "Шабанов Али Магомедович"
-SIGNER_EMAIL = os.environ.get("OUTREACH_SIGNER_EMAIL") or "Ali.Shabanov@tatar.ru"
-SIGNER_PHONE = os.environ.get("OUTREACH_SIGNER_PHONE") or "+7 917 876 7741"
+# Подписывает письмо один человек, а связываться предлагается с двумя: адресат
+# должен видеть, кому звонить, независимо от того, кто нажал «отправить».
+SIGNER_NAME = os.environ.get("OUTREACH_SIGNER_NAME") or "Булат Замалиев"
+SIGNER_POST = os.environ.get("OUTREACH_SIGNER_POST") or ""
+# Первый контакт — тот же, что напечатан в one-pager (VENDOR_* в onepager_kimi):
+# в письме и во вложении обязан стоять один и тот же телефон.
+CONTACT1_NAME = os.environ.get("OUTREACH_CONTACT1_NAME") or "Шабанов Али Магомедович"
+CONTACT1_EMAIL = os.environ.get("OUTREACH_CONTACT1_EMAIL") or "Ali.Shabanov@tatar.ru"
+CONTACT1_PHONE = os.environ.get("OUTREACH_CONTACT1_PHONE") or "+7 917 876 7741"
+# Второй — ящик, с которого письмо уходит: ответ адресата придёт именно сюда,
+# и он должен видеть, чьё это имя.
+CONTACT2_NAME = os.environ.get("OUTREACH_CONTACT2_NAME") or "Байрашев Артур"
+CONTACT2_EMAIL = os.environ.get("OUTREACH_CONTACT2_EMAIL") or "Artur.Bayrashev@tatar.ru"
+CONTACT2_PHONE = os.environ.get("OUTREACH_CONTACT2_PHONE") or "+7 986 846 8748"
 VENDOR_NAME = "АО «ЦИТ РТ»"
 VENDOR_SITE = "citrt.ru"
 VENDOR_REQUISITES = "ИНН 1655505808 · ОГРН 1241600056829"
@@ -175,16 +184,26 @@ def parse_reply(text):
 
 
 def signature_block():
-    """Подпись и отказ — детерминированно, из констант."""
-    return "\n".join([
-        "—",
-        SIGNER_NAME,
+    """Подпись и отказ — детерминированно, из констант.
+
+    Два контакта, а не один: письмо уходит с ящика Байрашева (туда придёт ответ),
+    а в приложенном one-pager напечатан телефон Шабанова. Один контакт в подписи
+    означал бы, что адресат звонит одному, пишет другому и не понимает, кто есть кто."""
+    lines = ["—", SIGNER_NAME]
+    if SIGNER_POST:
+        lines.append(SIGNER_POST)
+    lines += [
         VENDOR_NAME,
-        f"тел. {SIGNER_PHONE} · {SIGNER_EMAIL} · {VENDOR_SITE}",
+        "",
+        "Контакты для связи:",
+        f"{CONTACT1_NAME} · тел. {CONTACT1_PHONE} · {CONTACT1_EMAIL}",
+        f"{CONTACT2_NAME} · тел. {CONTACT2_PHONE} · {CONTACT2_EMAIL}",
+        VENDOR_SITE,
         VENDOR_REQUISITES,
         "",
         OPT_OUT,
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def assemble(letter):
