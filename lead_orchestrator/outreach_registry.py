@@ -204,6 +204,16 @@ class Registry:
         rec["sent"] = {"at": _now(), "to": to, "subject": subject, "draft": bool(draft)}
         return rec
 
+    def mark_crm(self, inn, ok, note=""):
+        """Стадия 9: результат выгрузки лида в CRM — отдельным полем, НЕ стадией.
+
+        Намеренно не в ``STAGES``: стадия 9 появилась позже, и попади она в общий
+        список, все ранее отработанные компании стали бы в отчёте «частично» —
+        отчёт стадии 8 задним числом наврал бы про пропуск того, чего тогда не было."""
+        rec = self._record(inn)
+        rec["crm"] = {"ok": bool(ok), "at": _now(), "note": note or ""}
+        return rec
+
     # ------------------------------------------------------------- вопросы ----
     def stage_status(self, inn, stage):
         rec = self.get(inn) or {}
@@ -291,6 +301,7 @@ class Registry:
                 state = "ранее" if rec.get("deliverables") else "не начата"
             else:
                 state = "частично"
+            crm = rec.get("crm") or {}
             rows.append({
                 "inn": inn,
                 "name": rec.get("name") or "",
@@ -299,6 +310,10 @@ class Registry:
                 "missing": missing,
                 "worked": self.is_worked(inn),
                 "sent": self.was_sent(inn),
+                # Стадия 9 (выгрузка в CRM) — рядом с фактом отправки, а не среди стадий:
+                # None = не пробовали, True/False = результат последней попытки.
+                "crm": crm.get("ok") if crm else None,
+                "crm_note": crm.get("note") or "",
             })
         return rows
 
@@ -327,6 +342,17 @@ def format_audit(rows):
         lines.append(f"  … {counts['не начата']} компаний заведены, но не обрабатывались")
     lines.append(f"[стадия 8] пройдено полностью: {counts['готово']}, "
                  f"с пропусками: {counts['частично']}, из {len(rows)}")
+
+    # Стадия 9 — отдельной строкой: она не входит в STAGES, но не показать её
+    # нельзя, иначе «письмо ушло» молча значило бы «менеджер лид увидит».
+    tried = [r for r in rows if r.get("crm") is not None]
+    if tried:
+        failed = [r for r in tried if not r["crm"]]
+        lines.append(f"[стадия 9] заведено в CRM: {len(tried) - len(failed)} из {len(tried)}")
+        for row in failed[:10]:
+            lines.append(f"  ✗ {row['inn']} {row['name'][:40]} — {row['crm_note']}")
+        if len(failed) > 10:
+            lines.append(f"  … и ещё {len(failed) - 10} с той же проблемой")
     return "\n".join(lines)
 
 

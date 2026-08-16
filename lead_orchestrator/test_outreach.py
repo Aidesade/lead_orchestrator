@@ -5,11 +5,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -295,6 +297,57 @@ def check_verifier_precondition() -> None:
                 os.environ[key] = value
 
 
+def check_sent_persisted_before_crm() -> None:
+    """Необратимая отправка должна пережить остановку процесса внутри CRM."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "registry.json")
+        reg = REG.Registry(path)
+        lead = {"_inn": "7712345678", "name": "ООО Тест",
+                "contact_person": "Иванов Иван Иванович"}
+        args = SimpleNamespace(
+            generate_onepager=False, dry_run=False, use_lead_email=False,
+            send=True, no_crm=False)
+        saved = {
+            name: getattr(OUT, name) for name in (
+                "stage_onepager", "stage_email", "check_recipient",
+                "stage_letter", "stage_send", "stage_crm")
+        }
+        observed = []
+
+        async def onepager(*_args, **_kwargs):
+            return "", "нет one-pager"
+
+        async def email(*_args, **_kwargs):
+            return {"email": "ivanov@example.ru", "confirmed": True}, ""
+
+        async def letter(*_args, **_kwargs):
+            return {"subject": "Тема", "body": "Текст"}, ""
+
+        def interrupted_crm(*_args, **_kwargs):
+            observed.append(REG.Registry(path).was_sent("7712345678"))
+            raise KeyboardInterrupt("остановка в CRM")
+
+        try:
+            OUT.stage_onepager = onepager
+            OUT.stage_email = email
+            OUT.check_recipient = lambda *_args, **_kwargs: (True, "")
+            OUT.stage_letter = letter
+            OUT.stage_send = lambda *_args, **_kwargs: (
+                {"to": "ivanov@example.ru", "subject": "Тема"}, "")
+            OUT.stage_crm = interrupted_crm
+            try:
+                asyncio.run(OUT.process(lead, 1, reg, args, tmp))
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError("остановка CRM была проглочена тестовым контуром")
+        finally:
+            for name, value in saved.items():
+                setattr(OUT, name, value)
+        assert observed == [True], "факт отправки не сохранён до CRM"
+    print("  ✓ факт отправки атомарно сохранён до необязательной CRM")
+
+
 def main() -> int:
     check_registry()
     check_backfill()
@@ -303,6 +356,7 @@ def main() -> int:
     check_recipients()
     check_letter()
     check_verifier_precondition()
+    check_sent_persisted_before_crm()
     print("test_outreach: OK — реестр атомарен, отвергнутые адреса не рассылаются, "
           "подпись и отписка дописываются кодом")
     return 0

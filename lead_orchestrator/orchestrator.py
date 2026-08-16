@@ -44,6 +44,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 import warnings
 from typing import Annotated
 
@@ -384,7 +385,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     import deep_research_engine as DRE
     from claude_agent_sdk import (
         tool, create_sdk_mcp_server, AgentDefinition, ClaudeAgentOptions, ClaudeSDKClient,
-        ResultMessage, AssistantMessage, TextBlock, ToolUseBlock,
+        ResultMessage, AssistantMessage, ToolUseBlock,
     )
 
     # Субагент-разведчик: писатель раздаёт направления, scout'ы читают страницы каждый
@@ -688,6 +689,100 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
         print(f"    [{idx}] [onepager] неуспех: {tail}")
         return 0.0, tail
     return 0.0, ""
+
+
+def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True):
+    """Строгая Фаза 1: ровно N новых компаний с подтверждённой госдолей >25%."""
+    import source_rusprofile as RP
+    import pipeline
+    import rusprofile_session as RPS
+    from crm_push import CRMIndexError, fetch_existing_leads
+    from crm_push import is_configured as crm_push_configured
+    from state_lead_collection import load_local_registry_strict
+    from state_ownership import OwnershipVerifier, RosimRegistry, StateOwnershipDeadline
+
+    source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
+    if source not in ("rusprofile", "rp"):
+        raise SystemExit(
+            "--state-owned работает только через desktop RusProfile; "
+            f"получено LEAD_SOURCE={source!r}")
+    browser = (os.environ.get("RUSPROFILE_BROWSER") or "playwright").strip().lower()
+    if browser not in ("playwright", "pw"):
+        raise SystemExit("--state-owned требует RUSPROFILE_BROWSER=playwright")
+    if not os.path.exists(RPS.COOKIES_FILE):
+        raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
+
+    try:
+        max_seconds = float(os.environ.get("STATE_LEAD_MAX_SECONDS", "1200"))
+    except ValueError:
+        raise SystemExit("STATE_LEAD_MAX_SECONDS должен быть положительным числом") from None
+    if max_seconds <= 0:
+        raise SystemExit("STATE_LEAD_MAX_SECONDS должен быть положительным числом")
+    deadline = time.monotonic() + max_seconds
+
+    # CRM — прекондишен ДО Chrome и до первого запроса RusProfile.
+    try:
+        crm_index = fetch_existing_leads(deadline=deadline)
+    except CRMIndexError as exc:
+        raise SystemExit(f"CRM-прекондишен: {exc}") from None
+    if push_crm and not crm_push_configured():
+        raise SystemExit("CRM-прекондишен: запись выключена через CRM_PUSH=0")
+    try:
+        verifier = OwnershipVerifier(
+            rosim=RosimRegistry.from_environment(deadline=deadline))
+    except StateOwnershipDeadline:
+        raise SystemExit("общий лимит строгого добора истёк на источнике Росимущества") from None
+    except Exception as exc:
+        raise SystemExit(f"источник Росимущества не подготовлен: {str(exc)[:180]}") from None
+
+    try:
+        local_registry = load_local_registry_strict(log=print)
+    except RuntimeError as exc:
+        raise SystemExit(f"локальный реестр: {exc}") from None
+    print(
+        f"[1/2] строгий добор {count} новых госкомпаний | CRM {crm_index.total} лидов | "
+        "выручка >=2 млрд ₽ за 2025 | штат 240–260 | прямая/косвенная госдоля >25%")
+    from rusprofile_playwright import (
+        RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
+    )
+    leads = None
+    for attempt in (1, 2):
+        try:
+            with RusProfilePlaywrightSession(
+                    headless=headless, offscreen=offscreen, deadline=deadline) as session:
+                leads = RP.harvest_state_owned(
+                    count, session=session, crm_index=crm_index,
+                    local_registry=local_registry,
+                    ownership_verifier=verifier, deadline=deadline,
+                    out_path=json_out, log=print)
+            break
+        except RP.StateLeadExhausted as exc:
+            reasons = ", ".join(
+                f"{key}={value}" for key, value in exc.stats.items() if value)
+            raise SystemExit(
+                f"строгий добор остановлен: найдено {exc.found}/{exc.requested}; "
+                f"{reasons}. Частичный JSON: {json_out}") from None
+        except RP.StateOwnershipUnavailable as exc:
+            raise SystemExit(f"строгий добор остановлен fail-closed: {exc}") from None
+        except RusProfileDeadlineReached:
+            raise SystemExit("общий лимит строгого добора истёк в RusProfile/Playwright") from None
+        except RusProfilePlaywrightError as exc:
+            if attempt == 2:
+                raise SystemExit(f"RusProfile/Playwright: {exc}") from None
+            print(f"[1/2] RusProfile/Playwright: {exc} — повтор через 10с")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit("общий лимит строгого добора истёк перед повтором Chrome") from None
+            time.sleep(min(10, remaining))
+    if leads is None or len(leads) != count:
+        raise SystemExit(f"нарушен постконтракт строгого добора: {len(leads or [])}/{count}")
+
+    pipeline._save(leads, json_out)
+    print(f"[1/2] собрано ровно {len(leads)} новых госкомпаний | JSON: {json_out}")
+    if _store_mode() == "disk":
+        print("[1/2] раскладка папок+заготовок на Диске ...")
+        DO.organize_to_disk(leads, base=base, account=account, log=print)
+    return leads
 
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
@@ -1207,8 +1302,11 @@ async def main():
     # --- ФАЗА 1: сбор (первый агент). Задаёшь --industries -> оркестратор сам соберёт лиды и создаст папки ---
     ap.add_argument("--industries", default=None,
                     help="ЗАПУСТИТЬ СБОР: отрасли через запятую (mining,construction,energy,...)")
+    ap.add_argument("--state-owned", dest="state_owned", action="store_true",
+                    help="строгий добор ровно --count НОВЫХ госкомпаний: CRM-дедуп, "
+                         "выручка >=2 млрд за 2025, штат 240–260, госдоля >25%%")
     ap.add_argument("--count", type=int, default=200,
-                    help="сколько лидов собрать ВСЕГО, суммарно по отраслям (с --industries)")
+                    help="сколько лидов собрать ВСЕГО (с --industries или --state-owned)")
     ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,
                     help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
@@ -1293,6 +1391,24 @@ async def main():
         _keys = [s.strip() for s in a.leads.split(",") if s.strip()]
         if _keys and all(k in RP.INDUSTRY for k in _keys):
             a.industries, a.leads = ",".join(_keys), None
+    if a.state_owned:
+        conflicts = []
+        if a.industries:
+            conflicts.append("--industries")
+        if a.leads:
+            conflicts.append("leads.json")
+        if a.per_industry is not None:
+            conflicts.append("--per-industry")
+        if a.region:
+            conflicts.append("--region")
+        if float(a.min_revenue) != 1e9:
+            conflicts.append("--min-revenue")
+        if conflicts:
+            raise SystemExit(
+                "--state-owned имеет фиксированные критерии и несовместим с: "
+                + ", ".join(conflicts))
+        if not 1 <= a.count <= 200:
+            raise SystemExit("--state-owned: --count должен быть от 1 до 200")
     # «N на отрасль» перекрывает --count: итог = N × число валидных отраслей
     if a.industries and a.per_industry:
         import source_rusprofile as RP
@@ -1304,27 +1420,39 @@ async def main():
     headless = bool(a.headless)
     offscreen = (not a.show_browser) and (not headless)
 
-    if a.industries:                                  # ФАЗА 1 — сбор сам (блокирующий Chrome -> в поток)
+    if a.state_owned or a.industries:                 # ФАЗА 1 — сбор сам (блокирующий Chrome -> в поток)
         mode = ("без окна (headless)" if headless
                 else "окно скрыто за экраном" if offscreen else "окно Chrome видно")
-        print(f"=== ФАЗА 1: сбор лидов (RusProfile — {mode}) ===")
+        label = "строгий добор госкомпаний" if a.state_owned else "сбор лидов"
+        print(f"=== ФАЗА 1: {label} (RusProfile — {mode}) ===")
         # --out терпимо принимает и старый .xlsx-путь: расширение всё равно станет .json
         default_leads_dir = os.environ.get("ORQ_LEADS_DIR", "").strip()
         if not default_leads_dir:
             default_leads_dir = r"D:\лиды" if os.name == "nt" else "/data/leads"
         os.makedirs(default_leads_dir, exist_ok=True)
+        default_name = ("leads_state_owned.json" if a.state_owned
+                        else "leads_" + a.industries.replace(",", "_") + ".json")
         json_out = (os.path.splitext(a.out)[0] + ".json" if a.out
-                    else os.path.join(default_leads_dir,
-                                      "leads_" + a.industries.replace(",", "_") + ".json"))
-        leads = await asyncio.to_thread(
-            _collect, a.industries, a.count, a.min_revenue, a.region,
-            headless, offscreen, a.base, a.account, json_out)
+                    else os.path.join(default_leads_dir, default_name))
+        if a.state_owned:
+            leads = await asyncio.to_thread(
+                _collect_state_owned, a.count, headless, offscreen,
+                a.base, a.account, json_out, not a.dry_run)
+        else:
+            leads = await asyncio.to_thread(
+                _collect, a.industries, a.count, a.min_revenue, a.region,
+                headless, offscreen, a.base, a.account, json_out)
     elif a.leads:                                     # готовый JSON — только ресёрч
         leads = json.load(open(a.leads, encoding="utf-8"))
     else:
-        print("Источник не задан: укажи --industries <отрасли> (сбор+ресёрч) ИЛИ путь к leads.json (только ресёрч).")
+        print("Источник не задан: укажи --industries <отрасли>, --state-owned "
+              "или путь к leads.json (только ресёрч).")
         return
+    collected_count = len(leads)
     leads = [l for l in leads if l and l.get("name")]
+    if a.state_owned and len(leads) != collected_count:
+        raise SystemExit(
+            f"нарушен постконтракт строгого добора после загрузки: {len(leads)}/{collected_count}")
     dup_names = {n for n, c in collections.Counter(DO._safe(l.get("name")) for l in leads).items() if c > 1}
     sel = leads          # ресёрчим ВСЕХ, кого собрал первый агент (его --count, по умолч. 200)
     if not sel:
@@ -1582,6 +1710,30 @@ async def main():
         print("  Повтори ту же команду: резюм пропустит готовые компании и доделает только эти.")
     if store == "disk" and not a.no_upload and not a.dry_run:
         await _drain_outbox(a.account, "финальный долив")
+    crm_batch_error = ""
+    if a.state_owned:
+        if a.dry_run:
+            print("[CRM] dry-run: исследованный набор не записывается")
+        elif fails:
+            crm_batch_error = (
+                f"CRM atomic batch не выполнен: Фаза 2 успешна для {len(ok)}/{len(sel)} компаний")
+            print(f"[CRM] {crm_batch_error}")
+        else:
+            from crm_push import CRMBatchError, create_researched_batch
+            batch_leads = []
+            for lead in sel:
+                payload = dict(lead)
+                payload["_crm_note"] = (
+                    "Строгий добор госкомпаний; письмо не готовилось и не отправлялось; "
+                    f"доказанная госдоля {lead.get('_state_share')}%.")
+                batch_leads.append(payload)
+            try:
+                response = create_researched_batch(batch_leads, str(uuid.uuid4()))
+                action = "повтор подтверждён" if response.get("replayed") else "создано"
+                print(f"[CRM] atomic batch: {action} {len(response['ids'])}/{len(sel)} лидов")
+            except CRMBatchError as exc:
+                crm_batch_error = f"CRM atomic batch: {exc}"
+                print(f"[CRM] {crm_batch_error}")
     kept = [r.get("kept") for r in results if r and isinstance(r, dict) and r.get("kept")]
     if a.no_upload:
         print(f"[локально] .docx/.pdf во временной папке: {tmp}")
@@ -1589,6 +1741,8 @@ async def main():
         print(f"[!] файлы {len(kept)} компаний не спасены в outbox — temp сохранён: {tmp}")
     else:
         shutil.rmtree(tmp, ignore_errors=True)
+    if crm_batch_error:
+        raise SystemExit(crm_batch_error)
     if sel and not ok and not a.dry_run:
         raise SystemExit(3)   # системный провал: ни одной компании за весь прогон
 

@@ -292,7 +292,8 @@ class RusProfileSession:
         log(f"  [warn] стр.{body.get('page')}: {last} — стоп")
         return None
 
-    def search(self, okved, revenue_from, max_pages=20, pause=1.0, log=log):
+    def search(self, okved, revenue_from, max_pages=20, pause=1.0, log=log,
+               staff_from=None, staff_to=None):
         """okved: список кодов ОКВЭД-2. revenue_from: ₽. Возвращает items[].
 
         РЕГИОН сервер НЕ фильтрует. Проверено живым пробником API расш. поиска:
@@ -307,6 +308,13 @@ class RusProfileSession:
             "state_4": False, "state_5": False, "okved_strict": True,
             "okved": list(okved), "finance_revenue_from": str(int(revenue_from)),
         }
+        if staff_from is not None:
+            base["sshr_from"] = str(int(staff_from))
+        if staff_to is not None:
+            base["sshr_to"] = str(int(staff_to))
+        if (staff_from is not None and staff_to is not None
+                and int(staff_from) > int(staff_to)):
+            raise ValueError("staff_from не может быть больше staff_to")
         out, total = [], None
         for page in range(1, max_pages + 1):
             body = dict(base, page=page)
@@ -341,6 +349,42 @@ def revenue_value(raw):
     return rev
 
 
+def displayed_revenue_value(raw):
+    """«2,5 млрд руб.» / «2 500 000 000 ₽» -> рубли из карточки.
+
+    Значение карточки связано с явно распознанным там же отчётным годом, поэтому
+    строгий collector перепроверяет им порог, а не полагается только на выдачу.
+    """
+    text = str(raw or "").lower().replace("\xa0", " ")
+    match = re.search(r"\d[\d\s]*(?:[,.]\d+)?", text)
+    if not match:
+        return None
+    number = match.group(0).strip().replace(" ", "").replace(",", ".")
+    try:
+        value = float(number)
+    except ValueError:
+        return None
+    multiplier = 1
+    if "трлн" in text:
+        multiplier = 1_000_000_000_000
+    elif "млрд" in text:
+        multiplier = 1_000_000_000
+    elif "млн" in text:
+        multiplier = 1_000_000
+    elif "тыс" in text:
+        multiplier = 1_000
+    return int(value * multiplier)
+
+
+def integer_value(raw):
+    """Целое из числового поля API; пустое/маркер возвращает None."""
+    try:
+        text = str(raw).replace("\xa0", "").replace(" ", "")
+        return int(float(text)) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def item_to_lead(it, cfg, industry):
     rev = revenue_value(it.get("finance_revenue"))
     okved = str(it.get("main_okved_id") or "").strip()
@@ -364,6 +408,9 @@ def item_to_lead(it, cfg, industry):
         "_region": it.get("region") or "",
         "_okved_descr": descr or "",
         "_revenue": rev,
+        "_revenue_year": integer_value(it.get("finance_year")),
+        "_staff_count": integer_value(it.get("sshr")),
+        "_staff_year": integer_value(it.get("sshr_year")),
         "_revenue_src": "rusprofile",
         "_revenue_source_name": "RusProfile",
         "_revenue_source_url": "https://www.rusprofile.ru" + (it.get("link") or ""),
@@ -564,6 +611,70 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
     session_cls = _browser_session_class()
     with session_cls(headless=headless, offscreen=offscreen) as owned_session:
         return _harvest_with_session(owned_session, *args)
+
+
+class StateLeadExhausted(RuntimeError):
+    """Фильтр исчерпан раньше, чем найдено запрошенное число новых лидов."""
+
+    def __init__(self, requested, found, stats):
+        self.requested = int(requested)
+        self.found = int(found)
+        self.stats = dict(stats)
+        super().__init__(
+            f"по строгим критериям найдено {self.found}/{self.requested}; "
+            f"источник исчерпан в заданном лимите страниц")
+
+
+class StateOwnershipUnavailable(RuntimeError):
+    """Официальный источник госучастия системно недоступен."""
+
+
+def _industry_for_okved(code):
+    """Наиболее специфичная существующая отрасль для downstream-материалов."""
+    code = str(code or "").strip()
+    priority = {"opk": 3, "processing": 2, "manufacturing": 1}
+    matches = []
+    for key, cfg in INDUSTRY.items():
+        for prefix in cfg.get("okved") or ():
+            if code == prefix or code.startswith(prefix + "."):
+                matches.append((len(prefix), priority.get(key, 0), key))
+    return max(matches)[2] if matches else "services"
+
+
+def _merge_state_contacts(lead, contacts):
+    """Перенести факты карточки в канонические поля лида."""
+    contacts = contacts or {}
+    for key in (
+        "_ceo_post", "_ceo_fio", "_ceo_inn", "_capital", "_main_okved_id",
+        "_staff_count", "_staff_year", "_revenue_year", "_revenue_display",
+    ):
+        if contacts.get(key):
+            lead[key] = contacts[key]
+    if contacts.get("_ceo_fio"):
+        lead["contact_person"] = contacts["_ceo_fio"]
+    if contacts.get("website"):
+        lead["website"] = contacts["website"]
+    phones = list(contacts.get("phones") or [])
+    if contacts.get("phone") and contacts["phone"] not in phones:
+        phones.insert(0, contacts["phone"])
+    if phones:
+        lead["_phones"] = phones
+        lead["phone"] = ", ".join(phones)[:90]
+    emails = list(dict.fromkeys(
+        str(value).strip().lower() for value in (contacts.get("emails") or [])
+        if str(value).strip()))
+    if emails:
+        lead["_emails"] = emails
+        lead["email"] = emails[0]
+        lead["_email_src"] = "RusProfile/Playwright"
+    if contacts.get("founders"):
+        lead["_founders"] = contacts["founders"]
+
+
+def harvest_state_owned(*args, **kwargs):
+    """Ленивый фасад, чтобы основной источник оставался канонической точкой входа."""
+    from state_lead_collection import harvest_state_owned as implementation
+    return implementation(*args, **kwargs)
 
 
 def _save(rows, path):

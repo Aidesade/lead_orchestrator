@@ -12,10 +12,16 @@ r"""Outreach-пайплайн: сбор -> адрес ЛПР -> письмо с 
   6. Адрес ЛПР             — email_guess (гипотезы по схеме домена) + проверка без отправки
   7. Письмо                — текст моделью, подпись кодом, отправка через Outlook
   8. Проверка прогона      — какая стадия по какой компании пропущена и почему
+  9. Выгрузка в CRM        — crm_push: компания и факт письма уходят в раздел «Лиды»
 
 Стадии 4 и 5 — не шаги цикла, а прекондишены: проверяются ОДИН раз до первой компании
 и падают жёсткой ошибкой. Пайплайн, который отработал сбор и подбор адресов, а потом
 не смог отправить, потратил время и лимиты RusProfile впустую.
+
+Стадия 9 — наоборот, «мягкая»: она идёт ПОСЛЕ необратимой отправки, поэтому её сбой
+(CRM не настроена, легла, сменился токен) только пишется в реестр и лог. Уронить
+прогон здесь значило бы потерять запись об уже отправленном письме. Дальше лид
+живёт в CRM: там менеджер пишет итог холодного звонка и заводит сделку.
 
 ⚠️ По умолчанию письма СОХРАНЯЮТСЯ В ЧЕРНОВИКИ. Реальная отправка — только явным
 ``--send``. Отправка необратима, а ошибка в шаблоне на сотне компаний стоит домена.
@@ -55,6 +61,7 @@ except Exception:
 
 import outreach_registry as REG                     # noqa: E402
 import outreach_letter as LETTER                    # noqa: E402
+import crm_push as CRM                              # noqa: E402  — стадия 9
 # Транспорт выбирается переменной, а не правкой кода: рассылка может идти как с
 # ящика в профиле Outlook, так и напрямую по SMTP с ящика, которого в профиле нет.
 # Контракт у модулей одинаковый (check_ready / send_message), стадии не ветвятся.
@@ -434,6 +441,26 @@ def stage_send(lead, idx, picked, letter, onepager, send=False, dry_run=False):
     return res, note
 
 
+def stage_crm(lead, idx, reg, inn, sent, onepager, *, draft=False, enabled=True):
+    """Стадия 9: компания и факт письма -> раздел «Лиды» CRM ЦИТ РТ.
+
+    Единственная стадия ПОСЛЕ необратимого действия, поэтому она мягкая: любой
+    сбой уходит в реестр и лог, но прогон не валит и статус письма не меняет.
+    Дальше лид ведут в CRM — там пишут итог холодного звонка и заводят сделку."""
+    if not enabled:
+        reg.mark_crm(inn, False, "выключена ключом --no-crm")
+        return
+    if not CRM.is_configured():
+        reg.mark_crm(inn, False, "CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)")
+        return
+    try:
+        ok, note = CRM.push_lead(lead, sent, draft=draft, onepager=onepager)
+    except Exception as exc:                        # noqa: BLE001 — письмо уже ушло, падать нельзя
+        ok, note = False, f"{type(exc).__name__}: {str(exc)[:120]}"
+    reg.mark_crm(inn, ok, note)
+    log(f"    [{idx}] CRM: {note}")
+
+
 # ============================================================== ОБРАБОТКА =====
 # Как называется остановка в логе и чем она оборачивается для счётчиков прогона.
 _STOP = {REG.SKIP: ("пропуск", "skip"), REG.FAIL: ("сбой", "fail")}
@@ -500,7 +527,17 @@ async def process(lead, idx, reg, args, tmp_dir):
     if args.dry_run:
         reg.mark(inn, "sent", REG.SKIP, "dry-run: письмо не создавалось")
     else:
-        reg.mark_sent(inn, res["to"], res["subject"], draft=not args.send, note=note)
+        rec = reg.mark_sent(inn, res["to"], res["subject"], draft=not args.send, note=note)
+        # Необратимое действие уже произошло: фиксируем его на диске ДО любой сети.
+        # Иначе Ctrl+C/сбой питания внутри необязательной CRM приведёт к повторной отправке.
+        reg.save()
+        # Стадия 9 использует timestamp уже сохранённого факта отправки.
+        stage_crm(
+            lead, idx, reg, inn,
+            {"to": res["to"], "subject": res["subject"],
+             "at": (rec.get("sent") or {}).get("at")},
+            onepager, draft=not args.send, enabled=not args.no_crm,
+        )
     reg.save()
     return "ok"
 
@@ -583,6 +620,8 @@ def main():
                          "собрана из карточек ЕГРЮЛ, а подбор предложит расчётный адрес")
     ap.add_argument("--no-verify-server", dest="no_verify_server", action="store_true",
                     help="работать без верификатора ЦИТ РТ (адреса — непроверенные гипотезы)")
+    ap.add_argument("--no-crm", dest="no_crm", action="store_true",
+                    help="стадия 9: не выгружать лиды в CRM (по умолчанию выгружаем, если настроена)")
     ap.add_argument("--check", action="store_true", help="стадия 8: только отчёт по реестру")
     ap.add_argument("--registry", default=None, help="путь к файлу реестра")
     a = ap.parse_args()

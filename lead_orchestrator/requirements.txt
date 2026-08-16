@@ -11,6 +11,7 @@ claude-agent-sdk==0.2.103       # SDK-обёртки orchestrator_agent / compan
 anyio==4.13.0                   # увод блокирующего сбора в поток внутри async-тулов SDK
 undetected-chromedriver==3.5.5  # обход Cloudflare у RusProfile (uc, НЕ Playwright); тянет selenium
 openpyxl==3.1.5                 # сборка Excel по шаблону D:\лиды
+pymupdf==1.28.0                 # текст актуальной PDF-выписки ЕГРЮЛ для графа госучастия
 python-docx==1.2.0              # рендер двух нейтральных .docx (карта процессов / карта ролей)
 Crawl4AI==0.9.0                 # PRIMARY реальный краул сайта в движке deep_research (фолбэк — HTTP)
 # --- стадия презентации .pptx (официальный скилл pptx исполняет их агентно) ---

@@ -7,6 +7,7 @@ import os
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
 
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -69,6 +70,21 @@ CARD_LOCKED = """Уставный капитал
 Генеральный директор ООО "Регион-Нефть" - Гребнева Татьяна Николаевна (ИНН 343900088737).
 """
 
+# Живой блок карточки RusProfile 2026-08-16. В выдаче точная выручка приходит
+# числом, а годы выручки и численности нужно подтверждать на карточке.
+CARD_METRICS = """Среднесписочная численность
+250 сотрудников в 2025 году  6
+Среднемесячная зарплата
+85 734 руб в 2025 году
+Финансы
+Основные показатели за 2025 год:
+Выручка
+2,5 млрд руб.
+↑+11 %
+Прибыль
+7,9 млн руб.
+"""
+
 # Страница /founders/<id> без профессионального доступа — состав закрыт целиком.
 FOUNDERS_LOCKED = """Учредители
 Уставный капитал: 22 000 руб.
@@ -116,6 +132,12 @@ def _check_card_parsers() -> None:
     assert facts["_ceo_inn"] == "343900088737", facts
     assert facts["_capital"] == "22 000 руб.", facts
 
+    metrics = RPW.card_facts(CARD_METRICS)
+    assert metrics["_staff_count"] == 250, metrics
+    assert metrics["_staff_year"] == 2025, metrics
+    assert metrics["_revenue_year"] == 2025, metrics
+    assert metrics["_revenue_display"] == "2,5 млрд руб.", metrics
+
     masked_card = CARD_LOCKED.replace("Гребнева Татьяна Николаевна", "░░░░░░░ ░░░░░░")
     masked = RPW.card_facts(masked_card)
     assert "_ceo_fio" not in masked, "замаскированное ФИО нельзя выдавать за прочитанное"
@@ -136,8 +158,201 @@ def _check_card_parsers() -> None:
     assert RPW.parse_founders("") == {"founders": [], "historic": [], "locked": False}
 
 
+def _check_staff_filter_body() -> None:
+    """Оба browser-backend должны отправлять серверу один и тот же диапазон."""
+    for cls in (RPW.RusProfilePlaywrightSession, RP.RusProfileSession):
+        session = object.__new__(cls)
+        captured = []
+        session._post_retry = lambda body, log=None, **_kwargs: (
+            captured.append(body) or {
+                "success": True,
+                "data": {"items": [], "total_count": 0,
+                         "pagination": {"page_count": 1}},
+            })
+        if cls is RPW.RusProfilePlaywrightSession:
+            session.page = SimpleNamespace(url=RPW.ADV_URL)
+            session._goto = lambda *_args, **_kwargs: None
+            session.log = lambda *_args: None
+        session.search(
+            ["10.11"], 2_000_000_000, max_pages=1, pause=0,
+            staff_from=240, staff_to=260, log=lambda *_args: None,
+        )
+        assert captured, cls
+        assert captured[0]["finance_revenue_from"] == "2000000000", captured[0]
+        assert captured[0]["sshr_from"] == "240", captured[0]
+        assert captured[0]["sshr_to"] == "260", captured[0]
+
+    session = object.__new__(RPW.RusProfilePlaywrightSession)
+    captured = []
+    session.page = SimpleNamespace(url=RPW.ADV_URL)
+    session._goto = lambda *_args, **_kwargs: None
+    session.log = lambda *_args: None
+    session._post_retry = lambda body, log=None, **_kwargs: captured.append(body)
+    try:
+        session.search([], 2_000_000_000, max_pages=20, deadline=0,
+                       log=lambda *_args: None)
+    except RPW.RusProfileDeadlineReached:
+        pass
+    else:
+        raise AssertionError("истёкший deadline был выдан за пустую выдачу")
+    assert captured == [], "истёкший deadline не должен читать выдачу"
+
+
+def _check_card_url_and_search_failure() -> None:
+    assert RPW.canonical_card_url("/id/123") == "https://www.rusprofile.ru/id/123"
+    assert RPW.canonical_card_url("https://rusprofile.ru/id/123").endswith("/id/123")
+    for unsafe in ("http://127.0.0.1/id/1", "https://evil.test/id/1",
+                   "https://www.rusprofile.ru/id/1?next=x", "/company/1"):
+        try:
+            RPW.canonical_card_url(unsafe)
+        except RPW.RusProfilePlaywrightError:
+            pass
+        else:
+            raise AssertionError(f"SSRF/неканоническая ссылка принята: {unsafe}")
+
+    session = object.__new__(RPW.RusProfilePlaywrightSession)
+    session.log = lambda *_args: None
+    session.timeout_ms = 1_000
+    session._post = lambda _body, **_kwargs: (_ for _ in ()).throw(OSError("offline"))
+    session._goto = lambda *_args, **_kwargs: None
+    try:
+        session._post_retry({"page": 3}, log_fn=lambda *_args: None)
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "стр.3" in str(exc)
+    else:
+        raise AssertionError("сбой страницы поиска был выдан за исчерпание источника")
+
+    session._post = lambda _body, **_kwargs: (_ for _ in ()).throw(
+        RPW.RusProfileDeadlineReached("deadline в XHR"))
+    try:
+        session._post_retry({"page": 4}, log_fn=lambda *_args: None)
+    except RPW.RusProfileDeadlineReached:
+        pass
+    except RPW.RusProfilePlaywrightError as exc:
+        raise AssertionError("deadline XHR потерял тип timeout") from exc
+    else:
+        raise AssertionError("deadline XHR был проигнорирован")
+
+    opened = []
+
+    class Body:
+        @staticmethod
+        def inner_text():
+            return "Актуальные (0)"
+
+    founders = object.__new__(RPW.RusProfilePlaywrightSession)
+    founders._goto = lambda url, **_kwargs: opened.append(url)
+    founders.page = SimpleNamespace(
+        content=lambda: "<html></html>", locator=lambda _selector: Body())
+    result = founders.founders_by_url("/id/123")
+    assert result["founders"] == []
+    assert opened == ["https://www.rusprofile.ru/founders/123"]
+
+    malformed = object.__new__(RPW.RusProfilePlaywrightSession)
+    malformed.page = SimpleNamespace(url=RPW.ADV_URL)
+    malformed.log = lambda *_args: None
+    malformed._goto = lambda *_args, **_kwargs: None
+    malformed._post_retry = lambda *_args, **_kwargs: {"success": True}
+    try:
+        malformed.search(["10.11"], 2_000_000_000, max_pages=1, pause=0)
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "схем" in str(exc)
+    else:
+        raise AssertionError("malformed-success был выдан за пустую последнюю страницу")
+
+    partial = object.__new__(RPW.RusProfilePlaywrightSession)
+    partial.page = SimpleNamespace(url=RPW.ADV_URL)
+    partial.log = lambda *_args: None
+    partial._goto = lambda *_args, **_kwargs: None
+    responses = iter((
+        {"success": True, "data": {
+            "items": [{"inn": "1650000049"}], "total_count": 100,
+            "pagination": {"page_count": 2}}},
+        {"success": True, "data": {
+            "items": [], "total_count": 100,
+            "pagination": {"page_count": 2}}},
+    ))
+    partial._post_retry = lambda *_args, **_kwargs: next(responses)
+    try:
+        partial.search(["10.11"], 2_000_000_000, max_pages=2, pause=0,
+                       log=lambda *_args: None)
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "пуст" in str(exc).lower() or "частич" in str(exc).lower()
+    else:
+        raise AssertionError("преждевременно пустая страница вернула partial results")
+
+    changed = object.__new__(RPW.RusProfilePlaywrightSession)
+    changed.page = SimpleNamespace(url=RPW.ADV_URL)
+    changed.log = lambda *_args: None
+    changed._goto = lambda *_args, **_kwargs: None
+    changed_responses = iter((
+        {"success": True, "data": {
+            "items": [{"inn": "1650000049"}], "total_count": 2,
+            "pagination": {"page_count": 2}}},
+        {"success": True, "data": {
+            "items": [{"inn": "1650000056"}], "total_count": 3,
+            "pagination": {"page_count": 3}}},
+    ))
+    changed._post_retry = lambda *_args, **_kwargs: next(changed_responses)
+    try:
+        changed.search(["10.11"], 2_000_000_000, max_pages=2, pause=0,
+                       log=lambda *_args: None)
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "пагинац" in str(exc).lower() or "схем" in str(exc).lower()
+    else:
+        raise AssertionError("изменившаяся pagination metadata вернула partial results")
+
+
+def _check_card_schema_fail_closed() -> None:
+    session = object.__new__(RPW.RusProfilePlaywrightSession)
+    session._snapshot = lambda *_args, **_kwargs: (
+        "https://www.rusprofile.ru/id/1", "", "Just a moment... CAPTCHA", "")
+    try:
+        session.card_facts_by_url("/id/1", expected_inn="1650000049")
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "карточ" in str(exc).lower() or "captcha" in str(exc).lower()
+    else:
+        raise AssertionError("CAPTCHA карточки была принята как отсутствие метрик")
+
+    session._snapshot = lambda *_args, **_kwargs: (
+        "https://www.rusprofile.ru/id/1", "", "ИНН 1650000049\nКарточка компании", "")
+    try:
+        session.card_facts_by_url("/id/1", expected_inn="1650000049")
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "схем" in str(exc).lower() or "выруч" in str(exc).lower()
+    else:
+        raise AssertionError("сломанная схема карточки была принята как отсутствие метрик")
+
+    session._snapshot = lambda *_args, **_kwargs: (
+        "https://www.rusprofile.ru/id/1", "",
+        "ИНН 1650000049\nОсновные показатели за 2025 год:\n"
+        "Выручка\n2,5 млрд руб.", "")
+    try:
+        session.card_facts_by_url("/id/1", expected_inn="1650000049")
+    except RPW.RusProfilePlaywrightError as exc:
+        assert "числен" in str(exc).lower() or "схем" in str(exc).lower()
+    else:
+        raise AssertionError("частичный drift без численности был принят как бизнес-отказ")
+
+    ambiguous = (
+        "ИНН 1650000049\n" + CARD_METRICS
+        + "\nСреднесписочная численность\n999 сотрудников в 2024 году"
+        + "\nОсновные показатели за 2024 год:\nВыручка\n3,1 млрд руб.")
+    session._snapshot = lambda *_args, **_kwargs: (
+        "https://www.rusprofile.ru/id/1", "", ambiguous, "")
+    try:
+        session.card_facts_by_url("/id/1", expected_inn="1650000049")
+    except RPW.RusProfileCardSourceError:
+        pass
+    else:
+        raise AssertionError("неоднозначные метрики карточки были приняты по первому regex-match")
+
+
 def main() -> int:
     _check_card_parsers()
+    _check_staff_filter_body()
+    _check_card_url_and_search_failure()
+    _check_card_schema_fail_closed()
 
     rows = RPW.normalize_cookie_rows([
         {
@@ -197,12 +412,16 @@ def main() -> int:
     assert all(lead["_revenue"] >= RP.MIN_REVENUE_FLOOR for lead in leads)
     marker_item = _item("1000000006", 2_000_000_000)
     marker_item["main_okved_id"] = "!~.~1.01"
+    marker_item.update({"finance_year": 2025, "sshr": "250", "sshr_year": "2025"})
     marker_lead = RP.item_to_lead(
         marker_item,
         {"label": "Тест", "pain": "", "offer": ""},
         industry,
     )
     assert marker_lead["niche"] == "Тест"
+    assert marker_lead["_revenue_year"] == 2025
+    assert marker_lead["_staff_count"] == 250
+    assert marker_lead["_staff_year"] == 2025
 
     with tempfile.TemporaryDirectory() as tmp:
         nested = pathlib.Path(tmp) / "new" / "phase1.json"

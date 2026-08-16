@@ -14,11 +14,11 @@ import json
 import os
 import re
 import time
+import urllib.parse
 from pathlib import Path
 
 from rusprofile_session import (
     COOKIES_FILE,
-    HOME,
     PAYWALL,
     TEST_CARD,
     _MASK,
@@ -30,21 +30,56 @@ from rusprofile_session import (
 ADV_URL = "https://www.rusprofile.ru/search-advanced"
 MAX_SEARCH_PAGES = 20
 
+
+def _canonical_profile_url(link, section):
+    """Канонический URL разрешённого раздела на ожидаемом origin."""
+    if section not in ("id", "founders"):
+        raise ValueError("неподдерживаемый раздел RusProfile")
+    raw = str(link or "").strip()
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme or parsed.netloc:
+        host = (parsed.hostname or "").lower()
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.port not in (None, 443)
+                or host not in ("rusprofile.ru", "www.rusprofile.ru")):
+            raise RusProfilePlaywrightError("ссылка карточки ведёт вне rusprofile.ru")
+    if (parsed.query or parsed.fragment
+            or not re.fullmatch(rf"/{section}/\d+", parsed.path or "")):
+        raise RusProfilePlaywrightError("неканоническая ссылка RusProfile")
+    return "https://www.rusprofile.ru" + parsed.path
+
+
+def canonical_card_url(link):
+    """Только каноническая карточка /id/<number> на ожидаемом origin."""
+    return _canonical_profile_url(link, "id")
+
 _SEARCH_XHR = r"""
-body => {
+async arg => {
   const tok=(document.cookie.match(/__Host-csrf-token=([^;]+)/)||[])[1]||'';
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/ajax/search/advanced?cacheKey='+Math.random(),false);
-  xhr.setRequestHeader('Content-Type','application/json');
-  xhr.setRequestHeader('X-Csrf-Token', decodeURIComponent(tok));
-  xhr.send(JSON.stringify(body));
-  return xhr.responseText;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(), Math.max(100, arg.timeout_ms));
+  try {
+    const response=await fetch('/ajax/search/advanced?cacheKey='+Math.random(), {
+      method:'POST', credentials:'same-origin', signal:controller.signal,
+      headers:{'Content-Type':'application/json','X-Csrf-Token':decodeURIComponent(tok)},
+      body:JSON.stringify(arg.body)
+    });
+    return await response.text();
+  } finally { clearTimeout(timer); }
 }
 """
 
 
 class RusProfilePlaywrightError(RuntimeError):
     """Cookie, browser, anti-bot or response error."""
+
+
+class RusProfileDeadlineReached(RusProfilePlaywrightError):
+    """Намеренная остановка по общему лимиту времени, а не сбой источника."""
+
+
+class RusProfileCardSourceError(RusProfilePlaywrightError):
+    """Карточка заменена антиботом или больше не соответствует ожидаемой схеме."""
 
 
 def log(message):
@@ -62,6 +97,15 @@ _RE_MANAGER = re.compile(
 # 12 цифр — ИНН физлица (у организаций 10), это и отличает ЛПР от самой компании.
 _RE_PERSON_INN = re.compile(r"\(ИНН\s*(\d{12})\)")
 _RE_CAPITAL = re.compile(r"Уставный капитал\s*\r?\n\s*([^\r\n]+)", re.I)
+_RE_STAFF = re.compile(
+    r"Среднесписочная численность\s*\r?\n\s*([\d\s]+)\s+сотрудник\w*\s+в\s+(\d{4})\s+год",
+    re.I,
+)
+_RE_REVENUE_YEAR = re.compile(
+    r"Основные показатели за\s+(\d{4})\s+год\w*:?\s*\r?\n\s*"
+    r"Выручка\s*\r?\n\s*([^\r\n]+)",
+    re.I,
+)
 
 
 def _masked(value):
@@ -90,6 +134,20 @@ def card_facts(text):
     capital = _RE_CAPITAL.search(text)
     if capital and not _masked(capital.group(1)):
         facts["_capital"] = capital.group(1).strip()
+    staff_values = {
+        (int(re.sub(r"\s+", "", match.group(1))), int(match.group(2)))
+        for match in _RE_STAFF.finditer(text)
+        if not _masked(match.group(0))
+    }
+    if len(staff_values) == 1:
+        facts["_staff_count"], facts["_staff_year"] = next(iter(staff_values))
+    revenue_values = {
+        (int(match.group(1)), " ".join(match.group(2).split()))
+        for match in _RE_REVENUE_YEAR.finditer(text)
+        if not _masked(match.group(0))
+    }
+    if len(revenue_values) == 1:
+        facts["_revenue_year"], facts["_revenue_display"] = next(iter(revenue_values))
     return facts
 
 
@@ -215,6 +273,7 @@ class RusProfilePlaywrightSession:
         offscreen=False,
         cookies_file=None,
         timeout_ms=None,
+        deadline=None,
         log_fn=log,
     ):
         self.headless = bool(headless)
@@ -223,6 +282,7 @@ class RusProfilePlaywrightSession:
             cookies_file or os.environ.get("RUSPROFILE_COOKIES_FILE") or COOKIES_FILE)
         self.timeout_ms = int(
             timeout_ms or os.environ.get("RUSPROFILE_TIMEOUT_MS") or 60_000)
+        self.deadline = deadline
         self.log = log_fn
         self._pw = None
         self.browser = None
@@ -233,6 +293,7 @@ class RusProfilePlaywrightSession:
         self.last_contacts_locked = False
 
     def __enter__(self):
+        self._remaining_ms(self.deadline, self.timeout_ms)
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
@@ -250,7 +311,10 @@ class RusProfilePlaywrightSession:
             ]
             if self.offscreen and not self.headless:
                 args.append("--window-position=-32000,-32000")
-            self.browser = self._pw.chromium.launch(headless=self.headless, args=args)
+            self.browser = self._pw.chromium.launch(
+                headless=self.headless, args=args,
+                timeout=self._remaining_ms(self.deadline, self.timeout_ms))
+            self._remaining_ms(self.deadline, self.timeout_ms)
             self.context = self.browser.new_context(viewport={"width": 1320, "height": 950})
             for cookie in cookies:
                 try:
@@ -263,7 +327,7 @@ class RusProfilePlaywrightSession:
                 raise RusProfilePlaywrightError(
                     "Playwright не принял ни одной cookie RusProfile")
             self.page = self.context.new_page()
-            self._goto(ADV_URL, settle_ms=7_000)
+            self._goto(ADV_URL, settle_ms=7_000, deadline=self.deadline)
             self.log(
                 f"[RusProfile/Playwright] cookie загружены: {self.cookies_loaded}; "
                 f"файл {self.cookies_file}")
@@ -285,20 +349,33 @@ class RusProfilePlaywrightSession:
                     pass
         self.page = self.context = self.browser = self._pw = None
 
-    def _goto(self, url, *, settle_ms=3_000):
-        self.page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-        self.page.wait_for_timeout(settle_ms)
+    @staticmethod
+    def _remaining_ms(deadline, fallback):
+        if deadline is None:
+            return int(fallback)
+        remaining = int((float(deadline) - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise RusProfileDeadlineReached("общий лимит времени RusProfile исчерпан")
+        return min(int(fallback), remaining)
+
+    def _goto(self, url, *, settle_ms=3_000, deadline=None):
+        timeout_ms = self._remaining_ms(deadline, self.timeout_ms)
+        self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        self.page.wait_for_timeout(self._remaining_ms(deadline, settle_ms))
         # Cloudflare иногда успевает завершить challenge уже после DOMContentLoaded.
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        challenge_end = time.monotonic() + 20
+        if deadline is not None:
+            challenge_end = min(challenge_end, float(deadline))
+        while time.monotonic() < challenge_end:
             title = (self.page.title() or "").lower()
             if "just a moment" not in title and "подождите" not in title:
                 break
-            self.page.wait_for_timeout(1_500)
+            self.page.wait_for_timeout(self._remaining_ms(deadline, 1_500))
 
-    def _post(self, body):
-        raw = self.page.evaluate(_SEARCH_XHR, body)
+    def _post(self, body, timeout_ms=None):
+        timeout_ms = max(100, min(self.timeout_ms, int(timeout_ms or self.timeout_ms)))
         self.search_requests += 1
+        raw = self.page.evaluate(_SEARCH_XHR, {"body": body, "timeout_ms": timeout_ms})
         try:
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -309,29 +386,36 @@ class RusProfilePlaywrightSession:
                 "RusProfile advanced-search вернул неожиданный ответ")
         return payload
 
-    def _post_retry(self, body, log_fn=None):
+    def _post_retry(self, body, log_fn=None, deadline=None):
         logger = log_fn or self.log
         last = ""
         for attempt in range(2):
+            timeout_ms = self._remaining_ms(deadline, self.timeout_ms)
             try:
-                response = self._post(body)
+                response = self._post(body, timeout_ms=timeout_ms)
                 if response.get("success"):
                     return response
                 last = str(response.get("message") or "success=false")[:120]
+            except RusProfileDeadlineReached:
+                raise
             except Exception as exc:
                 last = str(exc).splitlines()[0][:120]
             if attempt == 0:
                 logger(
                     f"  [warn] стр.{body.get('page')}: {last} — "
                     "обновляю Playwright-страницу и повторяю")
-                self._goto(ADV_URL, settle_ms=6_000)
-        logger(f"  [warn] стр.{body.get('page')}: {last} — стоп")
-        return None
+                self._goto(ADV_URL, settle_ms=6_000, deadline=deadline)
+        raise RusProfilePlaywrightError(
+            f"стр.{body.get('page')}: RusProfile advanced-search недоступен после ретрая: {last}")
 
-    def search(self, okved, revenue_from, max_pages=MAX_SEARCH_PAGES, pause=0.35, log=log):
-        """Внутренний advanced-search: ОКВЭД + серверный порог выручки."""
+    def search(self, okved, revenue_from, max_pages=MAX_SEARCH_PAGES, pause=0.35,
+               log=log, staff_from=None, staff_to=None, deadline=None):
+        """Advanced-search: ОКВЭД, выручка и опциональная численность."""
+        if deadline is not None and time.monotonic() >= float(deadline):
+            raise RusProfileDeadlineReached(
+                "лимит времени истёк до открытия advanced-search")
         if "/search-advanced" not in (self.page.url or ""):
-            self._goto(ADV_URL, settle_ms=5_000)
+            self._goto(ADV_URL, settle_ms=5_000, deadline=deadline)
         base = {
             "action": "search_advanced",
             "query": "",
@@ -344,35 +428,79 @@ class RusProfilePlaywrightSession:
             "okved": list(okved),
             "finance_revenue_from": str(int(revenue_from)),
         }
+        if staff_from is not None:
+            base["sshr_from"] = str(int(staff_from))
+        if staff_to is not None:
+            base["sshr_to"] = str(int(staff_to))
+        if (staff_from is not None and staff_to is not None
+                and int(staff_from) > int(staff_to)):
+            raise ValueError("staff_from не может быть больше staff_to")
         out = []
         page_count = max(1, min(int(max_pages), MAX_SEARCH_PAGES))
-        total = None
+        total = available = None
         for page_no in range(1, page_count + 1):
-            response = self._post_retry(dict(base, page=page_no), log)
+            if deadline is not None and time.monotonic() >= float(deadline):
+                raise RusProfileDeadlineReached(
+                    f"лимит времени истёк перед стр.{page_no}")
+            response = self._post_retry(
+                dict(base, page=page_no), log, deadline=deadline)
+            if deadline is not None and time.monotonic() >= float(deadline):
+                raise RusProfileDeadlineReached(
+                    f"лимит времени истёк на стр.{page_no}")
             if response is None:
                 break
-            data = response.get("data") or {}
-            items = data.get("items") or []
+            data = response.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: неверная схема ответа поиска на стр.{page_no}")
+            items = data["items"]
+            pagination = data.get("pagination")
+            if (not isinstance(pagination, dict)
+                    or any(not isinstance(item, dict) for item in items)):
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: неверная схема ответа поиска на стр.{page_no}")
+            try:
+                current_total = int(data["total_count"])
+                current_available = int(pagination["page_count"])
+            except (TypeError, ValueError):
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: неверная схема ответа поиска на стр.{page_no}") from None
+            except KeyError:
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: неполная схема ответа поиска на стр.{page_no}") from None
+            if current_total < 0 or current_available < 0:
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: неверная схема ответа поиска на стр.{page_no}")
             if total is None:
-                total = data.get("total_count")
-                try:
-                    available = int((data.get("pagination") or {}).get("page_count") or 1)
-                except (TypeError, ValueError):
-                    available = 1
+                total, available = current_total, current_available
                 page_count = min(page_count, max(1, available))
                 log(f"  всего по фильтру: {total} (страниц до {page_count})")
+            elif (current_total, current_available) != (total, available):
+                raise RusProfilePlaywrightError(
+                    f"RusProfile: изменилась схема пагинации на стр.{page_no}")
             if not items:
+                if total is not None and len(out) < total:
+                    raise RusProfilePlaywrightError(
+                        f"RusProfile: преждевременно пустая стр.{page_no}; "
+                        f"получено {len(out)} из заявленных {total}")
                 break
-            out.extend(item for item in items if isinstance(item, dict))
+            out.extend(items)
             log(f"  стр.{page_no}: +{len(items)} (итого {len(out)})")
             if page_no >= page_count:
                 break
-            time.sleep(max(0.0, float(pause)))
+            delay = max(0.0, float(pause))
+            if deadline is not None and delay >= float(deadline) - time.monotonic():
+                raise RusProfileDeadlineReached(
+                    f"лимит времени истёк перед паузой после стр.{page_no}")
+            time.sleep(delay)
+        if deadline is not None and time.monotonic() >= float(deadline):
+            raise RusProfileDeadlineReached(
+                "лимит времени истёк при завершении advanced-search")
         return out
 
-    def _snapshot(self, link):
-        url = link if str(link).startswith("http") else "https://www.rusprofile.ru" + str(link)
-        self._goto(url, settle_ms=3_000)
+    def _snapshot(self, link, *, deadline=None, section="id"):
+        url = _canonical_profile_url(link, section)
+        self._goto(url, settle_ms=3_000, deadline=deadline)
         html = self.page.content()
         try:
             text = self.page.locator("body").inner_text()
@@ -423,8 +551,36 @@ class RusProfilePlaywrightSession:
             and bool(_REAL_TEL.search(combined))
         )
 
-    def contacts_by_url(self, link):
-        _url, _html, text, combined = self._snapshot(link)
+    def card_facts_by_url(self, link, *, expected_inn="", deadline=None):
+        """Открыть карточку и извлечь показатели строгого отбора."""
+        _url, _title, text, _html = self._snapshot(link, deadline=deadline)
+        lowered = text.casefold()
+        anti_bot = (
+            "captcha", "just a moment", "cloudflare", "проверка браузера",
+            "доступ ограничен", "подтвердите, что вы не робот",
+        )
+        if any(marker in lowered for marker in anti_bot):
+            raise RusProfileCardSourceError("карточка RusProfile заменена CAPTCHA/anti-bot")
+        expected_inn = re.sub(r"\D", "", str(expected_inn or ""))
+        if expected_inn:
+            shown_inns = {
+                re.sub(r"\D", "", value)
+                for value in re.findall(r"\bИНН\D{0,20}([\d\s-]{10,24})", text, re.I)
+            }
+            if expected_inn not in shown_inns:
+                raise RusProfileCardSourceError(
+                    "карточка RusProfile не содержит ожидаемый ИНН")
+        facts = card_facts(text)
+        if not facts.get("_revenue_display") or not facts.get("_revenue_year"):
+            raise RusProfileCardSourceError(
+                "схема карточки RusProfile не содержит выручку и её год")
+        if facts.get("_staff_count") is None:
+            raise RusProfileCardSourceError(
+                "схема карточки RusProfile не содержит численность сотрудников")
+        return facts
+
+    def contacts_by_url(self, link, *, deadline=None):
+        _url, _html, text, combined = self._snapshot(link, deadline=deadline)
         low = combined.lower()
         self.last_contacts_locked = PAYWALL in low or _MASK in combined
         contacts = self._contacts_from_current(combined)
@@ -453,7 +609,8 @@ class RusProfilePlaywrightSession:
             return {"founders": [], "historic": [], "locked": False,
                     "note": f"из ссылки {url[:60]} не выводится страница учредителей"}
         founders_url = f"https://www.rusprofile.ru/founders/{match.group(1)}"
-        _url, _html, text, _combined = self._snapshot(founders_url)
+        _url, _html, text, _combined = self._snapshot(
+            founders_url, section="founders")
         return parse_founders(text)
 
     def company_by_url(self, link):
@@ -548,7 +705,10 @@ class RusProfilePlaywrightSession:
             # переносим их ДО проверки замка, иначе ЛПР терялся бы вместе с телефоном
             if contacts.get("_ceo_fio") and not lead.get("_ceo_fio"):
                 facts += 1
-            for key in ("_ceo_post", "_ceo_fio", "_ceo_inn", "_capital"):
+            for key in (
+                "_ceo_post", "_ceo_fio", "_ceo_inn", "_capital",
+                "_staff_count", "_staff_year", "_revenue_year", "_revenue_display",
+            ):
                 if contacts.get(key) and not lead.get(key):
                     lead[key] = contacts[key]
             if contacts.get("_ceo_fio") and not lead.get("contact_person"):

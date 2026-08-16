@@ -81,6 +81,9 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
        lead_orchestrator/source_ofdata.py \
        lead_orchestrator/source_rusprofile.py \
        lead_orchestrator/rusprofile_playwright.py \
+       lead_orchestrator/state_ownership.py \
+       lead_orchestrator/state_lead_collection.py \
+       lead_orchestrator/crm_push.py \
        lead_orchestrator/writer_kimi.py \
        lead_orchestrator/kimi_research_cli.py \
        lead_orchestrator/rusprofile_session.py \
@@ -103,6 +106,10 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
     && python lead_orchestrator/test_source_ofdata.py \
     && python lead_orchestrator/test_source_girbo.py \
     && python lead_orchestrator/test_rusprofile_playwright.py \
+    && python lead_orchestrator/test_crm_push.py \
+    && python lead_orchestrator/test_state_ownership.py \
+    && python lead_orchestrator/test_state_owned_collection.py \
+    && python lead_orchestrator/test_state_owned_wiring.py \
     && python lead_orchestrator/test_kimi_only.py \
     && python lead_orchestrator/test_claude_runtime.py \
     && python lead_orchestrator/test_kimi_agent_freedom.py \

@@ -57,7 +57,8 @@ SYSTEM_PROMPT = """\
 преобразовать запрос пользователя в ОДИН JSON-план. Сам pipeline запускает Python после
 проверки плана; не пиши команды, не имитируй запуск и не добавляй текст вне JSON.
 
-Pipeline делает: сбор компаний по отрасли -> deep research -> два DOCX -> one-pager PDF.
+Pipeline делает: сбор компаний по отрасли ИЛИ строгий добор госкомпаний ->
+deep research -> два DOCX -> one-pager PDF.
 Модельные стадии закреплены конфигурацией запуска; поля выбора модели в плане НЕТ.
 
 Доступные отрасли (верни только ключи слева):
@@ -65,6 +66,10 @@ __INDUSTRIES__
 
 Правила:
 - industries — ключи через запятую. Подбери по смыслу русской формулировки.
+- state_owned=true, если просят новые государственные/муниципальные компании с
+  фиксированным профилем: выручка >=2 млрд за 2025 год, 240–260 сотрудников,
+  подтверждённая прямая/косвенная госдоля >25%, без дублей CRM. Тогда industries,
+  leads_json, min_revenue и region должны быть пустыми; count_total — итоговое N.
 - Если дан готовый leads.json, положи путь в leads_json, industries оставь пустым.
 - count_per_industry — число компаний НА КАЖДУЮ отрасль. Если пользователь сказал
   «30 по трём отраслям», верни 10. Если число не названо — null (Python предложит 200).
@@ -79,6 +84,8 @@ __INDUSTRIES__
 {
   "action": "run|clarify",
   "message": "короткий вопрос при clarify, иначе пустая строка",
+  "state_owned": false,
+  "count_total": 10,
   "industries": "mining,oil28 или пустая строка",
   "leads_json": "путь или пустая строка",
   "count_per_industry": 10,
@@ -138,17 +145,23 @@ def _normalise_plan(raw: dict) -> dict:
     """Недоверенный ответ модели -> узкий безопасный контракт запуска."""
     industries = parse_industries(raw.get("industries"))
     leads_json = str(raw.get("leads_json") or "").strip().strip('"')
+    state_owned = _bool(raw.get("state_owned"))
     action = str(raw.get("action") or "run").strip().lower()
     if action not in ("run", "clarify"):
         action = "clarify"
-    if industries and leads_json:
+    if state_owned and (industries or leads_json):
+        action = "clarify"
+        message = "Режим госкомпаний нельзя смешивать с отраслью или готовым leads.json."
+    elif industries and leads_json:
         action = "clarify"
         message = "Укажи либо отрасли для нового сбора, либо готовый leads.json — не оба сразу."
     else:
         message = str(raw.get("message") or "").strip()
-    if action == "run" and not industries and not leads_json:
+    if action == "run" and not state_owned and not industries and not leads_json:
         action = "clarify"
-        message = message or "Какую отрасль собрать или какой путь к leads.json использовать?"
+        message = message or (
+            "Какую отрасль собрать, использовать ли строгий режим госкомпаний "
+            "или какой путь к leads.json открыть?")
 
     revenue = raw.get("min_revenue")
     try:
@@ -157,10 +170,18 @@ def _normalise_plan(raw: dict) -> dict:
         revenue = None
     count = raw.get("count_per_industry")
     count = None if count in (None, "") else _positive_int(count, DEFAULT_PER_INDUSTRY)
+    count_total = raw.get("count_total")
+    count_total = None if count_total in (None, "") else _positive_int(
+        count_total, DEFAULT_PER_INDUSTRY)
+    if state_owned and count_total is not None and count_total > 200:
+        action = "clarify"
+        message = "В строгом режиме госкомпаний --count должен быть от 1 до 200."
     workers = min(2, _positive_int(raw.get("workers"), 2))
     return {
         "action": action,
         "message": message,
+        "state_owned": state_owned,
+        "count_total": count_total,
         "industries": ",".join(industries),
         "leads_json": leads_json,
         "count_per_industry": count,
@@ -252,20 +273,28 @@ def per_industry(plan: dict) -> int:
 def _build_cmd(plan: dict) -> tuple[list[str] | None, str | None]:
     industries = parse_industries(plan.get("industries"))
     leads_json = str(plan.get("leads_json") or "").strip()
+    state_owned = _bool(plan.get("state_owned"))
+    if state_owned and (industries or leads_json):
+        return None, "Режим госкомпаний нельзя смешивать с отраслью или leads.json."
     if industries and leads_json:
         return None, "Нельзя одновременно собирать отрасли и читать готовый leads.json."
-    if not industries and not leads_json:
-        return None, "Нужна отрасль или путь к готовому leads.json."
+    if not state_owned and not industries and not leads_json:
+        return None, "Нужна отрасль, строгий режим госкомпаний или готовый leads.json."
 
     cmd = [sys.executable, ORCH]
-    if leads_json:
+    if state_owned:
+        total = _positive_int(
+            plan.get("count_total") or plan.get("count_per_industry"),
+            DEFAULT_PER_INDUSTRY)
+        cmd += ["--state-owned", "--count", str(total)]
+    elif leads_json:
         cmd.append(leads_json)
     if industries:
         cmd += ["--industries", ",".join(industries),
                 "--per-industry", str(per_industry(plan))]
-    if plan.get("min_revenue"):
+    if not state_owned and plan.get("min_revenue"):
         cmd += ["--min-revenue", str(float(plan["min_revenue"]))]
-    if str(plan.get("region") or "").strip():
+    if not state_owned and str(plan.get("region") or "").strip():
         cmd += ["--region", str(plan["region"]).strip()]
     cmd += ["--model", KC.default_model_flag(),
             "--workers", str(min(2, _positive_int(plan.get("workers"), 2)))]
@@ -296,6 +325,49 @@ def _box(title: str, lines: list[str], pad: int = 1) -> str:
 
 
 async def _confirm_volume(plan: dict) -> dict | None:
+    if _bool(plan.get("state_owned")):
+        proposed = _positive_int(
+            plan.get("count_total") or plan.get("count_per_industry"),
+            DEFAULT_PER_INDUSTRY)
+        if not sys.stdin.isatty():
+            print(f"[объём] неинтерактивно: {proposed} госкомпаний всего")
+            plan["count_total"] = proposed
+            return plan
+        while True:
+            choices = sorted(set(COUNT_CHOICES) | {proposed})
+            lines = ["Режим: новые госкомпании, ровно N ВСЕГО", ""]
+            for index, number in enumerate(choices, 1):
+                mark = "  ←" if number == proposed else ""
+                mode = "dry-run" if plan.get("dry_run") else "боевой прогон"
+                lines.append(f"{index}) {number:>3} компаний, {mode}{mark}")
+            lines.append("0) отмена")
+            print("\n" + _box("Подтверди объём", lines))
+            default = choices.index(proposed) + 1
+            try:
+                answer = (await asyncio.to_thread(
+                    input, f"Выбор [{default}]: ")).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if answer in ("0", "отмена", "n", "нет"):
+                return None
+            if not answer:
+                chosen = proposed
+            elif answer.isdigit() and 1 <= int(answer) <= len(choices):
+                chosen = choices[int(answer) - 1]
+            elif answer.isdigit():
+                chosen = max(1, int(answer))
+            else:
+                print("Не понял выбор.")
+                continue
+            if not plan.get("dry_run") and chosen > BIG_RUN_COMPANIES:
+                confirm = (await asyncio.to_thread(
+                    input, f"Боевой прогон: {chosen} компаний. Продолжить? [y/N]: ")).strip().lower()
+                if confirm not in ("y", "yes", "д", "да"):
+                    continue
+            plan["count_total"] = chosen
+            print(f"[объём] {chosen} госкомпаний всего")
+            return plan
+
     industries = parse_industries(plan.get("industries"))
     if not industries:
         return plan
