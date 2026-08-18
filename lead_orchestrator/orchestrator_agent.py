@@ -3,9 +3,9 @@ r"""NL-обёртка полной цепочки лидогенерации (ru
 
 Запрос на русском языке -> модель возвращает строгий JSON-план -> детерминированный
 Python проверяет отрасли и объём -> subprocess запускает orchestrator.py. Runtime
-выбирает kimi_config.runtime(): claude (штат ветки claude-sdk, Claude Agent SDK,
-авторизация логином Claude Code) либо kimi при ORQ_KIMI_ONLY=1 (KIMI_API_KEY с
-fallback GPLLM_API_KEY, KIMI_BASE_URL, KIMI_MODEL_NAME). Claude SDK грузится ТОЛЬКО
+выбирает kimi_config.runtime(): Kimi по умолчанию (KIMI_API_KEY с fallback
+GPLLM_API_KEY, KIMI_BASE_URL, KIMI_MODEL_NAME) либо Claude Agent SDK при явном
+ORQ_LLM_RUNTIME=claude. Claude SDK грузится ТОЛЬКО
 лениво через importlib в claude-runtime — kimi-only офлайн-контракт видит модуль
 без статических импортов Anthropic.
 

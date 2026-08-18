@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,7 +58,7 @@ async def industries() -> List[Dict[str, Any]]:
 
 @app.get("/api/models")
 async def models() -> List[Dict[str, Any]]:
-    """Runtime ПИСАТЕЛЯ двух .docx (флаг --model): claude (штат ветки) и kimi.
+    """Runtime ПИСАТЕЛЯ двух .docx (флаг --model): kimi (дефолт) и claude.
 
     `claude`/`kimi` — псевдонимы: конкретные модели резолвит kimi_config
     (ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL или единый KIMI_MODEL_NAME). У Kimi биллинг

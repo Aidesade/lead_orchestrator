@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Офлайн-контракт ветки claude-sdk: генератор по умолчанию на Claude Agent SDK.
+"""Офлайн-контракт явного отката генератора на Claude Agent SDK.
 
-Проверяет БЕЗ сети и LLM: дефолты runtime, диспатч текущего pipeline на model='claude',
+Проверяет БЕЗ сети и LLM: явный runtime, диспатч текущего pipeline на model='claude',
 резолв моделей стадий, готовность файлов агентных подпроцессов и Kimi-совместимый
 адаптер (спеки yaml/md + маппинг сообщений). Kimi-режим этих же файлов покрывает
 test_kimi_only.py (ORQ_KIMI_ONLY=1).
@@ -19,11 +19,12 @@ HERE = pathlib.Path(__file__).resolve().parent
 KIMI = HERE.parent / "lead_orchestrator_kimi"
 sys.path.insert(0, str(HERE))
 
-# Чистые дефолты ветки: без наследованных переключателей из консоли/лаунчера.
+# Явный Claude-откат: без наследованных переключателей из консоли/лаунчера.
 for name in ("ORQ_KIMI_ONLY", "ORQ_LLM_RUNTIME", "DR_LLM_PROVIDER",
              "ORQ_WRITER_MODEL", "ORQ_ENRICH_MODEL", "ORQ_ONEPAGER_MODEL",
              "ORQ_CONTROLLER_MODEL"):
     os.environ.pop(name, None)
+os.environ["ORQ_LLM_RUNTIME"] = "claude"
 
 import kimi_config as KC  # noqa: E402
 
@@ -38,7 +39,7 @@ def _load_adapter():
 
 
 def main() -> int:
-    # --- дефолты ветки: runtime claude, kimi — только явным переключателем ---
+    # --- явный Claude-runtime остаётся полностью рабочим ---
     assert KC.kimi_only() is False
     assert KC.runtime() == "claude"
     assert KC.default_model_flag() == "claude"
@@ -128,7 +129,7 @@ def main() -> int:
     web_runs = (HERE.parent / "web" / "api" / "runs.py").read_text(encoding="utf-8")
     assert '_default_model_flag()' in web_runs and '"--model", model' in web_runs
 
-    print("test_claude_runtime: OK — генератор ветки по умолчанию на Claude Agent SDK "
+    print("test_claude_runtime: OK — явный откат на Claude Agent SDK работает "
           f"(writer={KC.claude_model('writer')}, roles={KC.claude_model('enrich')})")
     return 0
 

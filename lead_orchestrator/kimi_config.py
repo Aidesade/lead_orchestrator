@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """Единый runtime-конфиг LLM-стадий лидген-пайплайна.
 
-Ветка claude-sdk: штатный runtime генератора — **Claude Agent SDK** (кодовый дефолт
-`ORQ_LLM_RUNTIME=claude`); прежний Kimi-only режим целиком возвращается `ORQ_KIMI_ONLY=1`
-(или `ORQ_LLM_RUNTIME=kimi` + ключ Kimi). Pipeline обоих runtime один и тот же —
-меняется только SDK, которым выполняются агентные стадии.
+Штатный runtime генератора — **Kimi** (кодовый дефолт `ORQ_LLM_RUNTIME=kimi`).
+Claude Agent SDK остаётся явным откатом через `ORQ_LLM_RUNTIME=claude`.
+`ORQ_KIMI_ONLY=1` дополнительно запрещает Claude и замену модели Kimi K2.7.
+Pipeline обоих runtime один и тот же — меняется только SDK агентных стадий.
 
 Kimi Agent SDK остаётся в соседнем изолированном venv; этот модуль не импортирует SDK.
 Claude Agent SDK живёт в ОСНОВНОМ окружении (как в legacy-ветке) и авторизуется
@@ -17,7 +17,7 @@ import os
 
 DEFAULT_BASE_URL = "https://gpllmkeeper.dtc.tatar/v1"
 DEFAULT_MODEL = "kimi-k2.7-code"
-DEFAULT_RUNTIME = "claude"
+DEFAULT_RUNTIME = "kimi"
 
 # Модели Claude по стадиям (алиасы CLI: sonnet/opus/haiku либо полный ID модели).
 # Философия та же, что в legacy-ветке: тяжёлое чтение — на sonnet, синтез — на opus.
@@ -49,13 +49,13 @@ def model_name() -> str:
 
 
 def kimi_only() -> bool:
-    """Аварийный полный Kimi-режим (прежний штатный). В ветке claude-sdk дефолт ВЫКЛ."""
+    """Жёсткий Kimi-only режим, запрещающий Claude и замену модели K2.7."""
     return (os.environ.get("ORQ_KIMI_ONLY", "0").strip().lower()
             in ("1", "true", "yes", "on", "да"))
 
 
 def runtime() -> str:
-    """Активный LLM-runtime: 'claude' (дефолт ветки) или 'kimi'."""
+    """Активный LLM-runtime: 'kimi' (дефолт) или явный 'claude'."""
     if kimi_only():
         return "kimi"
     value = (os.environ.get("ORQ_LLM_RUNTIME") or DEFAULT_RUNTIME).strip().lower()

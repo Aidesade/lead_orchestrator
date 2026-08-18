@@ -13,10 +13,16 @@ HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
-os.environ["ORQ_KIMI_ONLY"] = "1"
-os.environ.pop("DR_LLM_PROVIDER", None)
+for name in ("ORQ_KIMI_ONLY", "ORQ_LLM_RUNTIME", "DR_LLM_PROVIDER"):
+    os.environ.pop(name, None)
 
 import kimi_config as KC  # noqa: E402
+
+CLEAN_DEFAULT_RUNTIME = KC.runtime()
+CLEAN_DEFAULT_MODEL_FLAG = KC.default_model_flag()
+
+os.environ["ORQ_KIMI_ONLY"] = "1"
+os.environ.pop("DR_LLM_PROVIDER", None)
 
 KC.ensure_env()
 
@@ -38,6 +44,8 @@ def _imports(path: pathlib.Path) -> set[str]:
 
 
 def main() -> int:
+    assert CLEAN_DEFAULT_RUNTIME == "kimi"
+    assert CLEAN_DEFAULT_MODEL_FLAG == "kimi"
     assert KC.kimi_only() is True
     assert KC.model_name() == "kimi-k2.7-code"
     saved_model = os.environ.get("KIMI_MODEL_NAME")
@@ -112,12 +120,18 @@ def main() -> int:
     assert "OFDATA_API_KEY:" not in compose
 
     launcher = (HERE / "run_kimi_orchestrator.cmd").read_text(encoding="ascii")
+    assert 'if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=kimi"' in launcher
     assert 'set "LEAD_SOURCE=rusprofile"' in launcher
     assert 'set "RUSPROFILE_BROWSER=playwright"' in launcher
     assert "rusprofile_cookies.json" in launcher
     assert "from project_env import load_project_env" in launcher
     assert "r'%~dp0.'" in launcher  # %~dp0 ends with \ and is invalid as a raw string
     assert "orchestrator_agent.py" in launcher
+
+    canonical = (HERE / "run_orchestrator.cmd").read_text(encoding="ascii")
+    assert "run_kimi_orchestrator.cmd" in canonical
+    web_runs = (ROOT / "web" / "api" / "runs.py").read_text(encoding="utf-8")
+    assert 'return "kimi"' in web_runs
 
     print("test_kimi_only: OK — controller/research/writer/web runtime закреплены за Kimi K2.7")
     return 0

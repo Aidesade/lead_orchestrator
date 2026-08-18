@@ -131,7 +131,7 @@ VOLUME ["/data"]
 #   ORQ_KIMI_ONLY=1       — контейнер ОСТАЁТСЯ на Kimi-runtime: claude-runtime требует
 #                           авторизации Anthropic (логин Claude Code недоступен headless;
 #                           нужен ANTHROPIC_API_KEY в env/.env + ORQ_KIMI_ONLY=0 осознанно).
-# Локальный desktop-дефолт ветки — наоборот, claude (см. run_kimi_orchestrator.cmd).
+# Локальный desktop-дефолт также Kimi (см. run_kimi_orchestrator.cmd).
 ENV LEAD_SOURCE=ofdata \
     DR_LLM_PROVIDER=kimi \
     ORQ_KIMI_ONLY=1 \

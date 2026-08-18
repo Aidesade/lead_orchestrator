@@ -38,7 +38,7 @@ def _default_model_flag() -> str:
         import kimi_config
         return kimi_config.default_model_flag()
     except Exception:                              # noqa: BLE001 — веб не должен падать из-за конфига
-        return "claude"
+        return "kimi"
 
 
 class RunConflict(RuntimeError):

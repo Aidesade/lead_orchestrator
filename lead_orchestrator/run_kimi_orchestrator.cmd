@@ -5,12 +5,11 @@ rem    Double-click       -> interactive agent (talk to it in Russian).
 rem    With a request arg -> one-shot, e.g.:
 rem        run_kimi_orchestrator.cmd "collect 10 mining, dry-run"
 rem
-rem  Branch claude-sdk: default LLM runtime is CLAUDE AGENT SDK (main python,
-rem  auth = Claude Code login / ANTHROPIC_API_KEY). Same pipeline as before:
+rem  Default LLM runtime is KIMI end to end. Same pipeline as before:
 rem    NL controller + deep research extract + five research roles +
 rem    two DOCX writers + one-pager PDF.
-rem  Set ORQ_KIMI_ONLY=1 (or ORQ_LLM_RUNTIME=kimi) to get the previous
-rem  Kimi K2.7 runtime end to end (needs KIMI_API_KEY / GPLLM_API_KEY).
+rem  Set ORQ_LLM_RUNTIME=claude for the explicit Claude Agent SDK fallback
+rem  (Claude Code login / ANTHROPIC_API_KEY).
 rem
 rem  Per company: 2 neutral .docx + one-pager .pdf -> storage.
 rem  Chrome during scraping is HIDDEN (offscreen).
@@ -34,9 +33,9 @@ if errorlevel 1 (
 
 if /I "%~1"=="oil28" goto oil28
 
-rem --- Runtime selection: claude is the branch default, kimi is the explicit fallback ---
+rem --- Runtime selection: Kimi is the default, Claude is the explicit fallback ---
 if not defined ORQ_KIMI_ONLY set "ORQ_KIMI_ONLY=0"
-if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=claude"
+if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=kimi"
 if /I "%ORQ_KIMI_ONLY%"=="1" set "ORQ_LLM_RUNTIME=kimi"
 
 rem Kimi endpoint defaults stay exported: harmless for claude, required for kimi.
