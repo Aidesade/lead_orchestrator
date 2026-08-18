@@ -251,50 +251,19 @@ def check_letter() -> None:
         assert value in final["body"], f"в подписи нет «{value}»"
 
 
-# ----------------------------------------------------- прекондишен стадии 4 ----
-def check_verifier_precondition() -> None:
-    """Облачный добор — самостоятельный слой, но не замена верификатора ЦИТ РТ."""
-    import email_guess as EG
+# --------------------------------------------------- пробивка ящиков удалена ---
+def check_no_verifier_stage() -> None:
+    """Отказ от пробивки ящиков (2026-08-18) необратим на уровне кода.
 
-    saved = {k: os.environ.get(k) for k in
-             ("EMAIL_VERIFIER_URL", "EMAIL_MEV_ENABLE", "EMAIL_MEV_API_KEY")}
-    saved_credits = EG.mev_credits
-    try:
-        os.environ.pop("EMAIL_VERIFIER_URL", None)
-        os.environ.pop("EMAIL_MEV_ENABLE", None)
-        os.environ.pop("EMAIL_MEV_API_KEY", None)
-
-        # Слой выключен и верификатора нет -> прежнее поведение: жёсткая ошибка
-        try:
-            OUT.check_verifier(required=True)
-            raise AssertionError("без верификатора стадия 4 обязана падать")
-        except SystemExit as exc:
-            assert "EMAIL_VERIFIER_URL" in str(exc), str(exc)
-        assert OUT.check_verifier(required=False)["alive"] is False
-
-        # Живой облачный слой заменяет отсутствующий верификатор ЦИТ РТ, но
-        # раскрывает остаток квоты до первой компании, а не на сотой.
-        os.environ["EMAIL_MEV_ENABLE"] = "1"
-        os.environ["EMAIL_MEV_API_KEY"] = "K"
-        EG.mev_credits = lambda *a, **kw: (4200, "")
-        got = OUT.check_verifier(required=True)
-        assert got["alive"] is False, "верификатора ЦИТ РТ всё ещё нет"
-        assert got["mev"]["credits"] == 4200, got
-
-        # Битый ключ облака не отменяет требования иметь хоть какой-то верификатор
-        EG.mev_credits = lambda *a, **kw: (None, "unauthorized")
-        try:
-            OUT.check_verifier(required=True)
-            raise AssertionError("мёртвый облачный слой не должен считаться верификатором")
-        except SystemExit:
-            pass
-    finally:
-        EG.mev_credits = saved_credits
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    Вернуть check_verifier/SMTP-пробу «по памяти» не получится молча: тест
+    зафиксирует и сам факт, и то, что стадия 6 зовёт подбор без SMTP."""
+    assert not hasattr(OUT, "check_verifier"), \
+        "check_verifier вернулся: от пробивки ящиков отказались"
+    assert not hasattr(OUT, "_check_mev"), \
+        "_check_mev вернулся: облачный добор из пайплайна убран"
+    import inspect
+    src = inspect.getsource(OUT.stage_email)
+    assert "smtp=False" in src, "стадия 6 обязана строить гипотезы БЕЗ SMTP-пробы"
 
 
 def check_sent_persisted_before_crm() -> None:
@@ -355,7 +324,7 @@ def main() -> int:
     check_pick_recipient()
     check_recipients()
     check_letter()
-    check_verifier_precondition()
+    check_no_verifier_stage()
     check_sent_persisted_before_crm()
     print("test_outreach: OK — реестр атомарен, отвергнутые адреса не рассылаются, "
           "подпись и отписка дописываются кодом")

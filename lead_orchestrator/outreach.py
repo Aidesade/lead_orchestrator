@@ -7,15 +7,19 @@ r"""Outreach-пайплайн: сбор -> адрес ЛПР -> письмо с 
   1. Реестр отработанных   — outreach_registry: кому уже писали и по кому есть материалы
   2. Парсинг RusProfile    — название, сайт, телефоны, ИНН, руководитель, учредители
   3. One-pager по отрасли  — готовый файл из assets/onepagers либо генерация стадией Kimi/Claude
-  4. Верификатор ЦИТ РТ    — ПРЕКОНДИШЕН: email_verify --serve на хосте с PTR и SPF
   5. Ящик @tatar.ru        — ПРЕКОНДИШЕН: Outlook Desktop и аккаунт отправителя
-  6. Адрес ЛПР             — email_guess (гипотезы по схеме домена) + проверка без отправки
+  6. Адрес ЛПР             — email_guess: гипотезы по схеме домена, БЕЗ пробивки ящиков
   7. Письмо                — текст моделью, подпись кодом, отправка через Outlook
   8. Проверка прогона      — какая стадия по какой компании пропущена и почему
   9. Выгрузка в CRM        — crm_push: компания и факт письма уходят в раздел «Лиды»
 
-Стадии 4 и 5 — не шаги цикла, а прекондишены: проверяются ОДИН раз до первой компании
-и падают жёсткой ошибкой. Пайплайн, который отработал сбор и подбор адресов, а потом
+Нумерация историческая: стадия 4 (пробивка ящиков — верификатор ЦИТ РТ + облачный
+добор MyEmailVerifier) удалена 2026-08-18 — от проверки существования ящиков
+отказались. Неподтверждённая гипотеза и раньше уходила с копией на общую почту
+компании (build_recipients) — теперь это штатный путь для любого расчётного адреса.
+
+Стадия 5 — не шаг цикла, а прекондишен: проверяется ОДИН раз до первой компании
+и падает жёсткой ошибкой. Пайплайн, который отработал сбор и подбор адресов, а потом
 не смог отправить, потратил время и лимиты RusProfile впустую.
 
 Стадия 9 — наоборот, «мягкая»: она идёт ПОСЛЕ необратимой отправки, поэтому её сбой
@@ -53,7 +57,7 @@ except Exception:
 try:
     # Именно ВЫЗОВ, а не голый импорт: сам по себе модуль ничего не делает, и
     # прежний `import project_env` оставлял пайплайн без env/.env — секреты
-    # (EMAIL_VERIFIER_URL, EMAIL_MEV_*, OUTREACH_*) молча подменялись дефолтами.
+    # (OUTREACH_*, CRM_*) молча подменялись дефолтами.
     from project_env import load_project_env
     load_project_env()
 except Exception:
@@ -92,67 +96,6 @@ def _flag(name, default="1"):
 
 
 # ============================================================ ПРЕКОНДИШЕНЫ ====
-def check_verifier(required=True):
-    """Стадия 4: верификатор почты на сервере ЦИТ РТ.
-
-    Проверка ящиков идёт SMTP-диалогом до RCPT TO. Приёмная сторона смотрит на PTR
-    и SPF отправителя, поэтому с обычной рабочей машины почти всё возвращается как
-    «не смогли проверить» (это и показал verify_host_check). Отсюда требование
-    гонять пробу с хоста ЦИТ РТ: там PTR и SPF настроены.
-
-    На сервере: py email_verify.py --serve 8080
-    Локально:   set EMAIL_VERIFIER_URL=http://<хост>:8080"""
-    mev = _check_mev()
-    url = (os.environ.get("EMAIL_VERIFIER_URL") or "").strip()
-    if not url:
-        # Облачный добор — самостоятельный слой: если он поднят, проверять ящики
-        # есть чем и без верификатора ЦИТ РТ, просто не для всех компаний.
-        if required and not mev["alive"]:
-            raise SystemExit(
-                "[стадия 4] не задан EMAIL_VERIFIER_URL — проверять ящики неоткуда.\n"
-                "  На сервере ЦИТ РТ (там PTR и SPF): py email_verify.py --serve 8080\n"
-                "  Здесь: set EMAIL_VERIFIER_URL=http://<хост>:8080\n"
-                "  Пропустить осознанно: --no-verify-server (адреса пойдут как гипотезы)")
-        if not mev["alive"]:
-            log("[стадия 4] верификатор не настроен — адреса пойдут как непроверенные гипотезы")
-        return {"url": "", "alive": False, "mev": mev}
-
-    import email_guess as EG
-    # Контрольный адрес на домене, который заведомо принимает почту: нам важен не
-    # его вердикт, а сам факт, что сервис отвечает. «Ящика нет» — тоже ответ.
-    probe = EG.external_verify("postmaster@yandex.ru", url=url)
-    unreachable = (probe.get("verdict") == "unknown"
-                   and "недоступен" in (probe.get("note") or ""))
-    if unreachable:
-        raise SystemExit(f"[стадия 4] верификатор {url} не отвечает: {probe.get('note')}")
-    log(f"[стадия 4] верификатор: {url} — отвечает")
-    return {"url": url, "alive": True, "mev": mev}
-
-
-def _check_mev():
-    """Облачный добор MyEmailVerifier: остаток кредитов и блок-лист — ДО первой компании.
-
-    Не жёсткая ошибка: слой опциональный, и прогон без него просто отдаёт больше
-    непроверенных гипотез. Но остаток квоты надо видеть заранее — на 100 бесплатных
-    кредитов в сутки прогон на 200 компаний не влезает, и узнать об этом на сотой
-    компании хуже, чем до старта."""
-    import email_guess as EG
-
-    if not EG.mev_enabled():
-        return {"alive": False, "credits": None}
-    left, why = EG.mev_credits()
-    if left is None:
-        log(f"[стадия 4] MyEmailVerifier включён, но баланс не получен: {why} — "
-            f"добор работать не будет")
-        return {"alive": False, "credits": None}
-    policy = EG.mev_policy()
-    log(f"[стадия 4] MyEmailVerifier: {left} кредитов, "
-        f"суточный лимит {policy['daily_limit']}; не выпускаются отрасли "
-        f"{', '.join(policy['deny_industries'])} "
-        f"и домены {', '.join(policy['deny_domains'])}")
-    return {"alive": True, "credits": left}
-
-
 def check_mailbox(required=True):
     """Стадия 5: ящик отправителя (Outlook или SMTP — по OUTREACH_TRANSPORT)."""
     error_type = getattr(MAIL, "OutlookError", None) or getattr(MAIL, "YandexSendError")
@@ -302,9 +245,14 @@ def pick_recipient(guess, lead):
 
 
 async def stage_email(lead, idx, dry_run=False, use_lead_email=False):
-    """Стадия 6: адрес ЛПР — гипотезы по схеме домена + проверка без отправки письма.
+    """Стадия 6: адрес ЛПР — гипотезы по схеме домена, БЕЗ пробивки ящиков.
 
-    В dry-run ни DNS, ни SMTP, ни обход сайта не выполняются: прогон проверяет
+    SMTP-проба и облачный добор сюда больше не входят (отказ от пробивки,
+    2026-08-18): расчётный адрес честно помечается неподтверждённым и уходит
+    с копией на общую почту компании. MX-проверка домена остаётся — это DNS,
+    а не пробивка, и она отсекает домены, которые почту не принимают вовсе.
+
+    В dry-run ни DNS, ни обход сайта не выполняются: прогон проверяет
     цепочку стадий, а не доступность чужих серверов (и ничего им не стоит).
 
     ``use_lead_email`` — брать адрес прямо из выгрузки и не строить гипотез вовсе.
@@ -327,7 +275,7 @@ async def stage_email(lead, idx, dry_run=False, use_lead_email=False):
     online = not dry_run
     guess = await asyncio.to_thread(
         EG.guess_for_company, lead,
-        check_mx=online, smtp=online, per_person=3,
+        check_mx=online, smtp=False, per_person=3,
         use_site=online and _flag("EMAIL_GUESS_SITE"),
         log=lambda *a: None)
     picked = pick_recipient(guess, lead)
@@ -365,8 +313,8 @@ def check_recipient(address, lead):
       * домен принимает почту (MX) — иначе гарантированный отбойник, а отбойники
         с нового ящика портят его репутацию сильнее, чем польза от попытки.
 
-    Существование самого ящика тут не проверяется: для этого нужна SMTP-сессия
-    с хоста с корректными PTR/SPF, и это отдельная стадия (email_verify)."""
+    Существование самого ящика не проверяется нигде: от пробивки ящиков пайплайн
+    отказался (2026-08-18) — страховкой служит копия на общую почту компании."""
     import checko_enrich as CE
     import email_verify as EV
 
@@ -566,7 +514,6 @@ async def run(args):
     log(f"[стадия 1] к обработке: {len(leads)}")
 
     if not args.dry_run:
-        check_verifier(required=not args.no_verify_server)
         check_mailbox(required=True)
     if args.send:
         log(f"⚠️ РЕАЛЬНАЯ ОТПРАВКА включена: до {len(leads)} писем, пауза {args.pace:g} с")
@@ -618,8 +565,6 @@ def main():
     ap.add_argument("--use-lead-email", dest="use_lead_email", action="store_true",
                     help="брать адрес прямо из выгрузки, не строить гипотез: почта уже "
                          "собрана из карточек ЕГРЮЛ, а подбор предложит расчётный адрес")
-    ap.add_argument("--no-verify-server", dest="no_verify_server", action="store_true",
-                    help="работать без верификатора ЦИТ РТ (адреса — непроверенные гипотезы)")
     ap.add_argument("--no-crm", dest="no_crm", action="store_true",
                     help="стадия 9: не выгружать лиды в CRM (по умолчанию выгружаем, если настроена)")
     ap.add_argument("--check", action="store_true", help="стадия 8: только отчёт по реестру")

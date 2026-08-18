@@ -8,9 +8,8 @@ rem        run_outreach.cmd "D:\leads\leads_mining.json" --send --limit 5
 rem
 rem  DRAFTS BY DEFAULT. Real sending needs an explicit --send, and the menu
 rem  asks for a typed confirmation before it.
-rem  Mailbox verification (stage 4) runs on the CIT RT host where PTR and SPF
-rem  are configured: start "python email_verify.py --serve 8080" there and set
-rem  EMAIL_VERIFIER_URL here.
+rem  Mailbox existence probing (old stage 4) was removed 2026-08-18: guessed
+rem  addresses go out unverified with a CC to the company's general mailbox.
 rem  NOTE: keep this file ASCII + CRLF - cmd.exe garbles UTF-8/LF batch files.
 rem ==========================================================================
 chcp 65001 >nul
@@ -45,7 +44,7 @@ echo       (changes nothing, no network, no mail)
 echo   [2] Collect companies from RusProfile -^> DRAFT letters
 echo   [3] Use a ready leads JSON            -^> DRAFT letters
 echo   [4] SEND letters for real             (asks to type SEND)
-echo   [5] Preconditions check: Outlook mailbox and verifier
+echo   [5] Precondition check: Outlook sender mailbox
 echo   [0] Exit
 echo.
 set "pick="
@@ -157,12 +156,6 @@ if errorlevel 1 (
 exit /b 0
 
 :warnings
-if not defined EMAIL_VERIFIER_URL (
-    echo [WARN] EMAIL_VERIFIER_URL is not set - mailbox existence cannot be proven.
-    echo        On the CIT RT host: python email_verify.py --serve 8080
-    echo        Here:               set EMAIL_VERIFIER_URL=http://HOST:8080
-    echo        Or pass --no-verify-server to accept unverified guesses.
-)
 if not exist "%RUSPROFILE_COOKIES_FILE%" (
     echo [WARN] No RusProfile cookie file at "%RUSPROFILE_COOKIES_FILE%".
     echo        Fresh collection will fail; a ready leads JSON still works.
