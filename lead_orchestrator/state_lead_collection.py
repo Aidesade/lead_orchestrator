@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Bounded-добор новых госкомпаний поверх CRM, RusProfile и ЕГРЮЛ."""
+"""Bounded-добор новых госкомпаний поверх CRM, RusProfile и ЕГРЮЛ.
+
+Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025, штат 240–260,
+прямая/косвенная госдоля >25% (ЕГРЮЛ + Росимущество) и юрадрес в регионе
+`STATE_LEAD_REGION` (дефолт — Татарстан). Регион отклоняется дёшево по выдаче
+RusProfile, а ПРИНИМАЕТСЯ только по субъекту РФ из официальной выписки ЕГРЮЛ:
+выписка без распознанного адреса — отказ (fail-closed), как и всё остальное здесь."""
 from __future__ import annotations
 
 import json
@@ -30,9 +36,10 @@ def load_local_registry_strict(path=None, log=SR.log):
 
 def _with_session(session, requested_count, crm_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
-                  ownership_error_limit, card_error_limit):
+                  ownership_error_limit, card_error_limit, region_query):
     from rusprofile_playwright import RusProfileCardSourceError, RusProfileDeadlineReached
-    from state_ownership import StateOwnershipDeadline, StateOwnershipSourceError
+    from state_ownership import (StateOwnershipDeadline, StateOwnershipSourceError,
+                                 region_matches)
 
     if time.monotonic() >= deadline:
         raise SR.StateOwnershipUnavailable("общий лимит строгого добора истёк до RusProfile")
@@ -56,6 +63,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         "revenue": 0, "revenue_year": 0,
         "staff": 0, "card_error": 0, "state_not_over_25": 0,
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
+        "region_source": 0, "region_egrul": 0, "region_unknown": 0,
         "time_limit": 0,
     }
     selected, seen = [], set()
@@ -87,6 +95,15 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             stats["invalid_name"] += 1
             continue
         item["name"] = name
+
+        # Дешёвый регион-фильтр по выдаче: чужой регион отклоняется ДО карточки
+        # и ЕГРЮЛ. Пустой регион выдачи НЕ отклоняется — судьбу решит строгая
+        # проверка юрадреса по выписке ниже.
+        if region_query:
+            source_region = str(item.get("region") or item.get("region_name") or "").strip()
+            if source_region and not region_matches(source_region, region_query):
+                stats["region_source"] += 1
+                continue
 
         industry = SR._industry_for_okved(item.get("main_okved_id"))
         lead = SR.item_to_lead(item, SR.INDUSTRY[industry], industry)
@@ -166,6 +183,18 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             stats["state_not_over_25" if result.complete else "state_unknown"] += 1
             continue
 
+        # Строгий регион-гейт: принимается только юрадрес нужного субъекта РФ
+        # из той же выписки ЕГРЮЛ, что доказала госдолю. Нет региона в выписке —
+        # отказ: «не извлекли» не значит «Татарстан».
+        if region_query:
+            egrul_region = (result.region or "").strip()
+            if not egrul_region:
+                stats["region_unknown"] += 1
+                continue
+            if not region_matches(egrul_region, region_query):
+                stats["region_egrul"] += 1
+                continue
+
         if time.monotonic() >= deadline:
             stats["time_limit"] = 1
             break
@@ -190,6 +219,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             "_state_ownership_urls": list(result.source_urls),
             "_state_ownership_trace": list(result.trace),
             "_state_ownership_reasons": list(result.reasons),
+            "_egrul_region": (result.region or "").strip(),
         })
         selected.append(lead)
         stats["accepted"] = len(selected)
@@ -204,12 +234,19 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         f"CRM-дублей {stats['crm_duplicate']} | локальных дублей {stats['local_duplicate']} | "
         f"не 2025 {stats['revenue_year']} | "
         f"численность {stats['staff']} | госдоля <=25 {stats['state_not_over_25']} | "
-        f"ownership unknown {stats['state_unknown']}")
+        f"ownership unknown {stats['state_unknown']} | "
+        f"вне региона {stats['region_source'] + stats['region_egrul']} | "
+        f"регион не подтверждён {stats['region_unknown']}")
     if len(selected) != requested_count:
         if out_path:
             SR._save(selected, out_path)
         raise SR.StateLeadExhausted(requested_count, len(selected), stats)
     return selected
+
+
+def lead_region_query():
+    """Требуемый регион юрадреса госкомпании; "" — фильтр выключен явно."""
+    return str(os.environ.get("STATE_LEAD_REGION", "Татарстан") or "").strip()
 
 
 def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
@@ -218,8 +255,12 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         max_pages=None, max_candidates=None, max_seconds=None,
                         deadline=None,
                         out_path=None, log=SR.log,
-                        ownership_error_limit=3, card_error_limit=3):
-    """Найти ровно N новых компаний: CRM→RusProfile→2025/240..260→госдоля >25%."""
+                        ownership_error_limit=3, card_error_limit=3,
+                        region=None):
+    """Ровно N новых компаний: CRM→RusProfile→2025/240..260→госдоля >25%→юрадрес региона.
+
+    ``region`` (дефолт — ``STATE_LEAD_REGION`` = Татарстан) проверяется по субъекту РФ
+    из выписки ЕГРЮЛ; пустая строка осознанно выключает фильтр (вся РФ)."""
     try:
         requested_count = int(requested_count)
     except (TypeError, ValueError) as exc:
@@ -249,6 +290,8 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
         deadline = float(deadline)
     ownership_error_limit = max(1, int(ownership_error_limit))
     card_error_limit = max(1, int(card_error_limit))
+    region = lead_region_query() if region is None else str(region or "").strip()
+    log(f"[госкомпании] регион юрадреса (по выписке ЕГРЮЛ): {region or 'любой'}")
 
     # Прекондишен до Chrome: сбой CRM не расходует сессию RusProfile.
     if crm_index is None:
@@ -265,6 +308,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     args = (
         requested_count, crm_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
+        region,
     )
     if session is not None:
         if not hasattr(session, "contacts_by_url"):

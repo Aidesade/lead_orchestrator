@@ -47,7 +47,7 @@ def facts(year=2025, staff=250, revenue="2,5 млрд руб."):
     }
 
 
-def ownership(verified, share=0, complete=True, reason=()):
+def ownership(verified, share=0, complete=True, reason=(), region="РЕСПУБЛИКА ТАТАРСТАН"):
     share = Decimal(str(share))
     return SO.OwnershipResult(
         verified=verified,
@@ -58,6 +58,7 @@ def ownership(verified, share=0, complete=True, reason=()):
         source_urls=("https://egrul.nalog.ru/proof",),
         trace=(f"доказанная доля {share}%",),
         reasons=tuple(reason),
+        region=region,
     )
 
 
@@ -424,6 +425,57 @@ def check_invalid_target():
     print("  ✓ requested_count обязан быть положительным")
 
 
+def check_region_filter():
+    """Госкомпания обязана быть из Татарстана: чужой регион в выдаче отсекается
+    до карточки, а принятие требует юрадреса из выписки ЕГРЮЛ (fail-closed)."""
+    inns = [valid_test_inn(i) for i in range(70, 75)]
+    moscow = item(inns[0], "ГУП Московская")
+    moscow["region_name"] = "г. Москва"
+    blank_source = item(inns[1], "ГУП Без региона в выдаче")
+    blank_source["region_name"] = ""
+    moved = item(inns[2], "ГУП Переехавшая")           # выдача врёт, выписка — нет
+    no_address = item(inns[3], "ГУП Без адреса в выписке")
+    kazan = item(inns[4], "ГУП Казанская")
+    rows = [moscow, blank_source, moved, no_address, kazan]
+    verifier_rows = {
+        inns[1]: ownership(True, 100),
+        inns[2]: ownership(True, 100, region="ГОРОД МОСКВА"),
+        inns[3]: ownership(True, 100, region=""),
+        inns[4]: ownership(True, 100),
+    }
+
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=FakeVerifier(verifier_rows), log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == [inns[1], inns[4]], leads
+    assert moscow["url"] not in session.fact_calls, "чужой регион выдачи дошёл до карточки"
+    assert all(lead["_egrul_region"] == "РЕСПУБЛИКА ТАТАРСТАН" for lead in leads)
+
+    # Недобор из-за региона — обычное исчерпание с внятной статистикой.
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    try:
+        SR.harvest_state_owned(
+            3, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            ownership_verifier=FakeVerifier(verifier_rows), log=lambda _line: None)
+    except SR.StateLeadExhausted as exc:
+        assert exc.found == 2 and exc.stats["region_source"] == 1, exc.stats
+        assert exc.stats["region_egrul"] == 1 and exc.stats["region_unknown"] == 1, exc.stats
+    else:
+        raise AssertionError("недобор по региону принят за готовый результат")
+
+    # region="" — осознанное отключение фильтра: регион не проверяется вовсе.
+    all_rows = dict(verifier_rows)
+    all_rows[inns[0]] = ownership(True, 100, region="ГОРОД МОСКВА")
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        5, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=FakeVerifier(all_rows), region="",
+        log=lambda _line: None)
+    assert len(leads) == 5, [lead["_inn"] for lead in leads]
+    print("  ✓ регион: дёшево по выдаче, строго по выписке ЕГРЮЛ, выключается явно")
+
+
 def check_corrupt_local_registry_is_hard():
     with tempfile.TemporaryDirectory() as folder:
         path = pathlib.Path(folder) / "registry.json"
@@ -451,6 +503,7 @@ def main():
     check_deadline_after_contacts_is_hard()
     check_deadline_inside_search_is_not_exhaustion()
     check_invalid_target()
+    check_region_filter()
     check_corrupt_local_registry_is_hard()
 
     print("test_state_owned_collection: OK")

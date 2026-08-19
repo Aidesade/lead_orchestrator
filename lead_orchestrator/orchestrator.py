@@ -692,13 +692,14 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
 
 
 def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True):
-    """Строгая Фаза 1: ровно N новых компаний с подтверждённой госдолей >25%."""
+    """Строгая Фаза 1: ровно N новых компаний с госдолей >25% и юрадресом региона
+    (дефолт — Татарстан, тумблер STATE_LEAD_REGION)."""
     import source_rusprofile as RP
     import pipeline
     import rusprofile_session as RPS
     from crm_push import CRMIndexError, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
-    from state_lead_collection import load_local_registry_strict
+    from state_lead_collection import lead_region_query, load_local_registry_strict
     from state_ownership import OwnershipVerifier, RosimRegistry, StateOwnershipDeadline
 
     source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
@@ -739,9 +740,11 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
         local_registry = load_local_registry_strict(log=print)
     except RuntimeError as exc:
         raise SystemExit(f"локальный реестр: {exc}") from None
+    region_query = lead_region_query()
     print(
         f"[1/2] строгий добор {count} новых госкомпаний | CRM {crm_index.total} лидов | "
-        "выручка >=2 млрд ₽ за 2025 | штат 240–260 | прямая/косвенная госдоля >25%")
+        "выручка >=2 млрд ₽ за 2025 | штат 240–260 | прямая/косвенная госдоля >25% | "
+        f"юрадрес: {region_query or 'любой регион'}")
     from rusprofile_playwright import (
         RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
     )

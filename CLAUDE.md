@@ -140,6 +140,9 @@ RusProfile — в обоих режимах.
 ```
 # полная цепочка (сбор + ресёрч + 3 файла), ВСЯ отрасль (по умолчанию 200 компаний):
 py orchestrator.py --industries mining       # = py orchestrator.py mining (позиционно — только ключи INDUSTRY)
+# СТРОГИЙ добор госкомпаний, ровно N: выручка >=2 млрд ₽ за 2025, штат 240–260,
+# госдоля >25% (выписка ЕГРЮЛ + XLSX Росимущества), юрадрес — Республика Татарстан:
+py orchestrator.py --state-owned --count 5
 py orchestrator.py mining --count 10         # явно 10 ВСЕГО по всем отраслям
 py orchestrator.py mining,energy --per-industry 10   # 10 НА КАЖДУЮ отрасль (итог 20)
 # только ресёрч+материалы по готовому JSON лидов (ФАЗА 1 пишет их в D:\лиды\):
@@ -224,6 +227,9 @@ py test_crm_push.py              # ВЕТКА outreach, стадия 9: мапп
 py test_verify_xlsx.py           # добор по готовой .xlsx: зелёные не перепроверяются, ОПК не выпускается
 py test_source_ofdata.py         # формы /finances, включительный порог, ключ не в URL
 py test_source_girbo.py          # ГИР БО-источник: префиксный матч ОКВЭД, регион, год, предел offset
+py test_state_ownership.py       # госдоля: выписка ЕГРЮЛ, Росимущество, косвенные цепочки, регион юрадреса
+py test_state_owned_collection.py # строгий добор ровно N: дедуп CRM/реестра, гейты 2025/240–260/25%/Татарстан
+py test_state_owned_wiring.py    # CLI/NL-подключение госрежима: фикс. профиль нельзя ослабить
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
 py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
 py kimi_research_cli.py --selftest      # subprocess-мост URL-инструментов
@@ -270,6 +276,21 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
   Переиспользует `usable_okved`/`resolve_region`/`extract_company_contacts` из Checko.
 - **`checko`** (`source_checko.py`) — drop-in для `harvest()`: `/search`, выручка из ГИР БО,
   контакты `/company`.
+
+**Строгий режим госкомпаний (`--state-owned`)** — отдельная Фаза 1:
+`state_lead_collection.py` (добор ровно N) + `state_ownership.py` (доказательство госдоли).
+Профиль зашит кодом и НЕ ослабляется NL-контроллером: НОВЫЕ компании (дедуп по CRM ЦИТ РТ и
+локальному реестру), выручка ≥2 млрд ₽ за 2025 и штат 240–260 из карточки RusProfile,
+прямая+косвенная госдоля >25% по актуальной PDF-выписке ЕГРЮЛ (рекурсивный граф владения;
+для АО — XLSX Росимущества через `STATE_ROSIM_URL`, HTTPS + свежий Last-Modified) и
+**юрадрес в регионе `STATE_LEAD_REGION` (дефолт «Татарстан», добавлено 2026-08-19)**:
+чужой регион из выдачи RusProfile отсекается ДО карточки, а ПРИНИМАЕТСЯ только субъект РФ
+из той же выписки ЕГРЮЛ, что доказала долю («не извлекли адрес» = отказ, fail-closed;
+пустой `STATE_LEAD_REGION=` осознанно выключает фильтр). Системные сбои источников —
+жёсткая остановка (`StateOwnershipUnavailable`), недобор — `StateLeadExhausted` со
+статистикой причин. Тумблеры: `STATE_LEAD_MAX_SECONDS` (1200 — общий абсолютный deadline),
+`STATE_LEAD_MAX_PAGES`, `STATE_LEAD_MAX_CANDIDATES` (1000), `STATE_OWNERSHIP_CACHE_TTL_H` (24),
+`STATE_OWNERSHIP_MAX_DEPTH` (6), `STATE_ROSIM_MAX_AGE_DAYS` (45).
 
 Дальше: отбор → `D:\лиды\leads_<отрасли>.json` (`--out`; .xlsx из боевой ФАЗЫ 1 убран 2026-07-06)
 → при `ORQ_STORE=disk` ещё и дерево `<--base>/<отрасль>/<категория полноты контактов>/<компания>/`

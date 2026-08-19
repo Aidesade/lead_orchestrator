@@ -72,6 +72,7 @@ class Entity:
     source_date: str = ""
     source_sha256: str = ""
     source_artifact: str = ""
+    region: str = ""                      # субъект РФ юрадреса из выписки ("" = не извлечён)
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ class OwnershipResult:
     source_urls: tuple[str, ...]
     trace: tuple[str, ...]
     reasons: tuple[str, ...]
+    region: str = ""                      # субъект РФ юрадреса компании по выписке ЕГРЮЛ
 
 
 def _digits(value):
@@ -185,6 +187,37 @@ def _public_level(name):
             or re.search(r"\b(?:ОБЛАСТИ|КРАЯ|АВТОНОМНОГО ОКРУГА)\b", value)):
         return "regional"
     return "other"
+
+
+def region_matches(value, query):
+    """Регион/адрес из официального источника соответствует запросу.
+
+    Подстрочный матч без учёта регистра и Ё: запрос «Татарстан» находит и
+    «РЕСПУБЛИКА ТАТАРСТАН» из выписки, и «Республика Татарстан» из выдачи."""
+    def norm(text):
+        return unicodedata.normalize("NFKC", str(text or "")).upper().replace("Ё", "Е")
+    needle = norm(query).strip()
+    return bool(needle) and needle in norm(value)
+
+
+def _extract_region(flat):
+    """Субъект РФ юрадреса из плоского текста выписки; "" — не извлечён.
+
+    Два формата: структурные строки («Субъект Российской Федерации …») и
+    однострочный адрес. Обрезка на следующем нумерованном поле безопасна:
+    субъект стоит в начале адреса."""
+    match = re.search(
+        r"Субъект Российской Федерации\s+(.{2,80}?)(?=\s+\d+\s+[А-ЯЁA-Z]|\s+Сведения\b|\s*$)",
+        flat, re.I)
+    if match:
+        return _flat(match.group(1))
+    match = re.search(
+        r"(?:Место нахождения юридического лица|Адрес юридического лица)\s+"
+        r"(.{5,160}?)(?=\s+\d+\s+ГРН|\s+Сведения\b|\s*$)",
+        flat, re.I)
+    if match:
+        return _flat(match.group(1))
+    return ""
 
 
 def _entity_kind(name):
@@ -298,7 +331,8 @@ def parse_egrul_text(text, *, inn, source_url, source_date="",
         inn=_digits(inn), name=name, kind=kind, owners=tuple(owners),
         source_url=source_url, owners_complete=complete,
         structure_valid=structure_valid, source_date=source_date,
-        source_sha256=source_sha256, source_artifact=source_artifact)
+        source_sha256=source_sha256, source_artifact=source_artifact,
+        region=_extract_region(flat))
 
 
 def _egrul_pdf_text(pdf):
@@ -645,6 +679,7 @@ class OwnershipVerifier:
         self.max_depth = int(max_depth or os.environ.get(
             "STATE_OWNERSHIP_MAX_DEPTH", DEFAULT_MAX_DEPTH))
         self._memo = {}
+        self._region_memo = {}            # ИНН -> регион юрадреса из его выписки
 
     def _resolve(self, name, inn, path, depth, deadline=None):
         _remaining(deadline, 1.0)
@@ -659,6 +694,7 @@ class OwnershipVerifier:
             return self._memo[inn]
 
         entity = self.egrul.entity(inn, deadline=deadline)
+        self._region_memo[inn] = getattr(entity, "region", "") or ""
         urls = {entity.source_url}
         trace, reasons = [], []
         if entity.source_sha256:
@@ -785,4 +821,5 @@ class OwnershipVerifier:
             source_urls=urls,
             trace=trace,
             reasons=reasons,
+            region=self._region_memo.get(_digits(inn), ""),
         )

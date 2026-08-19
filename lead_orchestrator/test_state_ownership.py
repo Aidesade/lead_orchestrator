@@ -24,6 +24,16 @@ EGRUL_DIRECT = """Выписка из ЕГРЮЛ
 ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "ТЕСТ"
 2
 ГРН и дата внесения в ЕГРЮЛ записи
+Адрес юридического лица
+4
+Индекс
+420097
+5
+Субъект Российской Федерации
+РЕСПУБЛИКА ТАТАРСТАН
+6
+Город
+ГОРОД КАЗАНЬ
 Сведения об участниках / учредителях юридического лица
 10
 ГРН и дата внесения в ЕГРЮЛ сведений о
@@ -84,9 +94,10 @@ SAFI FOOD TRADING L.L.C
 """
 
 
-def entity(inn, name, owners=(), *, kind="llc"):
+def entity(inn, name, owners=(), *, kind="llc", region=""):
     return SO.Entity(inn=inn, name=name, kind=kind, owners=tuple(owners),
-                     source_url=f"https://egrul.nalog.ru/vyp-download/{inn}")
+                     source_url=f"https://egrul.nalog.ru/vyp-download/{inn}",
+                     region=region)
 
 
 def owner(name, share, inn="", kind="legal"):
@@ -127,14 +138,32 @@ def check_egrul_parser():
     assert foreign.owners[0].share == Decimal("100")
     print("  ✓ разбор текущих участников ЕГРЮЛ: государство, физлицо, иностранное юрлицо")
 
+    # Регион юрадреса: извлекается из выписки, отсутствие адреса не выдумывается.
+    assert parsed.region == "РЕСПУБЛИКА ТАТАРСТАН", parsed.region
+    assert foreign.region == "", foreign.region
+    single_line = SO.parse_egrul_text(
+        EGRUL_DIRECT.replace(
+            "Адрес юридического лица\n4\nИндекс\n420097\n5\n"
+            "Субъект Российской Федерации\nРЕСПУБЛИКА ТАТАРСТАН\n6\nГород\nГОРОД КАЗАНЬ",
+            "Адрес юридического лица\n420097, РЕСПУБЛИКА ТАТАРСТАН, "
+            "Г. КАЗАНЬ, УЛ. ПЕТЕРБУРГСКАЯ, Д. 52\n7\nГРН и дата внесения в ЕГРЮЛ записи"),
+        inn="1650000000", source_url="https://egrul.nalog.ru/x")
+    assert "ТАТАРСТАН" in single_line.region, single_line.region
+    assert SO.region_matches("РЕСПУБЛИКА ТАТАРСТАН", "Татарстан")
+    assert SO.region_matches("Республика Татарстан", "татарстан")
+    assert not SO.region_matches("ГОРОД МОСКВА", "Татарстан")
+    assert not SO.region_matches("РЕСПУБЛИКА ТАТАРСТАН", "")
+    print("  ✓ регион юрадреса читается из выписки, матч без учёта регистра")
+
 
 def check_direct_and_threshold():
     direct = entity("1", "ООО Тест", [
         owner("Российская Федерация", 30, kind="public"),
         owner("Иванов", 70, inn="123456789012", kind="person"),
-    ])
+    ], region="РЕСПУБЛИКА ТАТАРСТАН")
     result = SO.OwnershipVerifier(FakeEgrul({"1": direct}), FakeRosim()).verify("ООО Тест", "1")
     assert result.verified and result.share == Decimal("30") and result.direct_share == Decimal("30")
+    assert result.region == "РЕСПУБЛИКА ТАТАРСТАН", "verify обязан отдавать регион юрадреса"
 
     exact = entity("2", "ООО Ровно", [owner("Республика Татарстан", 25, kind="public")])
     result = SO.OwnershipVerifier(FakeEgrul({"2": exact}), FakeRosim()).verify("ООО Ровно", "2")
