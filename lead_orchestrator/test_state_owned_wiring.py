@@ -68,6 +68,15 @@ def check_crm_batch_after_phase_two():
     print("  ✓ CRM create-only batch выполняется только после успешной Фазы 2")
 
 
+def check_collect_only_stops_before_phase_two():
+    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    assert "--collect-only" in source
+    assert "работает только со сбором" in source
+    # Выход collect-only стоит ДО отбора компаний в Фазу 2 («ресёрчим ВСЕХ»).
+    assert source.index("[итог] collect-only:") < source.index("ресёрчим ВСЕХ")
+    print("  ✓ --collect-only останавливает прогон после ФАЗЫ 1")
+
+
 def check_one_deadline_wraps_all_preconditions():
     source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
     collector = source[source.index("def _collect_state_owned"):source.index("def _collect(")]
@@ -85,6 +94,7 @@ def main():
     check_conflicts()
     check_fixed_profile_not_overridden()
     check_crm_batch_after_phase_two()
+    check_collect_only_stops_before_phase_two()
     check_one_deadline_wraps_all_preconditions()
     print("test_state_owned_wiring: OK")
     return 0

@@ -143,6 +143,7 @@ py orchestrator.py --industries mining       # = py orchestrator.py mining (по
 # СТРОГИЙ добор госкомпаний, ровно N: выручка >=2 млрд ₽ за 2025,
 # госдоля >=25% (выписка ЕГРЮЛ + XLSX Росимущества), юрадрес — Республика Татарстан:
 py orchestrator.py --state-owned --count 5
+py orchestrator.py --state-owned --count 50 --collect-only   # только сбор в JSON, без ФАЗЫ 2
 py orchestrator.py mining --count 10         # явно 10 ВСЕГО по всем отраслям
 py orchestrator.py mining,energy --per-industry 10   # 10 НА КАЖДУЮ отрасль (итог 20)
 # только ресёрч+материалы по готовому JSON лидов (ФАЗА 1 пишет их в D:\лиды\):

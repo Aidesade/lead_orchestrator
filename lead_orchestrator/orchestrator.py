@@ -1310,6 +1310,8 @@ async def main():
                          "выручка >=2 млрд за 2025, госдоля >=25%%, юрадрес Татарстана")
     ap.add_argument("--count", type=int, default=200,
                     help="сколько лидов собрать ВСЕГО (с --industries или --state-owned)")
+    ap.add_argument("--collect-only", dest="collect_only", action="store_true",
+                    help="остановиться после ФАЗЫ 1: лиды сохраняются в JSON, ресёрч не запускается")
     ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,
                     help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
@@ -1412,6 +1414,8 @@ async def main():
                 + ", ".join(conflicts))
         if not 1 <= a.count <= 200:
             raise SystemExit("--state-owned: --count должен быть от 1 до 200")
+    if a.collect_only and not (a.state_owned or a.industries):
+        raise SystemExit("--collect-only работает только со сбором: --industries или --state-owned")
     # «N на отрасль» перекрывает --count: итог = N × число валидных отраслей
     if a.industries and a.per_industry:
         import source_rusprofile as RP
@@ -1456,6 +1460,10 @@ async def main():
     if a.state_owned and len(leads) != collected_count:
         raise SystemExit(
             f"нарушен постконтракт строгого добора после загрузки: {len(leads)}/{collected_count}")
+    if a.collect_only:
+        print(f"[итог] collect-only: {len(leads)} лидов сохранено в {json_out}; "
+              "ФАЗА 2 не запускалась")
+        return
     dup_names = {n for n, c in collections.Counter(DO._safe(l.get("name")) for l in leads).items() if c > 1}
     sel = leads          # ресёрчим ВСЕХ, кого собрал первый агент (его --count, по умолч. 200)
     if not sel:
