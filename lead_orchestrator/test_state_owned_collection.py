@@ -154,6 +154,8 @@ def check_exact_n_and_order():
     assert search_kwargs["max_pages"] == 7
     assert "staff_from" not in search_kwargs and "staff_to" not in search_kwargs, \
         "фильтр по штату удалён 2026-08-19 и не должен возвращаться в поиск"
+    assert search_kwargs["region_codes"] == ["16"], \
+        "серверный фильтр региона (код 16) обязан уходить в advanced-search"
     assert isinstance(search_kwargs["deadline"], float)
     assert rows[0]["url"] not in session.fact_calls, "CRM-дубликат дошёл до карточки"
     assert inns[1] not in {inn for _, inn in verifier.calls}, "не-2025 дошёл до ownership"
@@ -473,6 +475,8 @@ def check_region_filter():
         ownership_verifier=FakeVerifier(all_rows), region="",
         log=lambda _line: None)
     assert len(leads) == 5, [lead["_inn"] for lead in leads]
+    assert session.search_kwargs[2]["region_codes"] is None, \
+        "region=\"\" обязан выключать и серверный фильтр выдачи"
     print("  ✓ регион: дёшево по выдаче, строго по выписке ЕГРЮЛ, выключается явно")
 
 

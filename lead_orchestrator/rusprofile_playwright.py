@@ -409,8 +409,14 @@ class RusProfilePlaywrightSession:
             f"стр.{body.get('page')}: RusProfile advanced-search недоступен после ретрая: {last}")
 
     def search(self, okved, revenue_from, max_pages=MAX_SEARCH_PAGES, pause=0.35,
-               log=log, staff_from=None, staff_to=None, deadline=None):
-        """Advanced-search: ОКВЭД, выручка и опциональная численность."""
+               log=log, staff_from=None, staff_to=None, deadline=None,
+               region_codes=None):
+        """Advanced-search: ОКВЭД, выручка, опциональные численность и регион.
+
+        ``region_codes`` — СЕРВЕРНЫЙ фильтр по кодам субъектов РФ (Татарстан — 16):
+        payload-ключ ``region`` принимает список строк-кодов (проверено вживую
+        2026-08-19: 21235 компаний по РФ -> 660 по коду 16). Формат-строка вместо
+        списка даёт «Некорректные входные параметры»."""
         if deadline is not None and time.monotonic() >= float(deadline):
             raise RusProfileDeadlineReached(
                 "лимит времени истёк до открытия advanced-search")
@@ -435,6 +441,8 @@ class RusProfilePlaywrightSession:
         if (staff_from is not None and staff_to is not None
                 and int(staff_from) > int(staff_to)):
             raise ValueError("staff_from не может быть больше staff_to")
+        if region_codes:
+            base["region"] = [str(code).strip() for code in region_codes if str(code).strip()]
         out = []
         page_count = max(1, min(int(max_pages), MAX_SEARCH_PAGES))
         total = available = None

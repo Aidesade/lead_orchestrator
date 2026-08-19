@@ -36,7 +36,7 @@ def load_local_registry_strict(path=None, log=SR.log):
 
 def _with_session(session, requested_count, crm_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
-                  ownership_error_limit, card_error_limit, region_query):
+                  ownership_error_limit, card_error_limit, region_query, region_code):
     from rusprofile_playwright import RusProfileCardSourceError, RusProfileDeadlineReached
     from state_ownership import (StateOwnershipDeadline, StateOwnershipSourceError,
                                  region_matches)
@@ -46,7 +46,11 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
     min_revenue = 2_000_000_000
     revenue_year = 2025
     # Фильтр по штату (240–260) удалён 2026-08-19: критерий устарел.
-    items = session.search([], min_revenue, max_pages=max_pages, deadline=deadline)
+    # Серверный фильтр региона критичен для воронки: без него выдача — топ РФ по
+    # выручке, и Татарстана в первых 1000 строк единицы (боевой прогон: 24/1000).
+    items = session.search(
+        [], min_revenue, max_pages=max_pages, deadline=deadline,
+        region_codes=[region_code] if (region_query and region_code) else None)
     if time.monotonic() >= deadline:
         raise RusProfileDeadlineReached(
             "общий лимит строгого добора истёк внутри поиска RusProfile")
@@ -244,6 +248,14 @@ def lead_region_query():
     return str(os.environ.get("STATE_LEAD_REGION", "Татарстан") or "").strip()
 
 
+def lead_region_code():
+    """Код субъекта РФ для СЕРВЕРНОГО фильтра RusProfile (Татарстан — 16).
+
+    Пустой ``STATE_LEAD_REGION_CODE=`` отключает только серверный фильтр:
+    строгие гейты по выдаче и выписке ЕГРЮЛ работают независимо от него."""
+    return str(os.environ.get("STATE_LEAD_REGION_CODE", "16") or "").strip()
+
+
 def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         session=None, crm_index=None, local_registry=None,
                         ownership_verifier=None,
@@ -286,7 +298,10 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     ownership_error_limit = max(1, int(ownership_error_limit))
     card_error_limit = max(1, int(card_error_limit))
     region = lead_region_query() if region is None else str(region or "").strip()
-    log(f"[госкомпании] регион юрадреса (по выписке ЕГРЮЛ): {region or 'любой'}")
+    region_code = lead_region_code()
+    log(f"[госкомпании] регион юрадреса (по выписке ЕГРЮЛ): {region or 'любой'}"
+        + (f" | серверный фильтр выдачи: код {region_code}"
+           if region and region_code else ""))
 
     # Прекондишен до Chrome: сбой CRM не расходует сессию RusProfile.
     if crm_index is None:
@@ -303,7 +318,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     args = (
         requested_count, crm_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
-        region,
+        region, region_code,
     )
     if session is not None:
         if not hasattr(session, "contacts_by_url"):
