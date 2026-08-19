@@ -692,7 +692,7 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
 
 
 def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True):
-    """Строгая Фаза 1: ровно N новых компаний с госдолей >25% и юрадресом региона
+    """Строгая Фаза 1: ровно N новых компаний с госдолей ≥25% и юрадресом региона
     (дефолт — Татарстан, тумблер STATE_LEAD_REGION)."""
     import source_rusprofile as RP
     import pipeline
@@ -743,7 +743,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     region_query = lead_region_query()
     print(
         f"[1/2] строгий добор {count} новых госкомпаний | CRM {crm_index.total} лидов | "
-        "выручка >=2 млрд ₽ за 2025 | штат 240–260 | прямая/косвенная госдоля >25% | "
+        "выручка >=2 млрд ₽ за 2025 | прямая/косвенная госдоля >=25% | "
         f"юрадрес: {region_query or 'любой регион'}")
     from rusprofile_playwright import (
         RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
@@ -1307,7 +1307,7 @@ async def main():
                     help="ЗАПУСТИТЬ СБОР: отрасли через запятую (mining,construction,energy,...)")
     ap.add_argument("--state-owned", dest="state_owned", action="store_true",
                     help="строгий добор ровно --count НОВЫХ госкомпаний: CRM-дедуп, "
-                         "выручка >=2 млрд за 2025, штат 240–260, госдоля >25%%")
+                         "выручка >=2 млрд за 2025, госдоля >=25%%, юрадрес Татарстана")
     ap.add_argument("--count", type=int, default=200,
                     help="сколько лидов собрать ВСЕГО (с --industries или --state-owned)")
     ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,

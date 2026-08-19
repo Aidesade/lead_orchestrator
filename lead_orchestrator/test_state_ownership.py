@@ -167,8 +167,13 @@ def check_direct_and_threshold():
 
     exact = entity("2", "ООО Ровно", [owner("Республика Татарстан", 25, kind="public")])
     result = SO.OwnershipVerifier(FakeEgrul({"2": exact}), FakeRosim()).verify("ООО Ровно", "2")
-    assert not result.verified and result.complete and result.share == Decimal("25")
-    print("  ✓ прямое участие и строгий порог >25% (ровно 25% не проходит)")
+    assert result.verified and result.complete and result.share == Decimal("25")
+
+    below = entity("3", "ООО Чуть ниже", [owner("Республика Татарстан", "24.9", kind="public")])
+    result = SO.OwnershipVerifier(
+        FakeEgrul({"3": below}), FakeRosim()).verify("ООО Чуть ниже", "3")
+    assert not result.verified and result.complete and result.share == Decimal("24.9")
+    print("  ✓ прямое участие: порог включительный — ровно 25% проходит, 24.9% нет")
 
 
 def check_indirect_math():

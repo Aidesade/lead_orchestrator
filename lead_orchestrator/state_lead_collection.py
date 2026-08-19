@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Bounded-добор новых госкомпаний поверх CRM, RusProfile и ЕГРЮЛ.
 
-Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025, штат 240–260,
-прямая/косвенная госдоля >25% (ЕГРЮЛ + Росимущество) и юрадрес в регионе
+Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025,
+прямая/косвенная госдоля ≥25% (ЕГРЮЛ + Росимущество) и юрадрес в регионе
 `STATE_LEAD_REGION` (дефолт — Татарстан). Регион отклоняется дёшево по выдаче
 RusProfile, а ПРИНИМАЕТСЯ только по субъекту РФ из официальной выписки ЕГРЮЛ:
 выписка без распознанного адреса — отказ (fail-closed), как и всё остальное здесь."""
@@ -44,10 +44,9 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
     if time.monotonic() >= deadline:
         raise SR.StateOwnershipUnavailable("общий лимит строгого добора истёк до RusProfile")
     min_revenue = 2_000_000_000
-    staff_from, staff_to, revenue_year = 240, 260, 2025
-    items = session.search(
-        [], min_revenue, max_pages=max_pages,
-        staff_from=staff_from, staff_to=staff_to, deadline=deadline)
+    revenue_year = 2025
+    # Фильтр по штату (240–260) удалён 2026-08-19: критерий устарел.
+    items = session.search([], min_revenue, max_pages=max_pages, deadline=deadline)
     if time.monotonic() >= deadline:
         raise RusProfileDeadlineReached(
             "общий лимит строгого добора истёк внутри поиска RusProfile")
@@ -61,7 +60,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         "run_duplicate": 0,
         "invalid_inn": 0, "invalid_name": 0, "inactive": 0,
         "revenue": 0, "revenue_year": 0,
-        "staff": 0, "card_error": 0, "state_not_over_25": 0,
+        "card_error": 0, "state_below_25": 0,
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
         "region_source": 0, "region_egrul": 0, "region_unknown": 0,
         "time_limit": 0,
@@ -159,10 +158,6 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             continue
         # Значение и год теперь принадлежат одному блоку основной карточки.
         lead["_revenue"] = card_revenue
-        staff = SR.integer_value(lead.get("_staff_count"))
-        if staff is None or not staff_from <= staff <= staff_to:
-            stats["staff"] += 1
-            continue
 
         try:
             result = ownership_verifier.verify(
@@ -180,7 +175,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             continue
         consecutive_source_errors = 0
         if not result.verified:
-            stats["state_not_over_25" if result.complete else "state_unknown"] += 1
+            stats["state_below_25" if result.complete else "state_unknown"] += 1
             continue
 
         # Строгий регион-гейт: принимается только юрадрес нужного субъекта РФ
@@ -233,7 +228,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         f"[госкомпании] принято {len(selected)}/{requested_count} | "
         f"CRM-дублей {stats['crm_duplicate']} | локальных дублей {stats['local_duplicate']} | "
         f"не 2025 {stats['revenue_year']} | "
-        f"численность {stats['staff']} | госдоля <=25 {stats['state_not_over_25']} | "
+        f"госдоля <25 {stats['state_below_25']} | "
         f"ownership unknown {stats['state_unknown']} | "
         f"вне региона {stats['region_source'] + stats['region_egrul']} | "
         f"регион не подтверждён {stats['region_unknown']}")
@@ -257,7 +252,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         out_path=None, log=SR.log,
                         ownership_error_limit=3, card_error_limit=3,
                         region=None):
-    """Ровно N новых компаний: CRM→RusProfile→2025/240..260→госдоля >25%→юрадрес региона.
+    """Ровно N новых компаний: CRM→RusProfile→2025→госдоля ≥25%→юрадрес региона.
 
     ``region`` (дефолт — ``STATE_LEAD_REGION`` = Татарстан) проверяется по субъекту РФ
     из выписки ЕГРЮЛ; пустая строка осознанно выключает фильтр (вся РФ)."""

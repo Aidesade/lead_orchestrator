@@ -124,17 +124,17 @@ def check_exact_n_and_order():
         item(inns[1], "ООО Старая выручка"),
         item(inns[2], "ООО Частная"),
         item(inns[3], "ООО Гос 1"),
-        item(inns[4], "ООО Мало сотрудников"),
+        item(inns[4], "ООО Доля 24.9"),
         item(inns[5], "ООО Гос 2"),
         item(inns[6], "ООО Лишняя"),
     ]
     metrics = {row["url"]: facts() for row in rows}
     metrics[rows[1]["url"]] = facts(year=2024)
-    metrics[rows[4]["url"]] = facts(staff=239)
     session = FakeSession(rows, metrics)
     verifier = FakeVerifier({
         inns[2]: ownership(False, 0),
         inns[3]: ownership(True, 30),
+        inns[4]: ownership(False, "24.9"),
         inns[5]: ownership(True, 40),
         inns[6]: ownership(True, 50),
     })
@@ -152,19 +152,19 @@ def check_exact_n_and_order():
     search_okved, search_revenue, search_kwargs = session.search_kwargs
     assert search_okved == [] and search_revenue == 2_000_000_000
     assert search_kwargs["max_pages"] == 7
-    assert search_kwargs["staff_from"] == 240 and search_kwargs["staff_to"] == 260
+    assert "staff_from" not in search_kwargs and "staff_to" not in search_kwargs, \
+        "фильтр по штату удалён 2026-08-19 и не должен возвращаться в поиск"
     assert isinstance(search_kwargs["deadline"], float)
     assert rows[0]["url"] not in session.fact_calls, "CRM-дубликат дошёл до карточки"
     assert inns[1] not in {inn for _, inn in verifier.calls}, "не-2025 дошёл до ownership"
-    assert inns[4] not in {inn for _, inn in verifier.calls}, "численность вне диапазона дошла до ownership"
+    assert inns[4] in {inn for _, inn in verifier.calls}, "24.9% обязан дойти до ownership"
     assert inns[6] not in {inn for _, inn in verifier.calls}, "поиск не остановился ровно на N"
     assert session.contact_calls == [rows[3]["url"], rows[5]["url"]]
     assert all(isinstance(value, float) for value in verifier.deadlines)
     assert all(isinstance(value, float) for value in session.contact_deadlines)
     for lead in leads:
         assert lead["_revenue_year"] == 2025
-        assert 240 <= lead["_staff_count"] <= 260
-        assert lead["_state_share"] > 25
+        assert lead["_state_share"] >= 25
         assert lead["_state_ownership_urls"]
         assert lead["email"] == "office@example.test"
     assert any("CRM" in line and "1" in line for line in lines), lines
@@ -188,7 +188,7 @@ def check_exhaustion_is_hard():
         )
     except SR.StateLeadExhausted as exc:
         assert exc.found == 0 and exc.requested == 2
-        assert exc.stats["state_not_over_25"] == 1, exc.stats
+        assert exc.stats["state_below_25"] == 1, exc.stats
         assert exc.stats["invalid_inn"] == 1, exc.stats
         assert exc.stats["revenue"] == 1, exc.stats
     else:

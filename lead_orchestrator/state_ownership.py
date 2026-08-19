@@ -811,7 +811,8 @@ class OwnershipVerifier:
     def verify(self, name, inn, *, deadline=None):
         total, direct, complete, structure_valid, trace, reasons, urls = self._resolve(
             name, inn, (), 0, deadline)
-        verified = structure_valid and total > self.threshold
+        # Порог включительный: ровно 25% — госкомпания, 24.9% — нет (2026-08-19).
+        verified = structure_valid and total >= self.threshold
         return OwnershipResult(
             verified=verified,
             share=total,
