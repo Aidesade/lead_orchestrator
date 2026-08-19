@@ -318,10 +318,13 @@ def _check_card_schema_fail_closed() -> None:
         "https://www.rusprofile.ru/id/1", "", "ИНН 1650000049\nКарточка компании", "")
     try:
         session.card_facts_by_url("/id/1", expected_inn="1650000049")
-    except RPW.RusProfilePlaywrightError as exc:
-        assert "схем" in str(exc).lower() or "выруч" in str(exc).lower()
+    except RPW.RusProfileCardIncomplete as exc:
+        # Неполные данные — НЕ дрейф схемы: класс различает их намеренно
+        # (одиночный пробел отсеивает компанию, а не валит прогон).
+        assert not isinstance(exc, RPW.RusProfileCardSourceError)
+        assert "выруч" in str(exc).lower()
     else:
-        raise AssertionError("сломанная схема карточки была принята как отсутствие метрик")
+        raise AssertionError("карточка без блока выручки была принята как полная")
 
     # Карточка с выручкой, но БЕЗ блока численности — валидна: ССЧ у части
     # компаний не опубликована, а штат больше не критерий отбора (2026-08-19).
@@ -341,7 +344,9 @@ def _check_card_schema_fail_closed() -> None:
         "https://www.rusprofile.ru/id/1", "", ambiguous, "")
     try:
         session.card_facts_by_url("/id/1", expected_inn="1650000049")
-    except RPW.RusProfileCardSourceError:
+    except RPW.RusProfileCardIncomplete:
+        # Неоднозначные метрики схлопываются в None и дают ту же «неполноту»:
+        # одиночная кривая карточка — пропуск компании, серия — стоп по лимиту.
         pass
     else:
         raise AssertionError("неоднозначные метрики карточки были приняты по первому regex-match")

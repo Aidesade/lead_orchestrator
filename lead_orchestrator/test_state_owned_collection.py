@@ -265,6 +265,29 @@ def check_single_card_schema_failure_stops():
     print("  ✓ один schema drift карточки останавливает прогон fail-closed")
 
 
+def check_single_incomplete_card_skips_company():
+    """Карточка без блока данных (боевой ИНН 1650280847) — пропуск, не остановка."""
+    gap_inn = valid_test_inn(140)
+    ok_inn = valid_test_inn(141)
+    rows = [item(gap_inn, "ООО Без блока выручки"), item(ok_inn, "ГУП Полная")]
+
+    class GapCard(FakeSession):
+        def card_facts_by_url(self, link, **_kwargs):
+            self.fact_calls.append(link)
+            if link == f"/id/{gap_inn}":
+                raise RPW.RusProfileCardIncomplete("на карточке нет блока выручки")
+            return dict(self.metrics[link])
+
+    session = GapCard(rows, {f"/id/{ok_inn}": facts()})
+    leads = SR.harvest_state_owned(
+        1, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=FakeVerifier({ok_inn: ownership(True, 100)}),
+        card_error_limit=3, log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == [ok_inn], leads
+    assert len(session.fact_calls) == 2, session.fact_calls
+    print("  ✓ одиночная карточка без блока данных отсеивается, прогон продолжается")
+
+
 def check_local_duplicate_before_card():
     inn = valid_test_inn(20)
     row = item(inn, "ООО Уже отработана локально")
@@ -500,6 +523,7 @@ def main():
     check_systemic_ownership_failure_stops()
     check_systemic_card_failure_stops()
     check_single_card_schema_failure_stops()
+    check_single_incomplete_card_skips_company()
     check_local_duplicate_before_card()
     check_candidate_limit_is_hard()
     check_invalid_name_before_card()

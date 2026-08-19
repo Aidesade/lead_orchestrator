@@ -82,6 +82,16 @@ class RusProfileCardSourceError(RusProfilePlaywrightError):
     """Карточка заменена антиботом или больше не соответствует ожидаемой схеме."""
 
 
+class RusProfileCardIncomplete(RusProfilePlaywrightError):
+    """Карточка настоящая, но нужного блока данных на ней нет.
+
+    НЕ подкласс RusProfileCardSourceError намеренно: пропуск блока у ОДНОЙ
+    компании — состояние данных (боевой пример — ИНН 1650280847 без блока
+    выручки), и оно отсеивает компанию, а не валит прогон. Настоящий дрейф
+    вёрстки проявится серией таких карточек подряд и упрётся в лимит
+    последовательных ошибок вызывающей стороны."""
+
+
 def log(message):
     print(message, flush=True)
 
@@ -580,8 +590,8 @@ class RusProfilePlaywrightSession:
                     "карточка RusProfile не содержит ожидаемый ИНН")
         facts = card_facts(text)
         if not facts.get("_revenue_display") or not facts.get("_revenue_year"):
-            raise RusProfileCardSourceError(
-                "схема карточки RusProfile не содержит выручку и её год")
+            raise RusProfileCardIncomplete(
+                "на карточке RusProfile нет блока выручки с годом")
         # Численность НЕ обязательна (2026-08-19): штат перестал быть критерием
         # отбора, а блок ССЧ на реальных карточках бывает просто не опубликован
         # (проверено вживую на ИНН 1654038766). Дрейф вёрстки ловит обязательная
