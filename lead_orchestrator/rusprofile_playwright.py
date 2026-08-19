@@ -574,9 +574,10 @@ class RusProfilePlaywrightSession:
         if not facts.get("_revenue_display") or not facts.get("_revenue_year"):
             raise RusProfileCardSourceError(
                 "схема карточки RusProfile не содержит выручку и её год")
-        if facts.get("_staff_count") is None:
-            raise RusProfileCardSourceError(
-                "схема карточки RusProfile не содержит численность сотрудников")
+        # Численность НЕ обязательна (2026-08-19): штат перестал быть критерием
+        # отбора, а блок ССЧ на реальных карточках бывает просто не опубликован
+        # (проверено вживую на ИНН 1654038766). Дрейф вёрстки ловит обязательная
+        # выручка выше: карточка без неё по-прежнему = недостоверная схема.
         return facts
 
     def contacts_by_url(self, link, *, deadline=None):

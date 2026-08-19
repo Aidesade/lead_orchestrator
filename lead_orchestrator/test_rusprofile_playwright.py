@@ -323,16 +323,15 @@ def _check_card_schema_fail_closed() -> None:
     else:
         raise AssertionError("сломанная схема карточки была принята как отсутствие метрик")
 
+    # Карточка с выручкой, но БЕЗ блока численности — валидна: ССЧ у части
+    # компаний не опубликована, а штат больше не критерий отбора (2026-08-19).
     session._snapshot = lambda *_args, **_kwargs: (
         "https://www.rusprofile.ru/id/1", "",
         "ИНН 1650000049\nОсновные показатели за 2025 год:\n"
         "Выручка\n2,5 млрд руб.", "")
-    try:
-        session.card_facts_by_url("/id/1", expected_inn="1650000049")
-    except RPW.RusProfilePlaywrightError as exc:
-        assert "числен" in str(exc).lower() or "схем" in str(exc).lower()
-    else:
-        raise AssertionError("частичный drift без численности был принят как бизнес-отказ")
+    no_staff = session.card_facts_by_url("/id/1", expected_inn="1650000049")
+    assert no_staff["_revenue_year"] == 2025, no_staff
+    assert no_staff.get("_staff_count") is None, no_staff
 
     ambiguous = (
         "ИНН 1650000049\n" + CARD_METRICS
