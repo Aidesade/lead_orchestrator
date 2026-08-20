@@ -1,23 +1,35 @@
-# Lead Orchestrator — ЗАФИКСИРОВАННЫЕ зависимости (pinned lock)
-# Снимок рабочего окружения: Windows, Python 3.12 (запуск через `py`), 2026-06-30.
-# Установка:        py -m pip install -r requirements.txt
-# Содержимое — транзитивное замыкание того, что РЕАЛЬНО импортирует lead_orchestrator,
-# + pip-тулчейн стадии презентации .pptx. stdlib не перечисляется.
+# -*- coding: utf-8 -*-
+# (кука кодировки — в первой строке намеренно: pip на Windows без неё читает файл локалью)
+#
+# Lead Orchestrator — ЗАФИКСИРОВАННЫЕ зависимости ОСНОВНОГО окружения (pinned lock).
+# Снимок рабочего окружения: Windows, Python 3.12, пины — 2026-06-30 (рабочие, не трогать
+# без пересборки снимка). Установка из корня репо:  py -m pip install -r requirements.txt
+# (корневой агрегатор тянет этот файл + web/api/requirements.txt), либо отсюда напрямую:
+#   py -m pip install -r requirements.txt && py -m playwright install chromium
+# Содержимое — транзитивное замыкание того, что РЕАЛЬНО импортирует код. stdlib не перечисляется.
+# Dockerfile ставит этот же файл в /opt/venv, вырезая только pywin32 (Windows-only).
 
 # ============================================================================
-# ПРЯМЫЕ ЗАВИСИМОСТИ (импортируются кодом lead_orchestrator + тулчейн .pptx)
+# ПРЯМЫЕ ЗАВИСИМОСТИ — импортируются кодом lead_orchestrator / lead_orchestrator_kimi / web
 # ============================================================================
-claude-agent-sdk==0.2.103       # SDK-обёртки orchestrator_agent / company_research_agent (+ sonnet-экстракт движка)
-anyio==4.13.0                   # увод блокирующего сбора в поток внутри async-тулов SDK
-undetected-chromedriver==3.5.5  # обход Cloudflare у RusProfile (uc, НЕ Playwright); тянет selenium
-openpyxl==3.1.5                 # сборка Excel по шаблону D:\лиды
-pymupdf==1.28.0                 # текст актуальной PDF-выписки ЕГРЮЛ для графа госучастия
+claude-agent-sdk==0.2.103       # ШТАТНЫЙ runtime ветки: claude_kimi_adapter, NL-контроллер, писатель, роли, one-pager
+openai==2.44.0                  # kimi-runtime: весь LLM-трафик к шлюзу через AsyncOpenAI (движок, писатель, контроллер)
+playwright==1.60.0              # ФАЗА 1 RusProfile (rusprofile_playwright) + рендер one-pager HTML->PDF
+Crawl4AI==0.9.0                 # PRIMARY краул сайта в движке deep_research (фолбэк — HTTP)
 python-docx==1.2.0              # рендер двух нейтральных .docx (карта процессов / карта ролей)
-Crawl4AI==0.9.0                 # PRIMARY реальный краул сайта в движке deep_research (фолбэк — HTTP)
-# --- стадия презентации .pptx (официальный скилл pptx исполняет их агентно) ---
-markitdown==0.1.6               # извлечение/проверка текста .pptx (скилл зовёт `python -m markitdown`)
-python-pptx==1.0.2              # OOXML .pptx (тянется markitdown; нужен скиллу)
-pillow==12.2.0                  # картинки/кадрирование фото для дека
+openpyxl==3.1.5                 # verify_xlsx, build_excel, XLSX Росимущества (state_ownership)
+pymupdf==1.28.0                 # текст PDF-выписки ЕГРЮЛ для графа госучастия (state_ownership)
+undetected-chromedriver==3.5.5  # откат RUSPROFILE_BROWSER=uc (Cloudflare); тянет selenium
+pywin32==311                    # outreach: Outlook Desktop через COM (outlook_send); в Docker вырезается
+PyYAML==6.0.3                   # спеки агентов kimi_agent/*.yaml (claude_kimi_adapter)
+anyio==4.13.0                   # увод блокирующего сбора в поток внутри async-тулов SDK; BaseExceptionGroup
+mcp==1.27.0                     # MCP-тулы Lead* адаптера поверх Claude Agent SDK
+pydantic==2.13.4                # модели web/api; pydantic-core 2.46.4 — граница несовместимости с .venv_kimi
+# --- кодом НЕ импортируются: остаток тулчейна .pptx-стадии, удалённой 2026-07-13. Пины оставлены,
+#     чтобы не пересобирать снимок; убрать при следующей пересборке лока ---
+markitdown==0.1.6
+python-pptx==1.0.2
+pillow==12.2.0
 
 # ============================================================================
 # ТРАНЗИТИВНЫЕ — зафиксированы для воспроизводимости (locks рабочую связку, в т.ч.
@@ -75,7 +87,6 @@ magika==0.6.3
 markdown-it-py==4.1.0
 markdownify==1.2.2
 MarkupSafe==3.0.3
-mcp==1.27.0
 mdurl==0.1.2
 mpmath==1.3.0
 multidict==6.7.1
@@ -83,17 +94,14 @@ networkx==3.6.1
 nltk==3.9.4
 numpy==2.4.4
 onnxruntime==1.20.1
-openai==2.44.0
 outcome==1.3.0.post0
 packaging==26.2
 patchright==1.60.1
-playwright==1.60.0
 playwright-stealth==2.0.3
 propcache==0.5.2
 protobuf==7.35.1
 psutil==7.2.2
 pycparser==3.0
-pydantic==2.13.4
 pydantic-settings==2.14.0
 pydantic_core==2.46.4
 pyee==13.0.1
@@ -104,8 +112,6 @@ pyreadline3==3.5.6
 PySocks==1.7.1
 python-dotenv==1.2.2
 python-multipart==0.0.27
-pywin32==311
-PyYAML==6.0.3
 rank-bm25==0.2.2
 referencing==0.37.0
 regex==2026.5.9

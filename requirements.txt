@@ -1,0 +1,21 @@
+# -*- coding: utf-8 -*-
+# Корневой агрегатор зависимостей. Python 3.12.
+#
+#   py -m pip install -r requirements.txt
+#   py -m playwright install chromium          # Chromium для RusProfile, Crawl4AI и рендера PDF
+#
+# Что ставится:
+#   lead_orchestrator/requirements.txt — pinned-lock ОСНОВНОГО окружения (пайплайн, outreach,
+#                                         Claude Agent SDK, Playwright, Crawl4AI, python-docx…);
+#   web/api/requirements.txt           — FastAPI-слой веб-интерфейса (тонкий, без пинов).
+#
+# НЕ входит и ставиться сюда НЕ должно: lead_orchestrator_kimi/requirements.txt — изолированный
+# venv Kimi-стадии (.venv_kimi): kimi-agent-sdk тянет pydantic-core 2.41.5, а claude-agent-sdk
+# требует 2.46.4 — в одном интерпретаторе не живут. Нужен только при ORQ_LLM_RUNTIME=kimi:
+#   cd lead_orchestrator_kimi && py -m venv .venv_kimi
+#   .venv_kimi\Scripts\python.exe -m pip install -r requirements.txt
+#   .venv_kimi\Scripts\python.exe patches\apply_patches.py
+#
+# Dockerfile собирает оба venv сам из тех же двух файлов — этот агрегатор он не читает.
+-r lead_orchestrator/requirements.txt
+-r web/api/requirements.txt

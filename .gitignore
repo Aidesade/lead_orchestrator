@@ -50,3 +50,6 @@ raw.html
 Яндекс
 Thumbs.db
 desktop.ini
+
+# Служебная папка ассистента Hermes (планы сессий) — не исходники.
+.hermes/
