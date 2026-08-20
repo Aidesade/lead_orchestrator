@@ -699,7 +699,8 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     import rusprofile_session as RPS
     from crm_push import CRMIndexError, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
-    from state_lead_collection import lead_region_query, load_local_registry_strict
+    from state_lead_collection import (lead_region_query, lead_tz_limit,
+                                       load_local_registry_strict, ownership_enabled)
     from state_ownership import OwnershipVerifier, RosimRegistry, StateOwnershipDeadline
 
     source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
@@ -728,23 +729,30 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
         raise SystemExit(f"CRM-прекондишен: {exc}") from None
     if push_crm and not crm_push_configured():
         raise SystemExit("CRM-прекондишен: запись выключена через CRM_PUSH=0")
-    try:
-        verifier = OwnershipVerifier(
-            rosim=RosimRegistry.from_environment(deadline=deadline))
-    except StateOwnershipDeadline:
-        raise SystemExit("общий лимит строгого добора истёк на источнике Росимущества") from None
-    except Exception as exc:
-        raise SystemExit(f"источник Росимущества не подготовлен: {str(exc)[:180]}") from None
+    verifier = None
+    if ownership_enabled():
+        try:
+            verifier = OwnershipVerifier(
+                rosim=RosimRegistry.from_environment(deadline=deadline))
+        except StateOwnershipDeadline:
+            raise SystemExit("общий лимит строгого добора истёк на источнике Росимущества") from None
+        except Exception as exc:
+            raise SystemExit(f"источник Росимущества не подготовлен: {str(exc)[:180]}") from None
 
     try:
         local_registry = load_local_registry_strict(log=print)
     except RuntimeError as exc:
         raise SystemExit(f"локальный реестр: {exc}") from None
     region_query = lead_region_query()
+    tz_limit = lead_tz_limit()
     print(
-        f"[1/2] строгий добор {count} новых госкомпаний | CRM {crm_index.total} лидов | "
-        "выручка >=2 млрд ₽ за 2025 | прямая/косвенная госдоля >=25% | "
-        f"юрадрес: {region_query or 'любой регион'}")
+        f"[1/2] строгий добор {count} новых "
+        + ("госкомпаний" if ownership_enabled() else "компаний")
+        + f" | CRM {crm_index.total} лидов | выручка >=2 млрд ₽ за 2025 | "
+        + ("прямая/косвенная госдоля >=25% | " if ownership_enabled()
+           else "госдоля НЕ проверяется | ")
+        + f"регион: {region_query or 'любой'}"
+        + (f" | пояс МСК±{tz_limit} ч" if tz_limit is not None else ""))
     from rusprofile_playwright import (
         RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
     )
@@ -1308,6 +1316,9 @@ async def main():
     ap.add_argument("--state-owned", dest="state_owned", action="store_true",
                     help="строгий добор ровно --count НОВЫХ госкомпаний: CRM-дедуп, "
                          "выручка >=2 млрд за 2025, госдоля >=25%%, юрадрес Татарстана")
+    ap.add_argument("--no-state-share", dest="no_state_share", action="store_true",
+                    help="со --state-owned: НЕ проверять госдолю — критерии только "
+                         "выручка/регион/пояс (STATE_LEAD_REGION, STATE_LEAD_TZ_LIMIT)")
     ap.add_argument("--count", type=int, default=200,
                     help="сколько лидов собрать ВСЕГО (с --industries или --state-owned)")
     ap.add_argument("--collect-only", dest="collect_only", action="store_true",
@@ -1416,6 +1427,12 @@ async def main():
             raise SystemExit("--state-owned: --count должен быть от 1 до 200")
     if a.collect_only and not (a.state_owned or a.industries):
         raise SystemExit("--collect-only работает только со сбором: --industries или --state-owned")
+    if a.no_state_share:
+        if not a.state_owned:
+            raise SystemExit("--no-state-share имеет смысл только со --state-owned")
+        # Флаг транслируется в env: его читают и прекондишен Росимущества,
+        # и сам добор — источник правды один.
+        os.environ["STATE_LEAD_OWNERSHIP"] = "0"
     # «N на отрасль» перекрывает --count: итог = N × число валидных отраслей
     if a.industries and a.per_industry:
         import source_rusprofile as RP

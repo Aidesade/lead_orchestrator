@@ -144,6 +144,8 @@ py orchestrator.py --industries mining       # = py orchestrator.py mining (по
 # госдоля >=25% (выписка ЕГРЮЛ + XLSX Росимущества), юрадрес — Республика Татарстан:
 py orchestrator.py --state-owned --count 5
 py orchestrator.py --state-owned --count 50 --collect-only   # только сбор в JSON, без ФАЗЫ 2
+# тот же строгий добор БЕЗ госдоли (критерии: выручка >=2 млрд + регион/часовой пояс):
+set STATE_LEAD_REGION=&& set STATE_LEAD_TZ_LIMIT=2&& py orchestrator.py --state-owned --no-state-share --count 30 --collect-only
 py orchestrator.py mining --count 10         # явно 10 ВСЕГО по всем отраслям
 py orchestrator.py mining,energy --per-industry 10   # 10 НА КАЖДУЮ отрасль (итог 20)
 # только ресёрч+материалы по готовому JSON лидов (ФАЗА 1 пишет их в D:\лиды\):
@@ -295,7 +297,11 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 жёсткая остановка (`StateOwnershipUnavailable`), недобор — `StateLeadExhausted` со
 статистикой причин. Тумблеры: `STATE_LEAD_MAX_SECONDS` (1200 — общий абсолютный deadline),
 `STATE_LEAD_MAX_PAGES`, `STATE_LEAD_MAX_CANDIDATES` (1000), `STATE_OWNERSHIP_CACHE_TTL_H` (24),
-`STATE_OWNERSHIP_MAX_DEPTH` (6), `STATE_ROSIM_MAX_AGE_DAYS` (45).
+`STATE_OWNERSHIP_MAX_DEPTH` (6), `STATE_ROSIM_MAX_AGE_DAYS` (45),
+`STATE_LEAD_OWNERSHIP` (1; `=0` или флаг `--no-state-share` — НЕ проверять госдолю:
+режим «крупные компании по выручке и региону», ЕГРЮЛ/Росимущество не вызываются, регион
+матчится по выдаче), `STATE_LEAD_TZ_LIMIT` (пусто; `=N` — принимать только регионы с
+часовым поясом в пределах МСК±N ч, карта поясов — `_REGION_TZ` в `state_lead_collection`).
 
 Дальше: отбор → `D:\лиды\leads_<отрасли>.json` (`--out`; .xlsx из боевой ФАЗЫ 1 убран 2026-07-06)
 → при `ORQ_STORE=disk` ещё и дерево `<--base>/<отрасль>/<категория полноты контактов>/<компания>/`

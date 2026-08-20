@@ -503,6 +503,59 @@ def check_region_filter():
     print("  ✓ регион: дёшево по выдаче, строго по выписке ЕГРЮЛ, выключается явно")
 
 
+def check_no_ownership_and_timezone():
+    """STATE_LEAD_OWNERSHIP=0: критерии — выручка/регион/пояс, ЕГРЮЛ не зовётся."""
+    assert SLC.region_tz_offset("Республика Татарстан") == 3
+    assert SLC.region_tz_offset("Калининградская область") == 2
+    assert SLC.region_tz_offset("Свердловская область") == 5
+    assert SLC.region_tz_offset("Камчатский край") == 12
+    assert SLC.region_tz_offset("") is None
+
+    inns = [valid_test_inn(i) for i in range(150, 154)]
+    msk = item(inns[0], "ООО Московская")
+    msk["region_name"] = "Москва"
+    smr = item(inns[1], "АО Самарская")
+    smr["region_name"] = "Самарская область"
+    nsk = item(inns[2], "ООО Новосибирская")
+    nsk["region_name"] = "Новосибирская область"
+    blank = item(inns[3], "ООО Без региона")
+    blank["region_name"] = ""
+    rows = [msk, smr, nsk, blank]
+
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    verifier = FakeVerifier({})          # любое обращение к госдоле упало бы KeyError
+    leads = SR.harvest_state_owned(
+        2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=verifier, region="", verify_ownership=False, tz_limit=2,
+        log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == [inns[0], inns[1]], leads
+    assert verifier.calls == [], "госдоля не должна проверяться при verify_ownership=False"
+    assert all("_state_share" not in lead for lead in leads)
+    assert leads[0]["_source_region"] == "Москва"
+
+    # Новосибирск (+7) и пустой регион при tz-фильтре отсеиваются со статистикой.
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    try:
+        SR.harvest_state_owned(
+            3, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            ownership_verifier=FakeVerifier({}), region="", verify_ownership=False,
+            tz_limit=2, log=lambda _line: None)
+    except SR.StateLeadExhausted as exc:
+        assert exc.found == 2, exc.stats
+        assert exc.stats["tz_far"] == 1 and exc.stats["tz_unknown"] == 1, exc.stats
+    else:
+        raise AssertionError("чужой часовой пояс был принят")
+
+    # Регион-фильтр без ownership матчится по выдаче (ЕГРЮЛ недоступен).
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        1, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=FakeVerifier({}), region="Самар", verify_ownership=False,
+        log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == [inns[1]], leads
+    print("  ✓ без госдоли: пояс и регион по выдаче, ЕГРЮЛ не вызывается")
+
+
 def check_corrupt_local_registry_is_hard():
     with tempfile.TemporaryDirectory() as folder:
         path = pathlib.Path(folder) / "registry.json"
@@ -532,6 +585,7 @@ def main():
     check_deadline_inside_search_is_not_exhaustion()
     check_invalid_target()
     check_region_filter()
+    check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()
 
     print("test_state_owned_collection: OK")

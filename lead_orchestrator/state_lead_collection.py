@@ -36,7 +36,8 @@ def load_local_registry_strict(path=None, log=SR.log):
 
 def _with_session(session, requested_count, crm_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
-                  ownership_error_limit, card_error_limit, region_query, region_code):
+                  ownership_error_limit, card_error_limit, region_query, region_code,
+                  verify_ownership, tz_limit):
     from rusprofile_playwright import RusProfileCardSourceError, RusProfileDeadlineReached
     from state_ownership import (StateOwnershipDeadline, StateOwnershipSourceError,
                                  region_matches)
@@ -67,6 +68,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         "card_error": 0, "state_below_25": 0,
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
         "region_source": 0, "region_egrul": 0, "region_unknown": 0,
+        "tz_far": 0, "tz_unknown": 0,
         "time_limit": 0,
     }
     selected, seen = [], set()
@@ -100,12 +102,28 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         item["name"] = name
 
         # Дешёвый регион-фильтр по выдаче: чужой регион отклоняется ДО карточки
-        # и ЕГРЮЛ. Пустой регион выдачи НЕ отклоняется — судьбу решит строгая
-        # проверка юрадреса по выписке ниже.
+        # и ЕГРЮЛ. Пустой регион выдачи в ownership-режиме НЕ отклоняется — судьбу
+        # решит строгая проверка юрадреса по выписке; БЕЗ ownership выписки не
+        # будет, поэтому пустой регион при заданном фильтре = отказ (fail-closed).
+        source_region = str(item.get("region") or item.get("region_name") or "").strip()
         if region_query:
-            source_region = str(item.get("region") or item.get("region_name") or "").strip()
             if source_region and not region_matches(source_region, region_query):
                 stats["region_source"] += 1
+                continue
+            if not verify_ownership and not source_region:
+                stats["region_unknown"] += 1
+                continue
+
+        # Часовой пояс: по региону выдачи, отклонение от МСК не больше tz_limit
+        # часов. Регион без известного офсета (или пустой) — отказ: «не поняли,
+        # где компания» не значит «в нашем поясе».
+        if tz_limit is not None:
+            offset = region_tz_offset(source_region)
+            if offset is None:
+                stats["tz_unknown"] += 1
+                continue
+            if abs(offset - 3) > tz_limit:
+                stats["tz_far"] += 1
                 continue
 
         industry = SR._industry_for_okved(item.get("main_okved_id"))
@@ -163,36 +181,38 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         # Значение и год теперь принадлежат одному блоку основной карточки.
         lead["_revenue"] = card_revenue
 
-        try:
-            result = ownership_verifier.verify(
-                lead.get("name") or "", inn, deadline=deadline)
-        except StateOwnershipDeadline:
-            stats["time_limit"] = 1
-            break
-        except StateOwnershipSourceError as exc:
-            stats["ownership_source_error"] += 1
-            consecutive_source_errors += 1
-            if consecutive_source_errors >= ownership_error_limit:
-                raise SR.StateOwnershipUnavailable(
-                    f"официальная проверка госучастия не выполнена "
-                    f"{consecutive_source_errors} раза подряд: {exc}") from exc
-            continue
-        consecutive_source_errors = 0
-        if not result.verified:
-            stats["state_below_25" if result.complete else "state_unknown"] += 1
-            continue
+        result = None
+        if verify_ownership:
+            try:
+                result = ownership_verifier.verify(
+                    lead.get("name") or "", inn, deadline=deadline)
+            except StateOwnershipDeadline:
+                stats["time_limit"] = 1
+                break
+            except StateOwnershipSourceError as exc:
+                stats["ownership_source_error"] += 1
+                consecutive_source_errors += 1
+                if consecutive_source_errors >= ownership_error_limit:
+                    raise SR.StateOwnershipUnavailable(
+                        f"официальная проверка госучастия не выполнена "
+                        f"{consecutive_source_errors} раза подряд: {exc}") from exc
+                continue
+            consecutive_source_errors = 0
+            if not result.verified:
+                stats["state_below_25" if result.complete else "state_unknown"] += 1
+                continue
 
-        # Строгий регион-гейт: принимается только юрадрес нужного субъекта РФ
-        # из той же выписки ЕГРЮЛ, что доказала госдолю. Нет региона в выписке —
-        # отказ: «не извлекли» не значит «Татарстан».
-        if region_query:
-            egrul_region = (result.region or "").strip()
-            if not egrul_region:
-                stats["region_unknown"] += 1
-                continue
-            if not region_matches(egrul_region, region_query):
-                stats["region_egrul"] += 1
-                continue
+            # Строгий регион-гейт: принимается только юрадрес нужного субъекта РФ
+            # из той же выписки ЕГРЮЛ, что доказала госдолю. Нет региона в выписке —
+            # отказ: «не извлекли» не значит «Татарстан».
+            if region_query:
+                egrul_region = (result.region or "").strip()
+                if not egrul_region:
+                    stats["region_unknown"] += 1
+                    continue
+                if not region_matches(egrul_region, region_query):
+                    stats["region_egrul"] += 1
+                    continue
 
         if time.monotonic() >= deadline:
             stats["time_limit"] = 1
@@ -210,21 +230,25 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             stats["time_limit"] = 1
             break
         SR._merge_state_contacts(lead, accepted_contacts)
-        lead.update({
-            "_state_share": float(result.share),
-            "_state_share_direct": float(result.direct_share),
-            "_state_share_indirect": float(result.indirect_share),
-            "_state_ownership_complete": bool(result.complete),
-            "_state_ownership_urls": list(result.source_urls),
-            "_state_ownership_trace": list(result.trace),
-            "_state_ownership_reasons": list(result.reasons),
-            "_egrul_region": (result.region or "").strip(),
-        })
+        lead["_source_region"] = source_region
+        if result is not None:
+            lead.update({
+                "_state_share": float(result.share),
+                "_state_share_direct": float(result.direct_share),
+                "_state_share_indirect": float(result.indirect_share),
+                "_state_ownership_complete": bool(result.complete),
+                "_state_ownership_urls": list(result.source_urls),
+                "_state_ownership_trace": list(result.trace),
+                "_state_ownership_reasons": list(result.reasons),
+                "_egrul_region": (result.region or "").strip(),
+            })
         selected.append(lead)
         stats["accepted"] = len(selected)
         log(
             f"  [принят {len(selected)}/{requested_count}] {lead['name']} | "
-            f"ИНН {inn} | госдоля >={result.share}%")
+            f"ИНН {inn}"
+            + (f" | госдоля >={result.share}%" if result is not None
+               else f" | {source_region or 'регион не указан'}"))
         if out_path:
             SR._save(selected, out_path)
 
@@ -235,12 +259,68 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
         f"госдоля <25 {stats['state_below_25']} | "
         f"ownership unknown {stats['state_unknown']} | "
         f"вне региона {stats['region_source'] + stats['region_egrul']} | "
-        f"регион не подтверждён {stats['region_unknown']}")
+        f"регион не подтверждён {stats['region_unknown']} | "
+        f"чужой пояс {stats['tz_far']} | пояс неизвестен {stats['tz_unknown']}")
     if len(selected) != requested_count:
         if out_path:
             SR._save(selected, out_path)
         raise SR.StateLeadExhausted(requested_count, len(selected), stats)
     return selected
+
+
+# Субъекты РФ с часовым поясом, ОТЛИЧНЫМ от «прочей» европейской России (UTC+3).
+# Подстрочный матч по названию региона из выдачи RusProfile; всё, что не в
+# таблице, считается UTC+3. Достаточно для гейта |офсет-3| <= N: точность нужна
+# только на границах, а не для каждой области Центральной России.
+_REGION_TZ = {
+    "калининград": 2,
+    "самарск": 4, "удмурт": 4, "ульяновск": 4, "саратов": 4, "астрахан": 4,
+    "башкорт": 5, "пермск": 5, "оренбург": 5, "свердловск": 5, "челябинск": 5,
+    "курган": 5, "тюмен": 5, "ханты": 5, "югра": 5, "ямал": 5,
+    "омск": 6,
+    "алтай": 7, "кемеров": 7, "кузбасс": 7, "красноярск": 7,
+    "новосибирск": 7, "томск": 7, "тыва": 7, "хакас": 7,
+    "иркутск": 8, "бурят": 8,
+    "саха": 9, "якут": 9, "амурск": 9, "забайкал": 9,
+    "приморск": 10, "хабаровск": 10, "еврейск": 10,
+    "магадан": 11, "сахалин": 11,
+    "камчат": 12, "чукот": 12,
+}
+
+
+def region_tz_offset(region_text):
+    """UTC-офсет по названию субъекта из выдачи; None — регион не распознан."""
+    low = str(region_text or "").strip().lower().replace("ё", "е")
+    if not low:
+        return None
+    for marker, offset in _REGION_TZ.items():
+        if marker in low:
+            return offset
+    return 3
+
+
+def ownership_enabled():
+    """Проверять ли госдолю (STATE_LEAD_OWNERSHIP, дефолт ВКЛ).
+
+    `=0` превращает строгий добор в «крупные компании по выручке и региону»:
+    гейты выручки/2025, дедуп CRM+реестр и регион-фильтры работают, ЕГРЮЛ и
+    Росимущество не вызываются вовсе."""
+    return (os.environ.get("STATE_LEAD_OWNERSHIP", "1").strip().lower()
+            not in ("0", "false", "no", "off", "нет"))
+
+
+def lead_tz_limit():
+    """Макс. |отклонение| часового пояса региона от МСК; None — фильтр выключен."""
+    raw = (os.environ.get("STATE_LEAD_TZ_LIMIT") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("STATE_LEAD_TZ_LIMIT должен быть целым числом часов") from exc
+    if value < 0:
+        raise ValueError("STATE_LEAD_TZ_LIMIT должен быть неотрицательным")
+    return value
 
 
 def lead_region_query():
@@ -263,11 +343,15 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         deadline=None,
                         out_path=None, log=SR.log,
                         ownership_error_limit=3, card_error_limit=3,
-                        region=None):
-    """Ровно N новых компаний: CRM→RusProfile→2025→госдоля ≥25%→юрадрес региона.
+                        region=None, verify_ownership=None, tz_limit=None):
+    """Ровно N новых компаний: CRM→RusProfile→2025→[госдоля ≥25%]→регион/пояс.
 
     ``region`` (дефолт — ``STATE_LEAD_REGION`` = Татарстан) проверяется по субъекту РФ
-    из выписки ЕГРЮЛ; пустая строка осознанно выключает фильтр (вся РФ)."""
+    из выписки ЕГРЮЛ; пустая строка осознанно выключает фильтр (вся РФ).
+    ``verify_ownership`` (дефолт — ``STATE_LEAD_OWNERSHIP``) выключает проверку
+    госдоли целиком; без неё регион-фильтр работает по выдаче RusProfile.
+    ``tz_limit`` (дефолт — ``STATE_LEAD_TZ_LIMIT``) — макс. |отклонение| часового
+    пояса региона от МСК в часах; None — пояс не проверяется."""
     try:
         requested_count = int(requested_count)
     except (TypeError, ValueError) as exc:
@@ -299,9 +383,17 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     card_error_limit = max(1, int(card_error_limit))
     region = lead_region_query() if region is None else str(region or "").strip()
     region_code = lead_region_code()
-    log(f"[госкомпании] регион юрадреса (по выписке ЕГРЮЛ): {region or 'любой'}"
+    if verify_ownership is None:
+        verify_ownership = ownership_enabled()
+    tz_limit = lead_tz_limit() if tz_limit is None else int(tz_limit)
+    log("[госкомпании] госдоля: "
+        + (">=25% (ЕГРЮЛ + Росимущество)" if verify_ownership else "НЕ проверяется")
+        + f" | регион: {region or 'любой'}"
+        + (f" (по {'выписке ЕГРЮЛ' if verify_ownership else 'выдаче RusProfile'})"
+           if region else "")
         + (f" | серверный фильтр выдачи: код {region_code}"
-           if region and region_code else ""))
+           if region and region_code else "")
+        + (f" | часовой пояс: МСК±{tz_limit} ч" if tz_limit is not None else ""))
 
     # Прекондишен до Chrome: сбой CRM не расходует сессию RusProfile.
     if crm_index is None:
@@ -310,7 +402,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     log(f"[CRM] индекс существующих лидов загружен: {crm_index.total}")
     if local_registry is None:
         local_registry = load_local_registry_strict(log=log)
-    if ownership_verifier is None:
+    if ownership_verifier is None and verify_ownership:
         from state_ownership import OwnershipVerifier, RosimRegistry
         ownership_verifier = OwnershipVerifier(
             rosim=RosimRegistry.from_environment(deadline=deadline))
@@ -318,7 +410,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     args = (
         requested_count, crm_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
-        region, region_code,
+        region, region_code, verify_ownership, tz_limit,
     )
     if session is not None:
         if not hasattr(session, "contacts_by_url"):
