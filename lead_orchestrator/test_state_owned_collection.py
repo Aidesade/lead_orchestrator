@@ -2,6 +2,7 @@
 """Офлайн-регрессии добора ровно N новых госкомпаний."""
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 import tempfile
@@ -505,6 +506,22 @@ def check_region_filter():
 
 def check_no_ownership_and_timezone():
     """STATE_LEAD_OWNERSHIP=0: критерии — выручка/регион/пояс, ЕГРЮЛ не зовётся."""
+    # «*» отключает регион-фильтр: PowerShell не передаёт детям пустую env,
+    # и без явного отключателя дефолт «Татарстан» включался бы молча.
+    saved_region = os.environ.get("STATE_LEAD_REGION")
+    try:
+        os.environ["STATE_LEAD_REGION"] = "*"
+        assert SLC.lead_region_query() == ""
+        os.environ["STATE_LEAD_REGION"] = "любой"
+        assert SLC.lead_region_query() == ""
+        os.environ["STATE_LEAD_REGION"] = "Татарстан"
+        assert SLC.lead_region_query() == "Татарстан"
+    finally:
+        if saved_region is None:
+            os.environ.pop("STATE_LEAD_REGION", None)
+        else:
+            os.environ["STATE_LEAD_REGION"] = saved_region
+
     assert SLC.region_tz_offset("Республика Татарстан") == 3
     assert SLC.region_tz_offset("Калининградская область") == 2
     assert SLC.region_tz_offset("Свердловская область") == 5
