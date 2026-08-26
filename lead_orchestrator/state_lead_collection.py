@@ -34,7 +34,7 @@ def load_local_registry_strict(path=None, log=SR.log):
     return registry
 
 
-def _with_session(session, requested_count, crm_index, local_registry, ownership_verifier,
+def _with_session(session, requested_count, crm_index, client_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
                   ownership_error_limit, card_error_limit, region_query, region_code,
                   verify_ownership, tz_limit):
@@ -62,6 +62,7 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
     )[:max_candidates]
     stats = {
         "source_candidates": len(items), "crm_duplicate": 0, "local_duplicate": 0,
+        "client_duplicate": 0,
         "run_duplicate": 0,
         "invalid_inn": 0, "invalid_name": 0, "inactive": 0,
         "revenue": 0, "revenue_year": 0,
@@ -134,6 +135,11 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
             continue
         if crm_index.contains(lead):
             stats["crm_duplicate"] += 1
+            continue
+        # Клиент отсекается ДО карточки: с ним уже работают, и ресёрч по нему —
+        # трата лимита RusProfile и денег на модель без единого шанса на сделку.
+        if client_index is not None and client_index.contains(lead):
+            stats["client_duplicate"] += 1
             continue
         if local_registry.is_worked(inn):
             stats["local_duplicate"] += 1
@@ -254,7 +260,8 @@ def _with_session(session, requested_count, crm_index, local_registry, ownership
 
     log(
         f"[госкомпании] принято {len(selected)}/{requested_count} | "
-        f"CRM-дублей {stats['crm_duplicate']} | локальных дублей {stats['local_duplicate']} | "
+        f"CRM-дублей {stats['crm_duplicate']} | клиентов {stats['client_duplicate']} | "
+        f"локальных дублей {stats['local_duplicate']} | "
         f"не 2025 {stats['revenue_year']} | "
         f"госдоля <25 {stats['state_below_25']} | "
         f"ownership unknown {stats['state_unknown']} | "
@@ -344,7 +351,7 @@ def lead_region_code():
 
 
 def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
-                        session=None, crm_index=None, local_registry=None,
+                        session=None, crm_index=None, client_index=None, local_registry=None,
                         ownership_verifier=None,
                         max_pages=None, max_candidates=None, max_seconds=None,
                         deadline=None,
@@ -403,10 +410,19 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
         + (f" | часовой пояс: МСК±{tz_limit} ч" if tz_limit is not None else ""))
 
     # Прекондишен до Chrome: сбой CRM не расходует сессию RusProfile.
+    from crm_push import client_facts
     if crm_index is None:
-        from crm_push import fetch_existing_leads
+        # CRM целиком на нас — значит и клиентов добираем сами.
+        from crm_push import fetch_existing_leads, fetch_existing_clients
         crm_index = fetch_existing_leads(deadline=deadline)
+        if client_index is None:
+            client_index = fetch_existing_clients(deadline=deadline)
     log(f"[CRM] индекс существующих лидов загружен: {crm_index.total}")
+    # Индекс лидов пришёл снаружи -> клиентский обязан прийти оттуда же: лезть за
+    # ним в сеть за спиной вызывающего нельзя, иначе офлайн-тесты и разовые вызовы
+    # начнут ходить в CRM. Что боевой вход его передаёт — держит test_state_owned_wiring.
+    if client_index is not None:
+        log(client_facts(client_index))
     if local_registry is None:
         local_registry = load_local_registry_strict(log=log)
     if ownership_verifier is None and verify_ownership:
@@ -415,7 +431,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
             rosim=RosimRegistry.from_environment(deadline=deadline))
 
     args = (
-        requested_count, crm_index, local_registry, ownership_verifier, max_pages,
+        requested_count, crm_index, client_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
         region, region_code, verify_ownership, tz_limit,
     )

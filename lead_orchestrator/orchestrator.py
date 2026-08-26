@@ -697,7 +697,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     import source_rusprofile as RP
     import pipeline
     import rusprofile_session as RPS
-    from crm_push import CRMIndexError, fetch_existing_leads
+    from crm_push import CRMIndexError, client_facts, fetch_existing_clients, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
     from state_lead_collection import (lead_region_query, lead_tz_limit,
                                        load_local_registry_strict, ownership_enabled)
@@ -725,8 +725,10 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     # CRM — прекондишен ДО Chrome и до первого запроса RusProfile.
     try:
         crm_index = fetch_existing_leads(deadline=deadline)
+        client_index = fetch_existing_clients(deadline=deadline)
     except CRMIndexError as exc:
         raise SystemExit(f"CRM-прекондишен: {exc}") from None
+    print(client_facts(client_index))
     if push_crm and not crm_push_configured():
         raise SystemExit("CRM-прекондишен: запись выключена через CRM_PUSH=0")
     verifier = None
@@ -763,7 +765,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
                     headless=headless, offscreen=offscreen, deadline=deadline) as session:
                 leads = RP.harvest_state_owned(
                     count, session=session, crm_index=crm_index,
-                    local_registry=local_registry,
+                    client_index=client_index, local_registry=local_registry,
                     ownership_verifier=verifier, deadline=deadline,
                     out_path=json_out, log=print)
             break

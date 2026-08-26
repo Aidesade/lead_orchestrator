@@ -70,7 +70,7 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 
 | # | Стадия | Где живёт |
 |---|---|---|
-| 1 | Реестр отработанных | `outreach_registry.py` — ключ ИНН, бэкфилл из `D:\deliverables` |
+| 1 | Реестр отработанных + отсев клиентов | `outreach_registry.py` — ключ ИНН, бэкфилл из `D:\deliverables`; `outreach.filter_clients` выбрасывает действующих клиентов CRM |
 | 2 | Парсинг RusProfile | `rusprofile_playwright.card_facts` / `parse_founders` |
 | 3 | One-pager по отрасли | `assets/onepagers/<отрасль>.pdf`, иначе `--generate-onepager` |
 | 5 | **Прекондишен** ящика `@tatar.ru` | `outlook_send.check_ready` |
@@ -282,7 +282,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 
 **Строгий режим госкомпаний (`--state-owned`)** — отдельная Фаза 1:
 `state_lead_collection.py` (добор ровно N) + `state_ownership.py` (доказательство госдоли).
-Профиль зашит кодом и НЕ ослабляется NL-контроллером: НОВЫЕ компании (дедуп по CRM ЦИТ РТ и
+Профиль зашит кодом и НЕ ослабляется NL-контроллером: НОВЫЕ компании (дедуп по лидам И клиентам CRM ЦИТ РТ и
 локальному реестру), выручка ≥2 млрд ₽ за 2025 из карточки RusProfile (фильтр по штату
 240–260 удалён 2026-08-19), прямая+косвенная госдоля **≥25% — порог включительный:
 ровно 25% проходит, 24.9% нет** — по актуальной PDF-выписке ЕГРЮЛ (рекурсивный граф владения;
@@ -405,7 +405,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `writer_kimi.py` | **штатный писатель двух .docx** и parent-мост пяти enrichment-ролей (оба runtime): выбирает интерпретатор/модели по `kimi_config.runtime()`, сначала отдельный агент-процесс делает граф ролей, затем на документ запускается `writer_kimi_agent.py` |
 | `kimi_research_cli.py` | subprocess-мост URL-инструментов (search/fetch/crawl) из venv Kimi в основной; `--selftest` |
 | `company_research_agent.py` (CRA) | **общие схемы, промпты и DOCX-рендереры.** `PROCESS_MAP_SYSTEM`/`ROLES_CONTACTS_SYSTEM` берёт Kimi-писатель; импорт модуля НЕ загружает Claude SDK. Детерминированно дописывает таблицы центров решений, корпоративного графа, кандидатов, каналов и реестр доказательств |
-| `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
+| `deep_research_engine.py` | **настоящий deep-research**: официальная база + site/eis/courts_media/hh, Crawl4AI→HTTP, targeted refill и `completeness_critic`; текст страницы снимает trafilatura, но её вывод сверяется с полным текстом по контактам/реквизитам и потерянные строки возвращаются (на живых сайтах она теряет подвал в 4 случаях из 5); поиск brave→ddg→bing. HTTP-фетч защищён от `file://`, credentials, localhost/private/link-local IP и небезопасных redirect. Мульти-домен подтверждается по ИНН/полному названию; каталоги режутся `AGGREGATORS` |
 | `person_enrich.py` | ЛПР: ФИО+ИНН → прямой РАБОЧИЙ контакт (Dadata/Checko → домен с валидацией → email по шаблону+MX, телефоны; соцпрофили только с ИНН-контекстом). «Пробив»/утечки конструктивно исключены (`DENY_SOURCES`). Генерацию адресов НЕ реализует — делегирует `email_guess` |
 | `email_verify.py` | **проверка существования ящика БЕЗ отправки письма** — Python-порт ядра Reacher на голом stdlib (ни Docker, ни WSL, ни Rust-бинаря). Формат ответа совместим с Reacher (`is_reachable` + `syntax`/`mx`/`smtp`/`misc`), есть CLI и `--serve` (HTTP-API на том же контракте). ⚠️ Осознанное отличие от оригинала: у Reacher `invalid` означает и «нет ящика», и «не смог подключиться» — при закрытом порте 25 это вычеркнуло бы все живые адреса; здесь такой случай = `unknown`, а `550 5.7.x` (политика) отделён от `550 5.1.1` (нет адресата). Единственная SMTP-реализация в репо: `email_guess` и `person_enrich` зовут её |
 | `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов. Последним слоем — `_mev_fill`: облачный добор MyEmailVerifier ТОЛЬКО по оставшимся `unknown` и только вне блок-листа отраслей (см. «Тумблеры подбора почты»), по умолчанию выключен |
@@ -475,7 +475,10 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 **Зависимости:** `py -m pip install -r requirements.txt` (pinned-lock) + `python -m playwright install chromium`.
 Реально несущие пакеты: **`openai`** (весь штатный LLM-трафик к Kimi идёт через `AsyncOpenAI` —
 ленивый импорт в `deep_research_engine`, `writer_kimi`, `orchestrator_agent`), **`playwright`**
-(Фаза 1 и рендер PDF), `python-docx`, `Crawl4AI`, `openpyxl`.
+(Фаза 1 и рендер PDF), `python-docx`, `Crawl4AI`, `trafilatura`, `openpyxl`.
+⚠️ `Crawl4AI`/`trafilatura`/`lxml` — связанная тройка: trafilatura 2.2 требует `lxml>=6.1.1`, а
+Crawl4AI пускает lxml 6 только с 0.9.2 (у 0.9.0 был потолок `lxml~=5.3`). Откат любого из трёх
+поодиночке делает `pip install -r requirements.txt` неразрешимым — двигать только вместе.
 ⚠️ **Шапка `requirements.txt` устарела:** она числит `claude-agent-sdk` прямой зависимостью,
 `openai`/`playwright` — транзитивными, а `markitdown`/`python-pptx`/`pillow` — тулчейном
 `.pptx`-стадии, удалённой 2026-07-13. Пины рабочие; верить надо этому разделу, а не комментариям в файле.
@@ -496,6 +499,12 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `ORQ_ONEPAGER_MODEL` (`opus`), `ORQ_CONTROLLER_MODEL` (`sonnet`),
 `ORQ_SCOUT_MODEL`/`ORQ_CRITIC_MODEL`/`ORQ_VERIFIER_MODEL` (`sonnet`), `DR_EXTRACT_MODEL` (`sonnet`).
 
+**Бюджет NL-контроллера:** `ORQ_CONTROLLER_MAX_TOKENS` (8000). ⚠️ Не занижать: шлюз
+`kimi-k2.7-code` тратит на скрытый reasoning >1100 токенов ДО первого символа ответа, и они
+входят в `max_tokens`. На прежних 1800 контроллер отдавал `finish_reason="length"` с ПУСТЫМ
+content на любом вводе — в консоли это выглядело как «Kimi не вернул JSON-план» (поймано
+2026-08-24). `reasoning_effort` шлюз игнорирует, отключить размышление нельзя — только запас.
+
 **Портируемость путей** (для Docker/Linux; на Windows работают дефолты): `ORQ_DATA_ROOT` (корень
 служебных папок; в контейнере `/data`), `ORQ_LEADS_DIR` (`D:\лиды` / `/data/leads`),
 `ORQ_DELIVERABLES_DIR` (перекрывает `ORQ_DATA_ROOT/deliverables`), `ORQ_DELIVERABLE_KEY`,
@@ -504,6 +513,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `ORQ_DISK_BASE`, `ORQ_WEB_JOBS_DIR`.
 
 **Тумблеры движка:** `DR_USE_LLM` (1; `0` = regex-only, бесплатно), `DR_USE_CRAWL4AI` (1; `0` → HTTP-фолбэк),
+`DR_USE_TRAFILATURA` (1; `0` = только regex-срезка тегов),
 `DR_PAGE_CHARS` (9000), `DR_BREADTH`/`DR_DEPTH` (4/2), `DR_MAXPAGES` (25), `DR_MAX_DOMAINS` (3),
 `DR_LLM_CONCURRENCY` (2), `DR_CRAWL_CONCURRENCY` (4), `DR_SEARCH_INTERVAL` (1.6 с),
 `DR_SEARCH_CONCURRENCY` (1), `DR_LLM_TIMEOUT` (300), `DR_KIMI_MAX_TOKENS` (8000),
@@ -524,6 +534,16 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 страницу), `EMAIL_GUESS_SITE_BUDGET` (45 с — общий дедлайн обхода сайта на компанию; socket-таймаут
 от сервера, отдающего по байту, не спасает); `EMAIL_VERIFIER_URL` + `EMAIL_VERIFIER_KIND`
 (`aftership` | `reacher`) — адрес СВОЕГО (self-hosted) верификатора, если он поднят.
+
+**Отсев действующих клиентов (`crm_push.fetch_existing_clients`).** `GET <CRM_URL>/api/leads/ingest/clients`
+тем же `CRM_INGEST_TOKEN` отдаёт раздел «Клиенты» (организации). Компания-клиент выбрасывается
+ДО карточки RusProfile в госдоборе и ДО письма в outreach: с ней уже работают.
+⚠️ У организаций в CRM своего ИНН НЕТ — он приезжает только там, где выводится от лида с тем же
+названием, поэтому имя здесь полноправный ключ, а не аварийный откат как в индексе лидов.
+⚠️ HTTP 404 = «CRM старая, эндпоинта нет» и это НЕ «клиентов нет»: индекс возвращает
+`supported=False`, а `client_facts()` печатает громкое предупреждение. Молча выключенный отсев
+неотличим от отсева, который ничего не нашёл. В `outreach` недоступность CRM — предупреждение
+для черновиков и ЖЁСТКИЙ стоп для `--send`.
 
 **Стадия 9 — выгрузка в CRM (`crm_push`):** `CRM_URL` (база CRM ЦИТ РТ, напр.
 `https://crm.example.ru`; локально `http://localhost:8000`), `CRM_INGEST_TOKEN` (тот же

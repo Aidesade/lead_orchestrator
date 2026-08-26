@@ -227,6 +227,15 @@ async def _claude_plan(prompt: str, history: list[dict] | None = None) -> tuple[
     return _normalise_plan(_extract_json(text)), text
 
 
+# ⚠️ Бюджет НЕ равен длине плана. Сам JSON — это ~200 токенов, но шлюз
+# `kimi-k2.7-code` тратит перед ним больше 1100 на reasoning, и они входят в
+# max_tokens. На прежних 1800 ответ обрывался ДО первого символа: приходил
+# `finish_reason="length"` с ПУСТЫМ content, и это читалось как «модель не вернула
+# JSON» (замерено 2026-08-24: 1800 -> content='', 8000 -> план за 1345 токенов).
+# Занижать обратно нельзя — контроллер снова замолчит без внятной причины.
+CONTROLLER_MAX_TOKENS = _positive_int(os.environ.get("ORQ_CONTROLLER_MAX_TOKENS"), 8000)
+
+
 async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[dict, str]:
     """Один короткий вызов Kimi K2.7: NL -> JSON-план. Без tool calls и shell."""
     KC.ensure_env(require_key=True)
@@ -242,13 +251,22 @@ async def _kimi_plan(prompt: str, history: list[dict] | None = None) -> tuple[di
         for structured in (True, False):
             kwargs = {
                 "model": KC.model_name(), "messages": messages,
-                "max_tokens": 1800, "temperature": 0.0,
+                "max_tokens": CONTROLLER_MAX_TOKENS, "temperature": 0.0,
             }
             if structured:
                 kwargs["response_format"] = {"type": "json_object"}
             try:
                 response = await client.chat.completions.create(**kwargs)
-                text = response.choices[0].message.content or ""
+                choice = response.choices[0]
+                text = choice.message.content or ""
+                # Пустой ответ с finish_reason="length" — это не «модель не поняла»,
+                # а «бюджет кончился на reasoning». Причины разные, лечение тоже.
+                if not text.strip() and choice.finish_reason == "length":
+                    spent = getattr(getattr(response, "usage", None), "completion_tokens", "?")
+                    raise RuntimeError(
+                        f"модель израсходовала весь бюджет ({spent} из "
+                        f"{CONTROLLER_MAX_TOKENS} токенов) на размышление и не начала "
+                        f"ответ — подними ORQ_CONTROLLER_MAX_TOKENS")
                 return _normalise_plan(_extract_json(text)), text
             except Exception as exc:  # шлюз может не поддержать response_format
                 last_error = exc

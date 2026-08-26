@@ -266,6 +266,56 @@ def check_no_verifier_stage() -> None:
     assert "smtp=False" in src, "стадия 6 обязана строить гипотезы БЕЗ SMTP-пробы"
 
 
+def check_client_filter() -> None:
+    """Действующим клиентам не пишем, а невозможность это проверить блокирует --send."""
+    import crm_push as CRM
+
+    leads = [
+        {"_inn": "6234065445", "name": "АО «Рязаньавтодор»"},   # клиент по ИНН
+        {"_inn": "1655206692", "name": "ООО «Клиент без ИНН»"},  # клиент по имени
+        {"_inn": "7712040126", "name": "ПАО «Аэрофлот»"},        # не клиент
+    ]
+    index = CRM.ExistingClients(
+        frozenset({"6234065445"}),
+        frozenset({CRM._normal_name("ООО «Клиент без ИНН»")}),
+        2,
+    )
+
+    original_fetch, original_conf = CRM.fetch_existing_clients, CRM.is_configured
+    try:
+        CRM.is_configured = lambda: True
+        CRM.fetch_existing_clients = lambda *a, **k: index
+        kept = OUT.filter_clients(leads, sending=True)
+        assert [lead["_inn"] for lead in kept] == ["7712040126"], kept
+
+        # CRM недоступна: черновики продолжаем, реальную отправку — нет.
+        def boom(*a, **k):
+            raise CRM.CRMIndexError("индекс клиентов CRM недоступен: connection refused")
+
+        CRM.fetch_existing_clients = boom
+        assert OUT.filter_clients(leads, sending=False) == leads, \
+            "в режиме черновиков сбой CRM не должен останавливать прогон"
+        try:
+            OUT.filter_clients(leads, sending=True)
+        except SystemExit as exc:
+            assert "--send" in str(exc), exc
+        else:
+            raise AssertionError("с --send недоступный индекс клиентов обязан быть стопом")
+
+        # Старая CRM (404): отсева нет, но и прогон не рушится.
+        CRM.fetch_existing_clients = lambda *a, **k: CRM.ExistingClients(
+            frozenset(), frozenset(), 0, supported=False)
+        assert OUT.filter_clients(leads, sending=True) == leads
+
+        # CRM не настроена вовсе — легальный режим, отсекать нечем.
+        CRM.is_configured = lambda: False
+        CRM.fetch_existing_clients = boom
+        assert OUT.filter_clients(leads, sending=True) == leads
+    finally:
+        CRM.fetch_existing_clients, CRM.is_configured = original_fetch, original_conf
+    print("  ✓ отсев клиентов: по ИНН и имени, стоп на --send, мягко на черновиках")
+
+
 def check_sent_persisted_before_crm() -> None:
     """Необратимая отправка должна пережить остановку процесса внутри CRM."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -325,6 +375,7 @@ def main() -> int:
     check_recipients()
     check_letter()
     check_no_verifier_stage()
+    check_client_filter()
     check_sent_persisted_before_crm()
     print("test_outreach: OK — реестр атомарен, отвергнутые адреса не рассылаются, "
           "подпись и отписка дописываются кодом")

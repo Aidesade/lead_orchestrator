@@ -39,7 +39,7 @@ deep_research_engine — НАСТОЯЩИЙ глубокий ресёрч-дви
 дополнительные — половинный). Критик полноты также следит за «экосистемой» — вертикалью
 принятия решений (учредитель, курирующее ведомство, сестринские структуры, комиссии).
 
-Зависимости штатного пути: stdlib + openai + (опц.) crawl4ai. claude-agent-sdk нужен
+Зависимости штатного пути: stdlib + openai + (опц.) crawl4ai, trafilatura. claude-agent-sdk нужен
 только для явно включённого legacy-отката (ORQ_KIMI_ONLY=0, DR_LLM_PROVIDER=claude).
 Чистая логика (regex_findings, completeness_critic, merge_findings, consolidate)
 работает БЕЗ сети и БЕЗ LLM — это страховка и предмет дымового теста.
@@ -92,6 +92,9 @@ DR_LLM_PROVIDER = (os.environ.get("DR_LLM_PROVIDER", "kimi") or "kimi").strip().
 DR_USE_LLM = os.environ.get("DR_USE_LLM", "1") not in ("0", "false", "no", "")
 DR_PAGE_CHARS = int(os.environ.get("DR_PAGE_CHARS", "9000"))  # кап текста страницы для LLM
 DR_MAX_DOMAINS = int(os.environ.get("DR_MAX_DOMAINS", "3"))   # подтверждённых сайтов на компанию
+# trafilatura снимает со страницы основной текст без меню/футера/баннеров. `0` — вернуться
+# к чистому regex-разбору (движок обязан работать и без библиотеки).
+DR_USE_TRAFILATURA = os.environ.get("DR_USE_TRAFILATURA", "1") not in ("0", "false", "no", "")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -327,16 +330,24 @@ _LINK_KEEP = re.compile(
     r"dzen\.ru|rutube\.ru)/[\w.\-/@+]+", re.I)
 
 
-def _html_to_text(html):
-    """HTML -> компактный текст. ВАЖНО: соцсети/почты/телефоны живут в href/mailto/tel —
-    их надо вытащить ДО срезки тегов, иначе теряются (как у текущего агента)."""
-    if not html:
-        return ""
+def _keep_links(html):
+    """Соцсети/mailto/tel из АТРИБУТОВ — их надо снять до срезки тегов.
+
+    Ни regex-разбор, ни trafilatura до href не добираются: обе работают с текстом,
+    а телефон в `<a href="tel:...">` текстом может и не быть."""
     html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
-    # сохранить «интересные» ссылки из атрибутов перед удалением тегов
     keep = set(m.group(0) for m in _LINK_KEEP.finditer(html))
     keep |= set("mailto:" + m for m in re.findall(r'mailto:([^"\'>\s)]+)', html, re.I))
     keep |= set("tel:" + m for m in re.findall(r'tel:([^"\'>\s)]+)', html, re.I))
+    return keep
+
+
+def _html_to_text_regex(html):
+    """Полный текст страницы срезкой тегов — нижняя граница качества.
+
+    Тащит и навигацию, и подвал, зато не теряет НИЧЕГО. Служит и фолбэком, и
+    эталоном полноты для проверки вывода trafilatura."""
+    html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
     html = re.sub(r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>", "\n", html, flags=re.I)
     html = re.sub(r"<[^>]+>", " ", html)
     html = (html.replace("&nbsp;", " ").replace("&laquo;", "«").replace("&raquo;", "»")
@@ -346,7 +357,103 @@ def _html_to_text(html):
     html = re.sub(r"&[a-z]+;", " ", html)
     html = re.sub(r"[ \t\xa0]+", " ", html)
     html = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", html)
-    out = html.strip()
+    return html.strip()
+
+
+_TRAFILATURA = None      # None — ещё не пробовали, False — библиотеки нет
+
+
+def _trafilatura_text(html):
+    """Основной текст страницы через trafilatura либо None, если не получилось.
+
+    Импорт ленивый и однократный: библиотека — улучшение качества, а не новая
+    обязательная зависимость, и её отсутствие движок не роняет.
+    ⚠️ `favor_recall` включён осознанно: у нас цена лишнего абзаца навигации —
+    несколько токенов, а цена потерянного телефона — мёртвый контакт в CRM."""
+    global _TRAFILATURA
+    if not DR_USE_TRAFILATURA or _TRAFILATURA is False:
+        return None
+    if _TRAFILATURA is None:
+        try:
+            import trafilatura
+        except Exception:
+            _TRAFILATURA = False
+            return None
+        _TRAFILATURA = trafilatura
+    try:
+        return _TRAFILATURA.extract(
+            html,
+            output_format="txt",
+            include_comments=False,
+            include_tables=True,     # реквизиты и оргструктура на сайтах живут в таблицах
+            favor_recall=True,
+        ) or None
+    except Exception:
+        return None
+
+
+_FACT_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_FACT_PHONE = re.compile(r"(?:\+7|\b8)[\s(\-]*\d{3}[\s)\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}")
+_FACT_REQUISITE = re.compile(r"\b\d{10}\b|\b\d{12}\b|\b\d{13}\b")   # ИНН юр/физ, ОГРН
+
+
+def _contact_facts(text):
+    """Контакты и реквизиты текста — то, что никакая чистка терять не имеет права."""
+    text = text or ""
+    facts = {m.group(0).lower() for m in _FACT_EMAIL.finditer(text)}
+    facts |= {re.sub(r"\D", "", m.group(0))[-10:] for m in _FACT_PHONE.finditer(text)}
+    facts |= set(_FACT_REQUISITE.findall(text))
+    return facts
+
+
+_RESCUE_MAX_LINES = 40
+_RESCUE_MAX_CHARS = 4000
+
+
+def _rescue_lines(plain, lost):
+    """Строки полного текста, в которых стоят потерянные trafilatura контакты.
+
+    Возвращает None, если спасать пришлось бы слишком много: значит страница и есть
+    справочник контактов, и резать её вообще не надо — берётся полный текст."""
+    out, seen, size = [], set(), 0
+    for line in plain.split("\n"):
+        line = line.strip()
+        if not line or line in seen or not (_contact_facts(line) & lost):
+            continue
+        seen.add(line)
+        size += len(line)
+        if len(out) >= _RESCUE_MAX_LINES or size > _RESCUE_MAX_CHARS:
+            return None
+        out.append(line)
+    return out or None
+
+
+def _html_to_text(html):
+    """HTML -> компактный текст. ВАЖНО: соцсети/почты/телефоны живут в href/mailto/tel —
+    их надо вытащить ДО срезки тегов, иначе теряются (как у текущего агента).
+
+    Тело страницы даёт trafilatura: она снимает меню, подвал и «читайте также», на
+    которые LLM-экстракт раньше тратил окно. Но отдавать её вывод как есть нельзя:
+    на русских корпоративных сайтах телефон, почта и ИНН стоят как раз в подвале,
+    который она штатно считает шаблонным (замерено на живых сайтах — теряет на 4 из 5).
+
+    Поэтому вывод сверяется с полным текстом по контактам и реквизитам, и потерянные
+    строки возвращаются отдельным блоком. Полный текст берётся целиком только когда
+    возвращать пришлось бы слишком много — тогда страница и есть страница контактов."""
+    if not html:
+        return ""
+    keep = _keep_links(html)
+    plain = _html_to_text_regex(html)
+    main = (_trafilatura_text(html) or "").strip()
+    out = plain
+    if main:
+        lost = _contact_facts(plain) - _contact_facts(main)
+        if not lost:
+            out = main
+        else:
+            rescued = _rescue_lines(plain, lost)
+            if rescued:
+                out = main + "\n\nКонтакты и реквизиты со страницы:\n" + "\n".join(rescued)
     if keep:
         out += "\n\nСсылки и контакты страницы: " + " ".join(sorted(keep))
     return out

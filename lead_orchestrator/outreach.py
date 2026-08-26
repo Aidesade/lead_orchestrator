@@ -409,6 +409,41 @@ def stage_crm(lead, idx, reg, inn, sent, onepager, *, draft=False, enabled=True)
     log(f"    [{idx}] CRM: {note}")
 
 
+def filter_clients(leads, *, sending=False):
+    """Выбросить из очереди компании, которые уже наши клиенты.
+
+    Прекондишен до первой компании, как и проверка ящика: письмо действующему
+    клиенту — не потраченный лимит, а испорченный контакт живой сделки.
+
+    Сила отказа зависит от необратимости. Нет CRM_URL — отсеивать нечем и незачем
+    (прогон без CRM легален). CRM есть, но старая и эндпоинта не знает — громкое
+    предупреждение: блокировать рассылку до её обновления было бы хуже. А вот
+    когда CRM настроена и не отвечает, перед РЕАЛЬНОЙ отправкой это стоп: слать
+    вслепую по базе, где могут быть свои же, нельзя.
+    """
+    if not CRM.is_configured():
+        log("[стадия 1] отсев клиентов пропущен: CRM не настроена")
+        return leads
+    try:
+        index = CRM.fetch_existing_clients()
+    except CRM.CRMIndexError as exc:
+        if sending:
+            raise SystemExit(
+                f"[стадия 1] отсев клиентов невозможен ({exc}); "
+                "с --send это стоп — иначе письмо может уйти действующему клиенту")
+        log(f"[стадия 1] ⚠ отсев клиентов не выполнен: {exc}")
+        return leads
+    log(CRM.client_facts(index))
+    if not index.supported:
+        return leads
+    kept = [lead for lead in leads if not index.contains(lead)]
+    if len(kept) != len(leads):
+        for lead in leads:
+            if index.contains(lead):
+                log(f"[стадия 1] клиент, писать не будем: {lead.get('name') or lead.get('_inn')}")
+    return kept
+
+
 # ============================================================== ОБРАБОТКА =====
 # Как называется остановка в логе и чем она оборачивается для счётчиков прогона.
 _STOP = {REG.SKIP: ("пропуск", "skip"), REG.FAIL: ("сбой", "fail")}
@@ -505,6 +540,10 @@ async def run(args):
         leads = reg.filter_new(leads)
         if before != len(leads):
             log(f"[стадия 1] отсеяно уже отработанных: {before - len(leads)}")
+    before = len(leads)
+    leads = filter_clients(leads, sending=bool(args.send))
+    if before != len(leads):
+        log(f"[стадия 1] отсеяно действующих клиентов: {before - len(leads)}")
     if args.limit:
         leads = leads[:args.limit]
     if not leads:

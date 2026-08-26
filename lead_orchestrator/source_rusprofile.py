@@ -521,8 +521,20 @@ def parse_region_query(query):
     return (inc or None), (exc or None)
 
 
+def region_code_filter():
+    """Код субъекта РФ для СЕРВЕРНОГО фильтра выдачи (`RUSPROFILE_REGION_CODE`).
+
+    Пусто — прежнее поведение: листаем страну и режем регион у себя. Код задан —
+    RusProfile отдаёт только этот субъект, и в те же 20 страниц влезает весь регион,
+    а не его случайный срез из общероссийского топа. Клиентский фильтр при этом
+    НЕ отключается: код — ускоритель выдачи, а решение о регионе остаётся за
+    `region_included()`, иначе опечатка в коде тихо впустила бы чужой субъект."""
+    return str(os.environ.get("RUSPROFILE_REGION_CODE", "") or "").strip()
+
+
 def _harvest_with_session(session, industries, min_revenue, per_industry, region,
                           out_path, exclude_regions, max_pages):
+    region_code = region_code_filter()
     inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
     if exclude_regions:                    # явные исключения (обратная совместимость)
         exc = (exc or []) + list(exclude_regions)
@@ -536,7 +548,13 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
             + (f" | регион: {region}" if has_filter else "") + " ===")
         # Живой ответ RusProfile не упорядочен по finance_revenue. Берём все
         # доступные страницы (API ограничивает их двадцатью), затем сортируем.
-        items = session.search(cfg["okved"], min_revenue, max_pages=max_pages)
+        # ⚠️ Двадцать страниц — это 1000 записей и жёсткий потолок САМОГО RusProfile:
+        # запрос 50 страниц всё равно останавливается на 20-й (замерено 2026-08-24).
+        # Поэтому при региональном сборе решает не глубина листания, а серверный
+        # фильтр по коду субъекта: тот же construction по Башкортостану дал 25 из
+        # тысячи по стране против 54 по коду «02» — вдвое больше и без мусора.
+        items = session.search(cfg["okved"], min_revenue, max_pages=max_pages,
+                               region_codes=[region_code] if region_code else None)
         items = sorted(
             (it for it in items if isinstance(it, dict)),
             key=lambda it: revenue_value(it.get("finance_revenue")) or -1,

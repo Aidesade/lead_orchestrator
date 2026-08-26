@@ -141,6 +141,121 @@ class ExistingLeads:
         return bool(name and name in self.legacy_names)
 
 
+@dataclass(frozen=True)
+class ExistingClients:
+    """Раздел «Клиенты» CRM: с кем уже работают — к таким лидген не идёт.
+
+    Отдельно от `ExistingLeads`, потому что источник другой и слабее: у организаций
+    в CRM своего ИНН нет, он приходит только там, где выводится от лида с тем же
+    названием. Поэтому имя здесь — полноправный ключ, а не аварийный откат для
+    старых строк, как в индексе лидов.
+
+    `supported=False` — CRM ещё не умеет отдавать клиентов (эндпоинта нет). Это
+    состояние деплоя, а не сбой, но и не «клиентов нет»: вызывающий обязан сказать
+    об этом вслух, иначе отсев молча выключится и мы пойдём к своим же.
+    """
+    inns: frozenset[str]
+    names: frozenset[str]
+    total: int
+    supported: bool = True
+
+    def contains(self, lead):
+        lead = lead or {}
+        inn = _digits(lead.get("_inn") or lead.get("inn"))
+        if _valid_org_inn(inn) and inn in self.inns:
+            return True
+        name = _normal_name(lead.get("name") or lead.get("company_name"))
+        return bool(name and name in self.names)
+
+
+def client_facts(index):
+    """Строка для лога о том, работает ли отсев клиентов.
+
+    Отдельной функцией, потому что её печатают три точки входа, и «CRM не умеет
+    отдавать клиентов» обязано выглядеть одинаково громко во всех трёх: молчаливо
+    выключенный отсев неотличим от отсева, который ничего не нашёл."""
+    if not getattr(index, "supported", True):
+        return ("[CRM] ⚠ отсев клиентов НЕ РАБОТАЕТ: эта CRM не отдаёт "
+                "/api/leads/ingest/clients — обнови её, иначе пойдём к своим же")
+    return (f"[CRM] клиентов в CRM: {index.total} "
+            f"(с ИНН {len(index.inns)}, остальные матчатся по названию)")
+
+
+def _parse_clients_index(data):
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise CRMIndexError("CRM вернула неверную схему индекса клиентов")
+    items = data["items"]
+    total = data.get("total")
+    if not isinstance(total, int) or total != len(items):
+        raise CRMIndexError("CRM вернула несогласованный total индекса клиентов")
+
+    inns, names = set(), set()
+    for row in items:
+        if not isinstance(row, dict) or not isinstance(row.get("id"), int):
+            raise CRMIndexError("CRM вернула неверную строку индекса клиентов")
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise CRMIndexError("CRM вернула клиента без названия")
+        names.add(_normal_name(name))
+        inn = _digits(row.get("inn"))
+        if _valid_org_inn(inn):
+            inns.add(inn)
+    return ExistingClients(frozenset(inns), frozenset(names), total)
+
+
+def fetch_existing_clients(attempts=3, *, deadline=None):
+    """Индекс раздела «Клиенты» — компании, к которым идти уже не надо.
+
+    Строгость та же, что у индекса лидов: неверный ответ фатален, потому что
+    тихо принятый пустой список означал бы рассылку по действующим клиентам.
+    Единственное послабление — HTTP 404: это CRM без эндпоинта, и она возвращает
+    `supported=False`, чтобы не заблокировать прогон на старом стенде.
+    """
+    if not (base_url() and token()):
+        raise CRMIndexError("CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)")
+
+    req = urllib.request.Request(f"{base_url()}/api/leads/ingest/clients", method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("X-Ingest-Token", token())
+    attempts = max(1, int(attempts or 1))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with _urlopen(req, timeout=_deadline_timeout(deadline)) as resp:
+                raw = resp.read(5 * 1024 * 1024 + 1)
+            if len(raw) > 5 * 1024 * 1024:
+                raise CRMIndexError("индекс клиентов CRM превышает 5 МиБ")
+            return _parse_clients_index(json.loads(raw.decode("utf-8", "replace")))
+        except CRMIndexError:
+            raise
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return ExistingClients(frozenset(), frozenset(), 0, supported=False)
+            detail = ""
+            try:
+                detail = json.loads(exc.read().decode("utf-8", "replace")).get("detail") or ""
+            except Exception:
+                pass
+            last_error = CRMIndexError(_safe_index_error(
+                f"индекс клиентов CRM HTTP {exc.code}: {detail}"))
+            transient = exc.code == 429 or 500 <= exc.code < 600
+            if not transient or attempt >= attempts:
+                raise last_error from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = CRMIndexError(_safe_index_error(
+                f"индекс клиентов CRM недоступен: {getattr(exc, 'reason', None) or exc}"))
+            if attempt >= attempts:
+                raise last_error from None
+        except (ValueError, TypeError) as exc:
+            raise CRMIndexError(_safe_index_error(
+                f"CRM вернула невалидный JSON индекса клиентов: {exc}")) from None
+        delay = min(2.0, 0.5 * attempt)
+        if deadline is not None and delay >= _deadline_timeout(deadline):
+            raise CRMIndexError("общий лимит строгого добора истёк перед повтором CRM")
+        time.sleep(delay)
+    raise last_error or CRMIndexError("индекс клиентов CRM недоступен")
+
+
 def _safe_index_error(value):
     text = str(value or "")
     secret = token()

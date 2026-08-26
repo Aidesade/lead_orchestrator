@@ -88,6 +88,26 @@ def check_one_deadline_wraps_all_preconditions():
     print("  ✓ один абсолютный deadline охватывает CRM, Росимущество, Chrome и collector")
 
 
+def check_clients_reach_collector():
+    """Боевой вход обязан ДОСТАВИТЬ индекс клиентов в добор.
+
+    `harvest_state_owned` за клиентами сам не ходит, когда индекс лидов передан
+    снаружи, — иначе офлайн-вызовы полезли бы в сеть. Цена этого решения в том,
+    что потерянный `client_index=` не сломает ничего явно: сбор просто перестанет
+    отсеивать клиентов и молча пойдёт к своим. Этот тест и есть та поломка."""
+    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    collector = source[source.index("def _collect_state_owned"):source.index("def _collect(")]
+    assert "fetch_existing_clients(deadline=deadline)" in collector, \
+        "боевой вход перестал читать индекс клиентов"
+    assert collector.index("fetch_existing_clients(") < collector.index("harvest_state_owned("), \
+        "клиентов надо получить ДО Chrome и первой карточки"
+    assert "client_index=client_index" in collector, \
+        "индекс клиентов не доезжает до harvest_state_owned — отсев выключится молча"
+    assert "print(client_facts(client_index))" in collector, \
+        "состояние отсева клиентов обязано печататься: выключенный отсев должен быть виден"
+    print("  ✓ индекс клиентов читается до Chrome и доезжает до добора")
+
+
 def main():
     print("wiring режима госкомпаний:")
     check_state_plan()
@@ -96,6 +116,7 @@ def main():
     check_crm_batch_after_phase_two()
     check_collect_only_stops_before_phase_two()
     check_one_deadline_wraps_all_preconditions()
+    check_clients_reach_collector()
     print("test_state_owned_wiring: OK")
     return 0
 

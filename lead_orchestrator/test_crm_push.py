@@ -204,6 +204,101 @@ def check_lookup_index(monkeypatched):
     print("  ✓ GET-индекс: ИНН/ОГРН, точный fallback имени, минимальный запрос")
 
 
+def check_clients_index(monkeypatched):
+    """Индекс клиентов: имя — полноправный ключ, ИНН приходит не у всех."""
+    _configure()
+    seen = {}
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["method"] = req.get_method()
+        return FakeResponse(json.dumps({
+            "items": [
+                {"id": 1, "name": "АО «Рязаньавтодор»", "inn": "6234065445"},
+                {"id": 2, "name": "ООО «Клиент без ИНН»", "inn": None},
+                {"id": 3, "name": "АО «Клиент с мусорным ИНН»", "inn": "1234567890"},
+            ],
+            "total": 3,
+        }, ensure_ascii=False).encode("utf-8"))
+
+    monkeypatched(fake_urlopen)
+    index = CRM.fetch_existing_clients()
+    assert index.supported
+    assert index.total == 3
+    assert index.inns == frozenset({"6234065445"}), index.inns
+    assert index.contains({"_inn": "6234065445", "name": "имя не совпадает"})
+    # клиент, заведённый руками: ИНН взять неоткуда, спасает только имя
+    assert index.contains({"name": "  ООО \"Клиент без ИНН\"  "})
+    assert index.contains({"_inn": "9999999999", "name": "ООО «Клиент без ИНН»"})
+    # невалидный ИНН в ключи не попадает — иначе отсеяли бы чужую компанию
+    assert "1234567890" not in index.inns
+    assert not index.contains({"_inn": "1234567890", "name": "АО «Совсем другая»"})
+    assert not index.contains({"name": "ООО «Клиент без ИНН плюс»"})
+    assert seen["url"] == "http://crm.local/api/leads/ingest/clients", seen
+    assert seen["method"] == "GET"
+    print("  ✓ индекс клиентов: ИНН и имя, мусорный ИНН отбрасывается")
+
+
+def check_clients_404_is_not_empty(monkeypatched):
+    """404 = «CRM не умеет», а НЕ «клиентов нет» — и это должно быть видно."""
+    _configure()
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, io.BytesIO(b"{}"))
+
+    monkeypatched(fake_urlopen)
+    index = CRM.fetch_existing_clients()
+    assert index.supported is False
+    assert index.total == 0
+    assert not index.contains({"_inn": "6234065445", "name": "АО «Рязаньавтодор»"})
+    note = CRM.client_facts(index)
+    assert "НЕ РАБОТАЕТ" in note, note
+    # «клиентов 0» и «отсев выключен» обязаны читаться по-разному
+    empty = CRM.ExistingClients(frozenset(), frozenset(), 0)
+    assert "НЕ РАБОТАЕТ" not in CRM.client_facts(empty)
+    print("  ✓ 404: отсев выключен явно, а не молча выдаёт «клиентов нет»")
+
+
+def check_clients_fail_closed(monkeypatched):
+    """Сбой и кривая схема фатальны: тихо пустой список = рассылка по своим."""
+    _configure()
+
+    def broken_schema(req, timeout=None):
+        return FakeResponse(json.dumps({"items": [{"id": 1}], "total": 1}).encode("utf-8"))
+
+    monkeypatched(broken_schema)
+    try:
+        CRM.fetch_existing_clients()
+    except CRM.CRMIndexError as exc:
+        assert "клиент" in str(exc).lower(), exc
+    else:
+        raise AssertionError("клиент без названия обязан быть ошибкой")
+
+    def bad_total(req, timeout=None):
+        return FakeResponse(json.dumps(
+            {"items": [{"id": 1, "name": "X", "inn": None}], "total": 7}).encode("utf-8"))
+
+    monkeypatched(bad_total)
+    try:
+        CRM.fetch_existing_clients()
+    except CRM.CRMIndexError:
+        pass
+    else:
+        raise AssertionError("несогласованный total обязан быть ошибкой")
+
+    def server_error(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b"{}"))
+
+    monkeypatched(server_error)
+    try:
+        CRM.fetch_existing_clients(attempts=1)
+    except CRM.CRMIndexError:
+        pass
+    else:
+        raise AssertionError("HTTP 500 обязан быть ошибкой, а не пустым индексом")
+    print("  ✓ индекс клиентов fail-closed: схема, total и HTTP 500")
+
+
 def check_lookup_fail_closed(monkeypatched):
     import os
     for key in ("CRM_URL", "CRM_INGEST_TOKEN"):
@@ -318,6 +413,9 @@ def main():
         check_no_company_name(monkeypatched)
         check_ping_creates_nothing(monkeypatched)
         check_lookup_index(monkeypatched)
+        check_clients_index(monkeypatched)
+        check_clients_404_is_not_empty(monkeypatched)
+        check_clients_fail_closed(monkeypatched)
         check_lookup_fail_closed(monkeypatched)
         check_atomic_batch_and_no_redirect(monkeypatched)
     finally:
