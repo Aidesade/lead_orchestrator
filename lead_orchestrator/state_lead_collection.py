@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Bounded-добор новых госкомпаний поверх CRM, RusProfile и ЕГРЮЛ.
 
-Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025,
+Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025
+(порог — единственная цифра профиля с тумблером, `STATE_LEAD_MIN_REVENUE`),
 прямая/косвенная госдоля ≥25% (ЕГРЮЛ + Росимущество) и юрадрес в регионе
 `STATE_LEAD_REGION` (дефолт — Татарстан). Регион отклоняется дёшево по выдаче
 RusProfile, а ПРИНИМАЕТСЯ только по субъекту РФ из официальной выписки ЕГРЮЛ:
@@ -44,7 +45,7 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
 
     if time.monotonic() >= deadline:
         raise SR.StateOwnershipUnavailable("общий лимит строгого добора истёк до RusProfile")
-    min_revenue = 2_000_000_000
+    min_revenue = lead_min_revenue()
     revenue_year = 2025
     # Фильтр по штату (240–260) удалён 2026-08-19: критерий устарел.
     # Серверный фильтр региона критичен для воронки: без него выдача — топ РФ по
@@ -348,6 +349,32 @@ def lead_region_code():
     Пустой ``STATE_LEAD_REGION_CODE=`` отключает только серверный фильтр:
     строгие гейты по выдаче и выписке ЕГРЮЛ работают независимо от него."""
     return str(os.environ.get("STATE_LEAD_REGION_CODE", "16") or "").strip()
+
+
+def lead_min_revenue():
+    """Порог выручки строгого добора (`STATE_LEAD_MIN_REVENUE`, дефолт 2 млрд ₽).
+
+    Тумблер нужен там, где субъект мал: критерий «≥2 млрд» выведен на Татарстане,
+    а в регионе поменьше он оставляет от воронки десятки компаний — замер по
+    Башкортостану 2026-08-26: 586 компаний ≥1 млрд на весь субъект.
+
+    Ниже общего пола лидгена (`MIN_REVENUE_FLOOR`, 1 млрд) опускаться некуда:
+    серверный фильтр RusProfile дешевле не отдаёт, и «порог» превратился бы
+    в тихую фикцию. Значение невалидно -> ValueError, а не молчаливый дефолт:
+    опечатка в пороге меняет ВЕСЬ отбор и обязана останавливать прогон."""
+    raw = str(os.environ.get("STATE_LEAD_MIN_REVENUE", "") or "").strip()
+    if not raw:
+        return 2_000_000_000
+    try:
+        value = float(raw.replace(" ", "").replace(",", "."))
+    except ValueError as exc:
+        raise ValueError(
+            "STATE_LEAD_MIN_REVENUE должен быть числом рублей (напр. 1e9)") from exc
+    if value < SR.MIN_REVENUE_FLOOR:
+        raise ValueError(
+            f"STATE_LEAD_MIN_REVENUE={raw} ниже общего пола лидгена "
+            f"({int(SR.MIN_REVENUE_FLOOR)} ₽) — источник такие компании не отдаёт")
+    return int(value)
 
 
 def harvest_state_owned(requested_count, *, headless=False, offscreen=False,

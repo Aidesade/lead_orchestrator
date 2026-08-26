@@ -691,6 +691,29 @@ async def _onepager_one(lead, idx, p_tmp, findings=""):
     return 0.0, ""
 
 
+def _push_collected_to_crm(leads, json_out):
+    """Выгрузить собранных ФАЗОЙ 1 лидов в CRM (флаг --push-crm при --collect-only).
+
+    Идёт ПОСЛЕ сохранения JSON и никогда до него: JSON — источник правды прогона,
+    и повторить выгрузку по нему можно в любой момент
+    (`py crm_push.py --leads <json>`), а восстановить несохранённый сбор нельзя.
+
+    Ошибка выгрузки — ненулевой код возврата, а не тихая строка в логе: прогон
+    просили довести до CRM, и «собрал, но не залил» это невыполненная задача."""
+    from crm_push import base_url, is_configured, push_collected
+    if not is_configured():
+        raise SystemExit("--push-crm: CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)")
+    print(f"[CRM] выгрузка {len(leads)} собранных лидов -> {base_url()}")
+    pushed, failed = push_collected(
+        leads, note="Сбор ФАЗЫ 1: ресёрч не проводился, письмо не отправлялось.")
+    print(f"[CRM] заведено/обновлено {len(pushed)} из {len(leads)}"
+          + (f" | не удалось {len(failed)}" if failed else ""))
+    if failed:
+        raise SystemExit(
+            f"CRM: не выгружено {len(failed)} лидов; повтори по сохранённому JSON: "
+            f'py crm_push.py --leads "{json_out}"')
+
+
 def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True):
     """Строгая Фаза 1: ровно N новых компаний с госдолей ≥25% и юрадресом региона
     (дефолт — Татарстан, тумблер STATE_LEAD_REGION)."""
@@ -699,7 +722,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     import rusprofile_session as RPS
     from crm_push import CRMIndexError, client_facts, fetch_existing_clients, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
-    from state_lead_collection import (lead_region_query, lead_tz_limit,
+    from state_lead_collection import (lead_min_revenue, lead_region_query, lead_tz_limit,
                                        load_local_registry_strict, ownership_enabled)
     from state_ownership import OwnershipVerifier, RosimRegistry, StateOwnershipDeadline
 
@@ -747,10 +770,14 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
         raise SystemExit(f"локальный реестр: {exc}") from None
     region_query = lead_region_query()
     tz_limit = lead_tz_limit()
+    try:
+        min_revenue = lead_min_revenue()
+    except ValueError as exc:
+        raise SystemExit(f"порог выручки: {exc}") from None
     print(
         f"[1/2] строгий добор {count} новых "
         + ("госкомпаний" if ownership_enabled() else "компаний")
-        + f" | CRM {crm_index.total} лидов | выручка >=2 млрд ₽ за 2025 | "
+        + f" | CRM {crm_index.total} лидов | выручка >={min_revenue / 1e9:g} млрд ₽ за 2025 | "
         + ("прямая/косвенная госдоля >=25% | " if ownership_enabled()
            else "госдоля НЕ проверяется | ")
         + f"регион: {region_query or 'любой'}"
@@ -1325,6 +1352,9 @@ async def main():
                     help="сколько лидов собрать ВСЕГО (с --industries или --state-owned)")
     ap.add_argument("--collect-only", dest="collect_only", action="store_true",
                     help="остановиться после ФАЗЫ 1: лиды сохраняются в JSON, ресёрч не запускается")
+    ap.add_argument("--push-crm", dest="push_crm", action="store_true",
+                    help="с --collect-only: выгрузить собранных лидов в CRM сразу после ФАЗЫ 1 "
+                         "(upsert по ИНН, без ресёрча и писем)")
     ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,
                     help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
@@ -1429,6 +1459,14 @@ async def main():
             raise SystemExit("--state-owned: --count должен быть от 1 до 200")
     if a.collect_only and not (a.state_owned or a.industries):
         raise SystemExit("--collect-only работает только со сбором: --industries или --state-owned")
+    if a.push_crm:
+        # Выгрузка живёт ровно там, где прогон заканчивается сбором. После ФАЗЫ 2
+        # у госрежима свой атомарный batch исследованных лидов, и два пути записи
+        # в один раздел CRM за один прогон — это гарантированный спор о статусе.
+        if not a.collect_only:
+            raise SystemExit("--push-crm работает только с --collect-only")
+        if a.dry_run:
+            raise SystemExit("--push-crm несовместим с --dry-run: заглушки в CRM не льём")
     if a.no_state_share:
         if not a.state_owned:
             raise SystemExit("--no-state-share имеет смысл только со --state-owned")
@@ -1482,6 +1520,8 @@ async def main():
     if a.collect_only:
         print(f"[итог] collect-only: {len(leads)} лидов сохранено в {json_out}; "
               "ФАЗА 2 не запускалась")
+        if a.push_crm:
+            _push_collected_to_crm(leads, json_out)
         return
     dup_names = {n for n, c in collections.Counter(DO._safe(l.get("name")) for l in leads).items() if c > 1}
     sel = leads          # ресёрчим ВСЕХ, кого собрал первый агент (его --count, по умолч. 200)

@@ -22,9 +22,13 @@ Upsert по ИНН — повторный прогон обновит запис
   CRM_INGEST_TOKEN тот же токен, что LEADGEN_INGEST_TOKEN в .env самой CRM
   CRM_PUSH=0       выключить стадию, не трогая остальные ключи
 
+Вторая точка входа — выгрузка лидов СРАЗУ после ФАЗЫ 1 (`push_collected`),
+без ресёрча и письма: `orchestrator.py --collect-only --push-crm` и CLI ниже.
+
 CLI (ручная проверка связки, письма не шлёт):
   py crm_push.py --ping
   py crm_push.py --demo
+  py crm_push.py --leads "D:\лиды\leads_bashkortostan.json"
 """
 from __future__ import annotations
 
@@ -477,6 +481,49 @@ def push_lead(lead, sent=None, *, draft=False, onepager=""):
     return True, f"лид #{lead_id} {what} ({data.get('status') or '—'})"
 
 
+def push_collected(leads, *, note=None, log=print, error_limit=5):
+    """Выгрузить в CRM лиды СРАЗУ после ФАЗЫ 1 — до всякого ресёрча и письма.
+
+    Почему не `create_researched_batch`: тот пакет означает «компания
+    исследована, материалы готовы», и создаёт лиды только один раз. Здесь
+    ресёрча не было, поэтому идёт штатный ingest — тот же, которым стадия 9
+    заводит компанию письма. Он идемпотентен по ИНН: повтор той же командой
+    после обрыва обновит запись, а не заведёт вторую.
+
+    Лид без валидного ИНН не отправляется вовсе: CRM склеивает записи по ИНН, и
+    компания без него станет вечным дублем при следующем заходе.
+
+    `error_limit` подряд идущих отказов останавливают выгрузку: если CRM легла
+    или отвергла токен, следующие полторы сотни запросов дадут ту же ошибку —
+    лучше вернуть управление с внятной причиной, чем молотить в стену.
+
+    -> (список успешных ИНН, список пар (лид, причина)). Исключений не бросает.
+    """
+    ok, failed, consecutive = [], [], 0
+    for lead in list(leads or []):
+        lead = dict(lead or {})
+        inn = _digits(lead.get("_inn") or lead.get("inn"))
+        if not _valid_org_inn(inn):
+            failed.append((lead, "нет валидного ИНН организации"))
+            continue
+        if note and not lead.get("_crm_note"):
+            lead["_crm_note"] = note
+        pushed, why = push_lead(lead)
+        if pushed:
+            ok.append(inn)
+            consecutive = 0
+        else:
+            failed.append((lead, why))
+            consecutive += 1
+            log(f"  [CRM] {lead.get('name') or inn}: {why}")
+            if consecutive >= error_limit:
+                remaining = len(leads) - len(ok) - len(failed)
+                log(f"  [CRM] {consecutive} отказа подряд — выгрузка остановлена, "
+                    f"не отправлено ещё {max(0, remaining)}")
+                break
+    return ok, failed
+
+
 def lead_url(lead_id=None):
     """Ссылка на раздел «Лиды» — её печатает стадия 8 в отчёте."""
     root = base_url()
@@ -534,9 +581,12 @@ def main():
     ap = argparse.ArgumentParser(description="стадия 9: выгрузка лида в CRM ЦИТ РТ")
     ap.add_argument("--ping", action="store_true", help="проверить настройку и доступность CRM")
     ap.add_argument("--demo", action="store_true", help="залить тестовый лид (ИНН 0000000000)")
+    ap.add_argument("--leads", metavar="JSON",
+                    help="выгрузить собранный ФАЗОЙ 1 JSON лидов (upsert по ИНН)")
+    ap.add_argument("--note", default="", help="пометка в поле note каждого лида")
     args = ap.parse_args()
 
-    if not (args.ping or args.demo):
+    if not (args.ping or args.demo or args.leads):
         ap.print_help()
         return 0
 
@@ -549,8 +599,19 @@ def main():
     if args.ping:
         ok, note = ping()
         print(f"[ping] {'OK' if ok else 'СБОЙ'}: {note}")
-        if not args.demo:
+        if not (args.demo or args.leads):
             return 0 if ok else 3
+
+    if args.leads:
+        with open(args.leads, encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            print(f"[leads] {args.leads}: ожидался список лидов")
+            return 2
+        print(f"[leads] {len(rows)} лидов из {args.leads} -> {base_url()}")
+        pushed, failed = push_collected(rows, note=args.note or None)
+        print(f"[leads] в CRM: {len(pushed)} | не удалось: {len(failed)}")
+        return 0 if pushed and not failed else 3
 
     demo_lead = {
         "name": "ООО «Демо-компания» (тест стадии 9)",

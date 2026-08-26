@@ -398,6 +398,51 @@ def check_atomic_batch_and_no_redirect(monkeypatched):
     print("  ✓ atomic create-only batch и запрет redirect с CRM-токеном")
 
 
+def check_push_collected(monkeypatched):
+    """Выгрузка сырого сбора: upsert по одному, без ИНН не летит, стоп на серии отказов."""
+    _configure()
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse(json.dumps({"id": len(seen), "created": True, "status": "new"}).encode())
+
+    monkeypatched(fake_urlopen)
+    rows = [
+        dict(LEAD),
+        dict(LEAD, _inn="7736050003", name="ПАО «Второе»"),
+        dict(LEAD, _inn="", _ogrn="", name="ООО «Без ИНН»"),
+    ]
+    pushed, failed = CRM.push_collected(rows, note="Сбор ФАЗЫ 1", log=lambda *_: None)
+    assert pushed == ["6234065445", "7736050003"], pushed
+    assert len(failed) == 1 and "ИНН" in failed[0][1], failed
+    # Ушли ровно два запроса, оба — обычный ingest, и оба с пометкой о сборе.
+    assert len(seen) == 2, seen
+    assert all(item["note"] == "Сбор ФАЗЫ 1" for item in seen), seen
+    assert all("sent_to" not in item for item in seen), seen
+
+    # Своя пометка лида важнее общей: она конкретнее.
+    seen.clear()
+    CRM.push_collected([dict(LEAD, _crm_note="своя пометка")], note="общая", log=lambda *_: None)
+    assert seen[0]["note"] == "своя пометка", seen
+
+    # Легла CRM — не долбим её всем списком: после error_limit отказов подряд стоп.
+    calls = {"n": 0}
+
+    def failing(req, timeout=None):
+        calls["n"] += 1
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatched(failing)
+    pushed, failed = CRM.push_collected(
+        [dict(LEAD, _inn=inn) for inn in
+         ("6234065445", "7736050003", "7707083893", "5260200603", "7728168971")],
+        error_limit=2, log=lambda *_: None)
+    assert pushed == [] and calls["n"] == 2, (pushed, calls)
+    assert len(failed) == 2, failed
+    print("  ✓ выгрузка сбора: upsert по одному, лид без ИНН не летит, серия отказов = стоп")
+
+
 def main():
     original = CRM._urlopen
 
@@ -418,6 +463,7 @@ def main():
         check_clients_fail_closed(monkeypatched)
         check_lookup_fail_closed(monkeypatched)
         check_atomic_batch_and_no_redirect(monkeypatched)
+        check_push_collected(monkeypatched)
     finally:
         CRM._urlopen = original
     print("все проверки пройдены")

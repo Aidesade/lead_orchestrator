@@ -146,6 +146,9 @@ py orchestrator.py --state-owned --count 5
 py orchestrator.py --state-owned --count 50 --collect-only   # только сбор в JSON, без ФАЗЫ 2
 # тот же строгий добор БЕЗ госдоли (критерии: выручка >=2 млрд + регион/часовой пояс):
 set STATE_LEAD_REGION=&& set STATE_LEAD_TZ_LIMIT=2&& py orchestrator.py --state-owned --no-state-share --count 30 --collect-only
+# сбор в другом субъекте с порогом 1 млрд и выгрузкой собранного в CRM сразу после ФАЗЫ 1:
+set STATE_LEAD_REGION=Республика Башкортостан&& set STATE_LEAD_REGION_CODE=02&& set STATE_LEAD_MIN_REVENUE=1e9&& py orchestrator.py --state-owned --no-state-share --count 150 --collect-only --push-crm
+py crm_push.py --leads "D:\лиды\leads_state_owned.json"   # повторить выгрузку по сохранённому JSON
 py orchestrator.py mining --count 10         # явно 10 ВСЕГО по всем отраслям
 py orchestrator.py mining,energy --per-industry 10   # 10 НА КАЖДУЮ отрасль (итог 20)
 # только ресёрч+материалы по готовому JSON лидов (ФАЗА 1 пишет их в D:\лиды\):
@@ -199,6 +202,8 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 `--region "..."` (поддерживает ОТРИЦАНИЕ: `"НЕ Москва"`, `!X`, `-X`, `кроме X`; смешивание через
 запятую), `--workers N` (2, авто→1 при <3 ГБ RAM — только в боевом запуске, в dry-run проверки нет),
 `--model kimi`, `--no-presentation`, `--no-person-enrich`, `--show-browser`, `--out <json>`
+(плюс `--collect-only` — стоп после ФАЗЫ 1 и `--push-crm` — выгрузить собранное в CRM; второй
+работает только с первым: после ФАЗЫ 2 у госрежима свой batch исследованных лидов),
 (дефолт `D:\лиды\leads_<отрасли>.json`), `--base` (`disk:/Лиды`), `--account`, `--redo`
 (ВЫКЛючить резюм). NL-обёртка прокидывает лишь подмножество (нет `--no-person-enrich`/`--out`/
 `--base`/`--headless`).
@@ -298,6 +303,11 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 статистикой причин. Тумблеры: `STATE_LEAD_MAX_SECONDS` (1200 — общий абсолютный deadline),
 `STATE_LEAD_MAX_PAGES`, `STATE_LEAD_MAX_CANDIDATES` (1000), `STATE_OWNERSHIP_CACHE_TTL_H` (24),
 `STATE_OWNERSHIP_MAX_DEPTH` (6), `STATE_ROSIM_MAX_AGE_DAYS` (45),
+`STATE_LEAD_MIN_REVENUE` (2e9 — единственная цифра фиксированного профиля с тумблером; ниже
+общего пола лидгена 1 млрд не опускается: серверный фильтр RusProfile дешевле не отдаёт.
+Критерий «≥2 млрд» выведен на Татарстане, в субъекте поменьше он режет воронку до десятков —
+замер по Башкортостану 2026-08-26: 586 компаний ≥1 млрд на весь регион против 132 по 21 отрасли
+карты `INDUSTRY`, поэтому региональный сбор идёт госрежимом, где ОКВЭД не фильтруется вовсе),
 `STATE_LEAD_OWNERSHIP` (1; `=0` или флаг `--no-state-share` — НЕ проверять госдолю:
 режим «крупные компании по выручке и региону», ЕГРЮЛ/Росимущество не вызываются, регион
 матчится по выдаче), `STATE_LEAD_TZ_LIMIT` (пусто; `=N` — принимать только регионы с
@@ -410,7 +420,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `email_verify.py` | **проверка существования ящика БЕЗ отправки письма** — Python-порт ядра Reacher на голом stdlib (ни Docker, ни WSL, ни Rust-бинаря). Формат ответа совместим с Reacher (`is_reachable` + `syntax`/`mx`/`smtp`/`misc`), есть CLI и `--serve` (HTTP-API на том же контракте). ⚠️ Осознанное отличие от оригинала: у Reacher `invalid` означает и «нет ящика», и «не смог подключиться» — при закрытом порте 25 это вычеркнуло бы все живые адреса; здесь такой случай = `unknown`, а `550 5.7.x` (политика) отделён от `550 5.1.1` (нет адресата). Единственная SMTP-реализация в репо: `email_guess` и `person_enrich` зовут её |
 | `email_guess.py` | **гипотезы корпоративной почты ключевых сотрудников**: домен из общей почты лида (потом сайт) → люди (ЕГРЮЛ + находки движка + страницы `/rukovodstvo`) → ранжированные кандидаты по каталогу схем локал-парта с тремя профилями транслита → MX (с фолбэком на A) и опциональный SMTP. Ключевое: `infer_scheme` выводит «почерк» домена по известным адресам и схлопывает веер гипотез до 1–2. Пакетный CLI по JSON лидов. Последним слоем — `_mev_fill`: облачный добор MyEmailVerifier ТОЛЬКО по оставшимся `unknown` и только вне блок-листа отраслей (см. «Тумблеры подбора почты»), по умолчанию выключен |
 | `outreach.py` | **главный вход ВЕТКИ** (asyncio): стадии рассылки (нумерация историческая, 4-я — пробивка ящиков — удалена 2026-08-18), прекондишен 5, `--check` = стадия 8, `stage_crm` = стадия 9 (`--no-crm` выключает). Дефолт — черновики, `--send` — реальная отправка |
-| `crm_push.py` | **стадия 9**: лид + факт письма → `POST <CRM_URL>/api/leads/ingest` (заголовок `X-Ingest-Token`), upsert по ИНН. Здесь же маппинг служебных ключей лида (`_inn`, `_industry`, `_revenue`…) в контракт CRM — наружу они не торчат. Только stdlib `urllib`, как в `dadata_enrich`/`checko_enrich`. Ни одна ошибка не покидает модуль: всегда `(ok, причина)` |
+| `crm_push.py` | **стадия 9**: лид + факт письма → `POST <CRM_URL>/api/leads/ingest` (заголовок `X-Ingest-Token`), upsert по ИНН. Здесь же маппинг служебных ключей лида (`_inn`, `_industry`, `_revenue`…) в контракт CRM — наружу они не торчат. Только stdlib `urllib`, как в `dadata_enrich`/`checko_enrich`. Ни одна ошибка не покидает модуль: всегда `(ok, причина)`. Здесь же `push_collected` — выгрузка СЫРОГО сбора ФАЗЫ 1 (`--push-crm`, `py crm_push.py --leads <json>`): тем же upsert, а не пакетом исследованных, и с остановкой после серии отказов подряд |
 | `verify_xlsx.py` | **добор по готовой выгрузке .xlsx** (ветка `outreach`): берёт НЕзелёные строки колонки «Почта» (зелёная заливка = уже подтверждён сервером) и гонит их через облачный слой `email_guess._mev_fill`. Отрасли в таблице нет, поэтому `--industry` обязателен, а гейт всё равно проверяет название компании — на реальной выгрузке под меткой `construction` лежали ФНПЦ «Титан-Баррикады», ГосНИИ «Кристалл» и ОКБ «Новатор». Дефолт — СУХОЙ прогон, реальный только по `--run`; на выходе копия книги с вердиктами |
 | `outreach_registry.py` | реестр отработанных по ИНН: атомарная запись, бэкфилл из `D:\deliverables`, `audit()` для стадии 8. «Отработана» = есть деливераблы ИЛИ отправлено письмо |
 | `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
@@ -608,7 +618,9 @@ Microsoft 365 принимает почти всё и проверяет пол�
 ⚠️ Эти env читает ТОЛЬКО оркестратор; standalone `py person_enrich.py` по умолчанию делает и SMTP-пробу,
 и соцпоиск — гасить `--no-verify`/`--no-social`.
 
-**Капы источников:** `RUSPROFILE_MAX_PAGES` (20), `RUSPROFILE_TIMEOUT_MS`, `RUSPROFILE_BROWSER`
+**Капы источников:** `RUSPROFILE_MAX_PAGES` (20), `RUSPROFILE_REGION_CODE` (пусто; код субъекта
+для СЕРВЕРНОГО фильтра обычного сбора — клиентский `region_included()` при этом продолжает
+решать, так что опечатка в коде чужой регион не впустит), `RUSPROFILE_TIMEOUT_MS`, `RUSPROFILE_BROWSER`
 (`playwright` | `uc`), `OFDATA_MAX_CANDIDATES` (3000), `OFDATA_MAX_PAGES_PER_CODE` (50),
 `OFDATA_CONTACTS_CAP` (0 = все), `OFDATA_REVENUE_SOURCE` (`auto|ofdata|girbo`), `CHECKO_CONTACTS_CAP` (100).
 

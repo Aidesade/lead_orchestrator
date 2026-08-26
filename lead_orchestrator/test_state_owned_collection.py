@@ -586,6 +586,53 @@ def check_corrupt_local_registry_is_hard():
     print("  ✓ повреждённый локальный реестр останавливает строгий добор")
 
 
+def check_min_revenue_toggle():
+    """`STATE_LEAD_MIN_REVENUE` двигает порог И на сервере, И на карточке.
+
+    Порог — единственная цифра фиксированного профиля с тумблером: критерий
+    «≥2 млрд» выведен на Татарстане, а в субъекте поменьше он оставляет от
+    воронки десятки компаний. Двигать его можно только вместе: серверный фильтр
+    определяет, кого вообще покажут, а гейт карточки — кого примут."""
+    assert SLC.lead_min_revenue() == 2_000_000_000, "дефолт профиля обязан остаться 2 млрд"
+
+    inns = [valid_test_inn(i) for i in range(1, 3)]
+    rows = [item(inns[0], "ООО Полтора млрд", revenue=1_500_000_000),
+            item(inns[1], "ООО Три млрд", revenue=3_000_000_000)]
+    metrics = {rows[0]["url"]: facts(revenue="1,5 млрд руб."),
+               rows[1]["url"]: facts(revenue="3 млрд руб.")}
+
+    os.environ["STATE_LEAD_MIN_REVENUE"] = "1e9"
+    try:
+        session = FakeSession(rows, metrics)
+        leads = SR.harvest_state_owned(
+            2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            verify_ownership=False, region="", log=lambda *_: None)
+        # Порядок — по убыванию выручки, поэтому «три млрд» идёт первым.
+        assert [lead["_inn"] for lead in leads] == [inns[1], inns[0]], leads
+        assert session.search_kwargs[1] == 1_000_000_000, session.search_kwargs
+
+        # Ниже общего пола лидгена порог не опускается: источник дешевле не отдаёт,
+        # и «порог 100 млн» был бы фикцией, а не фильтром.
+        os.environ["STATE_LEAD_MIN_REVENUE"] = "100000000"
+        try:
+            SLC.lead_min_revenue()
+        except ValueError as exc:
+            assert "пол" in str(exc), exc
+        else:
+            raise AssertionError("порог ниже 1 млрд принят")
+
+        os.environ["STATE_LEAD_MIN_REVENUE"] = "много"
+        try:
+            SLC.lead_min_revenue()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("нечисловой порог принят молча")
+    finally:
+        os.environ.pop("STATE_LEAD_MIN_REVENUE", None)
+    print("  ✓ порог выручки: тумблер двигает сервер и карточку, мусор и «ниже пола» — отказ")
+
+
 def main():
     print("добор госкомпаний — офлайн-регрессии:")
     check_exact_n_and_order()
@@ -604,6 +651,7 @@ def main():
     check_region_filter()
     check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()
+    check_min_revenue_toggle()
 
     print("test_state_owned_collection: OK")
     return 0

@@ -108,6 +108,26 @@ def check_clients_reach_collector():
     print("  ✓ индекс клиентов читается до Chrome и доезжает до добора")
 
 
+def check_push_crm_only_after_collect():
+    """`--push-crm` живёт ровно там, где прогон кончается сбором.
+
+    Два пути записи в один раздел CRM за один прогон — это спор о статусе лида:
+    после ФАЗЫ 2 у госрежима свой атомарный batch исследованных. Поэтому флаг
+    привязан к `--collect-only`, запрещён в dry-run (заглушки в CRM не льём) и
+    выгружает ПОСЛЕ сохранения JSON — иначе упавшая выгрузка унесла бы с собой
+    и результат сбора."""
+    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    assert '"--push-crm работает только с --collect-only"' in source
+    assert "--push-crm несовместим с --dry-run" in source
+    pusher = source[source.index("def _push_collected_to_crm"):source.index("def _collect_state_owned")]
+    assert "create_researched_batch" not in pusher,         "сырой сбор нельзя заводить пакетом исследованных лидов"
+    assert "push_collected(" in pusher
+    call = source.index("            _push_collected_to_crm(")   # вызов, а не определение
+    assert source.index("[итог] collect-only:") < call,         "выгрузка обязана идти после сохранения JSON: по нему её можно повторить"
+    assert call < source.index("ресёрчим ВСЕХ"),         "выгрузка сырого сбора не должна доживать до ФАЗЫ 2"
+    print("  ✓ --push-crm: только с --collect-only, после JSON и мимо batch исследованных")
+
+
 def main():
     print("wiring режима госкомпаний:")
     check_state_plan()
@@ -117,6 +137,7 @@ def main():
     check_collect_only_stops_before_phase_two()
     check_one_deadline_wraps_all_preconditions()
     check_clients_reach_collector()
+    check_push_crm_only_after_collect()
     print("test_state_owned_wiring: OK")
     return 0
 
