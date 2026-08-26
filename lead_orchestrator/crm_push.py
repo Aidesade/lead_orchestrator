@@ -29,6 +29,7 @@ CLI (ручная проверка связки, письма не шлёт):
   py crm_push.py --ping
   py crm_push.py --demo
   py crm_push.py --leads "D:\лиды\leads_bashkortostan.json"
+  py crm_push.py --leads "D:\лиды\leads_bashkortostan.json" --only-missing
 """
 from __future__ import annotations
 
@@ -584,6 +585,9 @@ def main():
     ap.add_argument("--leads", metavar="JSON",
                     help="выгрузить собранный ФАЗОЙ 1 JSON лидов (upsert по ИНН)")
     ap.add_argument("--note", default="", help="пометка в поле note каждого лида")
+    ap.add_argument("--only-missing", dest="only_missing", action="store_true",
+                    help="с --leads: отправить только тех, кого в CRM ещё нет "
+                         "(дозалив после обрыва связи)")
     args = ap.parse_args()
 
     if not (args.ping or args.demo or args.leads):
@@ -608,6 +612,21 @@ def main():
         if not isinstance(rows, list):
             print(f"[leads] {args.leads}: ожидался список лидов")
             return 2
+        if args.only_missing:
+            # Дозалив после обрыва: upsert и так идемпотентен, но гонять всю пачку
+            # ради трёх недоехавших — лишняя нагрузка на ту же CRM, которая только
+            # что не справилась.
+            try:
+                index = fetch_existing_leads()
+            except CRMIndexError as exc:
+                print(f"[leads] индекс CRM недоступен: {exc}")
+                return 3
+            known = len(rows)
+            rows = [row for row in rows if not index.contains(row)]
+            print(f"[leads] в CRM уже {known - len(rows)} из {known}")
+            if not rows:
+                print("[leads] дозаливать нечего")
+                return 0
         print(f"[leads] {len(rows)} лидов из {args.leads} -> {base_url()}")
         pushed, failed = push_collected(rows, note=args.note or None)
         print(f"[leads] в CRM: {len(pushed)} | не удалось: {len(failed)}")
