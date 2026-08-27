@@ -698,19 +698,24 @@ def _push_collected_to_crm(leads, json_out):
     и повторить выгрузку по нему можно в любой момент
     (`py crm_push.py --leads <json>`), а восстановить несохранённый сбор нельзя.
 
+    Лиды ложатся в раздел «Исследован, письмо не готовилось»: ресёрча не было,
+    но и письма тоже, а статус «письмо отправлено» ввёл бы менеджера в заблуждение.
+
     Ошибка выгрузки — ненулевой код возврата, а не тихая строка в логе: прогон
     просили довести до CRM, и «собрал, но не залил» это невыполненная задача."""
     from crm_push import base_url, is_configured, push_collected
     if not is_configured():
         raise SystemExit("--push-crm: CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)")
     print(f"[CRM] выгрузка {len(leads)} собранных лидов -> {base_url()}")
-    pushed, failed = push_collected(
+    pushed, failed, skipped = push_collected(
         leads, note="Сбор ФАЗЫ 1: ресёрч не проводился, письмо не отправлялось.")
-    print(f"[CRM] заведено/обновлено {len(pushed)} из {len(leads)}"
+    print(f"[CRM] заведено {len(pushed)} из {len(leads)}"
+          + (f" | уже были в CRM {len(skipped)}" if skipped else "")
           + (f" | не удалось {len(failed)}" if failed else ""))
-    if failed:
+    left = len(leads) - len(pushed) - len(skipped)
+    if left > 0:
         raise SystemExit(
-            f"CRM: не выгружено {len(failed)} лидов; повтори по сохранённому JSON: "
+            f"CRM: не выгружено {left} лидов; повтори по сохранённому JSON: "
             f'py crm_push.py --leads "{json_out}"')
 
 

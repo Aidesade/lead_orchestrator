@@ -399,48 +399,99 @@ def check_atomic_batch_and_no_redirect(monkeypatched):
 
 
 def check_push_collected(monkeypatched):
-    """Выгрузка сырого сбора: upsert по одному, без ИНН не летит, стоп на серии отказов."""
+    """Выгрузка сырого сбора: пакет researched, дубли отсеяны, серия отказов = стоп."""
     _configure()
     seen = []
 
-    def fake_urlopen(req, timeout=None):
-        seen.append(json.loads(req.data.decode("utf-8")))
-        return FakeResponse(json.dumps({"id": len(seen), "created": True, "status": "new"}).encode())
+    def fake_batch(req, timeout=None):
+        # Сырой сбор обязан идти пакетной ручкой: поштучный /ingest пометил бы
+        # компанию как «письмо отправлено», а письма не было.
+        assert req.full_url.endswith("/api/leads/ingest/researched-batch"), req.full_url
+        body = json.loads(req.data.decode("utf-8"))
+        seen.append(body)
+        ids = list(range(1, len(body["items"]) + 1))
+        return FakeResponse(json.dumps({
+            "run_id": body["run_id"], "ids": ids,
+            "created": len(ids), "replayed": False,
+        }).encode())
 
-    monkeypatched(fake_urlopen)
+    monkeypatched(fake_batch)
+    empty = CRM.ExistingLeads(frozenset(), frozenset(), frozenset(), 0)
     rows = [
         dict(LEAD),
         dict(LEAD, _inn="7736050003", name="ПАО «Второе»"),
         dict(LEAD, _inn="", _ogrn="", name="ООО «Без ИНН»"),
     ]
-    pushed, failed = CRM.push_collected(rows, note="Сбор ФАЗЫ 1", log=lambda *_: None)
+    pushed, failed, skipped = CRM.push_collected(
+        rows, note="Сбор ФАЗЫ 1", log=lambda *_: None, index=empty)
     assert pushed == ["6234065445", "7736050003"], pushed
     assert len(failed) == 1 and "ИНН" in failed[0][1], failed
-    # Ушли ровно два запроса, оба — обычный ingest, и оба с пометкой о сборе.
-    assert len(seen) == 2, seen
-    assert all(item["note"] == "Сбор ФАЗЫ 1" for item in seen), seen
-    assert all("sent_to" not in item for item in seen), seen
+    assert skipped == [], skipped
+    assert len(seen) == 1 and len(seen[0]["items"]) == 2, seen
+    items = seen[0]["items"]
+    assert all(item["note"] == "Сбор ФАЗЫ 1" for item in items), items
+    assert all("sent_to" not in item and "sent_draft" not in item for item in items), items
+
+    # Тот же состав ИНН -> тот же run_id: повтор после обрыва попадёт в replay CRM,
+    # а не заведёт вторую копию пакета.
+    assert CRM._collected_run_id(["1", "2"], "n") == CRM._collected_run_id(["2", "1"], "n")
+    assert CRM._collected_run_id(["1"], "a") != CRM._collected_run_id(["1"], "b")
 
     # Своя пометка лида важнее общей: она конкретнее.
     seen.clear()
-    CRM.push_collected([dict(LEAD, _crm_note="своя пометка")], note="общая", log=lambda *_: None)
-    assert seen[0]["note"] == "своя пометка", seen
+    CRM.push_collected([dict(LEAD, _crm_note="своя пометка")], note="общая",
+                       log=lambda *_: None, index=empty)
+    assert seen[0]["items"][0]["note"] == "своя пометка", seen
 
-    # Легла CRM — не долбим её всем списком: после error_limit отказов подряд стоп.
+    # Уже заведённых не отправляем вовсе: ручка create-only, один дубль отбил бы пакет.
+    seen.clear()
+    known = CRM.ExistingLeads(frozenset({"6234065445"}), frozenset(), frozenset(), 1)
+    pushed, failed, skipped = CRM.push_collected(
+        [dict(LEAD), dict(LEAD, _inn="7736050003", name="ПАО «Второе»")],
+        log=lambda *_: None, index=known)
+    assert pushed == ["7736050003"] and skipped == ["6234065445"], (pushed, skipped)
+    assert [item["inn"] for item in seen[0]["items"]] == ["7736050003"], seen
+
+    # Лид завели между индексом и отправкой: конфликтующие вычитаются, пакет уходит снова.
+    seen.clear()
     calls = {"n": 0}
 
-    def failing(req, timeout=None):
+    def conflict_once(req, timeout=None):
         calls["n"] += 1
+        if calls["n"] == 1:
+            detail = io.BytesIO(json.dumps(
+                {"detail": {"code": "duplicate_inn", "inns": ["6234065445"]}}).encode())
+            raise urllib.error.HTTPError(req.full_url, 409, "conflict", None, detail)
+        return fake_batch(req, timeout)
+
+    monkeypatched(conflict_once)
+    pushed, failed, skipped = CRM.push_collected(
+        [dict(LEAD), dict(LEAD, _inn="7736050003", name="ПАО «Второе»")],
+        log=lambda *_: None, index=empty)
+    assert pushed == ["7736050003"] and skipped == ["6234065445"], (pushed, skipped)
+    assert not failed, failed
+
+    # Легла CRM — не долбим её всем списком: после error_limit пакетов подряд стоп.
+    dead = {"n": 0}
+
+    def failing(req, timeout=None):
+        dead["n"] += 1
         raise urllib.error.URLError("connection refused")
 
     monkeypatched(failing)
-    pushed, failed = CRM.push_collected(
-        [dict(LEAD, _inn=inn) for inn in
-         ("6234065445", "7736050003", "7707083893", "5260200603", "7728168971")],
-        error_limit=2, log=lambda *_: None)
-    assert pushed == [] and calls["n"] == 2, (pushed, calls)
-    assert len(failed) == 2, failed
-    print("  ✓ выгрузка сбора: upsert по одному, лид без ИНН не летит, серия отказов = стоп")
+    old_sleep, old_size = CRM.time.sleep, CRM.COLLECTED_BATCH
+    CRM.time.sleep, CRM.COLLECTED_BATCH = lambda *_: None, 1
+    try:
+        pushed, failed, skipped = CRM.push_collected(
+            [dict(LEAD, _inn=inn) for inn in
+             ("6234065445", "7736050003", "7707083893", "5260200603", "7728168971")],
+            error_limit=2, log=lambda *_: None, index=empty)
+    finally:
+        CRM.time.sleep, CRM.COLLECTED_BATCH = old_sleep, old_size
+    assert pushed == [] and len(failed) == 2, (pushed, failed)
+    assert dead["n"] == 6, dead          # 2 пакета по 3 попытки, дальше не пошли
+    print("  ✓ выгрузка сбора: пакет «исследован, письма не было», "
+          "дубли и конфликты отсеяны, серия отказов = стоп")
 
 
 def main():

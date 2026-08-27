@@ -24,6 +24,9 @@ Upsert по ИНН — повторный прогон обновит запис
 
 Вторая точка входа — выгрузка лидов СРАЗУ после ФАЗЫ 1 (`push_collected`),
 без ресёрча и письма: `orchestrator.py --collect-only --push-crm` и CLI ниже.
+Она идёт другой ручкой (`/ingest/researched-batch`) и кладёт компанию в раздел
+«Исследован, письмо не готовилось»: поштучный `/ingest` пометил бы её как
+«письмо отправлено», а письма не было.
 
 CLI (ручная проверка связки, письма не шлёт):
   py crm_push.py --ping
@@ -33,6 +36,7 @@ CLI (ручная проверка связки, письма не шлёт):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -88,7 +92,24 @@ class CRMIndexError(RuntimeError):
 
 
 class CRMBatchError(RuntimeError):
-    """Атомарная регистрация квалифицированного набора не состоялась."""
+    """Атомарная регистрация квалифицированного набора не состоялась.
+
+    `conflict_inns` — ИНН, которые CRM уже знает (409 `duplicate_inn`). Ручка
+    create-only, и такой отказ означает не «сломалось», а «эти лиды уже заведены»:
+    вызывающий вычитает их и повторяет пакет, а не теряет всю пачку.
+    """
+
+    def __init__(self, message, conflict_inns=()):
+        super().__init__(message)
+        self.conflict_inns = frozenset(conflict_inns)
+
+
+def _conflict_inns(detail):
+    """ИНН из 409: CRM отвечает {"code": "duplicate_inn", "inns": [...]}."""
+    if not isinstance(detail, dict) or detail.get("code") != "duplicate_inn":
+        return frozenset()
+    return frozenset(_digits(value) for value in (detail.get("inns") or [])
+                     if _valid_org_inn(value))
 
 
 def _deadline_timeout(deadline, fallback=TIMEOUT):
@@ -428,7 +449,8 @@ def create_researched_batch(leads, run_id, attempts=3):
                 pass
             safe = _safe_index_error(detail)
             if exc.code == 409:
-                raise CRMBatchError(f"CRM atomic batch conflict: {safe}") from None
+                raise CRMBatchError(f"CRM atomic batch conflict: {safe}",
+                                    _conflict_inns(detail)) from None
             last = CRMBatchError(f"CRM atomic batch HTTP {exc.code}: {safe}")
             if not (exc.code == 429 or 500 <= exc.code < 600) or attempt >= attempts:
                 raise last from None
@@ -482,47 +504,102 @@ def push_lead(lead, sent=None, *, draft=False, onepager=""):
     return True, f"лид #{lead_id} {what} ({data.get('status') or '—'})"
 
 
-def push_collected(leads, *, note=None, log=print, error_limit=5):
+COLLECTED_BATCH = 100            # атомарный пакет CRM принимает 1..200 лидов
+
+
+def _collected_run_id(inns, note):
+    """Стабильный run_id пакета: тот же состав ИНН -> тот же UUID.
+
+    Ради replay: если ответ CRM потерялся по дороге, повтор ТОЙ ЖЕ командой
+    попадёт в уже созданный пакет и получит его id. Случайный uuid4 превратил бы
+    такой повтор в 409 по каждому ИНН."""
+    key = "\n".join(sorted(inns)) + "\n" + (note or "")
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "leadgen-collected:" + digest))
+
+
+def push_collected(leads, *, note=None, log=print, error_limit=2, index=None):
     """Выгрузить в CRM лиды СРАЗУ после ФАЗЫ 1 — до всякого ресёрча и письма.
 
-    Почему не `create_researched_batch`: тот пакет означает «компания
-    исследована, материалы готовы», и создаёт лиды только один раз. Здесь
-    ресёрча не было, поэтому идёт штатный ingest — тот же, которым стадия 9
-    заводит компанию письма. Он идемпотентен по ИНН: повтор той же командой
-    после обрыва обновит запись, а не заведёт вторую.
+    Идёт атомарным `POST /ingest/researched-batch`, а НЕ поштучным `/ingest`:
+    одиночный ingest сам ставит статус «письмо отправлено» (`email_sent`) —
+    для только что собранной компании это ложь, и менеджер снял бы трубку в
+    уверенности, что ей уже писали. Пакетная ручка кладёт лид в раздел
+    «Исследован, письмо не готовилось» (`researched`) — единственный статус CRM,
+    который означает «квалифицирован, письма не было».
 
-    Лид без валидного ИНН не отправляется вовсе: CRM склеивает записи по ИНН, и
-    компания без него станет вечным дублем при следующем заходе.
+    Ручка create-only, поэтому уже заведённые компании отсеиваются по GET-индексу
+    ДО отправки. Если лид завели между индексом и отправкой, CRM вернёт 409 с его
+    ИНН — конфликтующие вычитаются и пакет уходит повторно, а не пропадает целиком.
 
-    `error_limit` подряд идущих отказов останавливают выгрузку: если CRM легла
-    или отвергла токен, следующие полторы сотни запросов дадут ту же ошибку —
-    лучше вернуть управление с внятной причиной, чем молотить в стену.
+    `error_limit` подряд отказавших пакетов останавливают выгрузку: если CRM легла
+    или отвергла токен, следующие полторы сотни компаний дадут ту же ошибку.
 
-    -> (список успешных ИНН, список пар (лид, причина)). Исключений не бросает.
+    -> (заведённые ИНН, пары (лид, причина), пропущенные ИНН). Исключений не бросает.
     """
-    ok, failed, consecutive = [], [], 0
+    prepared, failed, skipped, seen = [], [], [], set()
     for lead in list(leads or []):
         lead = dict(lead or {})
         inn = _digits(lead.get("_inn") or lead.get("inn"))
         if not _valid_org_inn(inn):
+            # CRM склеивает записи по ИНН: компания без него станет вечным дублем.
             failed.append((lead, "нет валидного ИНН организации"))
             continue
+        if not str(lead.get("name") or "").strip():
+            failed.append((lead, "у лида нет названия компании"))
+            continue
+        if inn in seen:                 # пакет с повтором ИНН CRM отвергает целиком
+            failed.append((lead, f"ИНН {inn} повторён в выгрузке"))
+            continue
+        seen.add(inn)
         if note and not lead.get("_crm_note"):
             lead["_crm_note"] = note
-        pushed, why = push_lead(lead)
-        if pushed:
-            ok.append(inn)
-            consecutive = 0
-        else:
-            failed.append((lead, why))
-            consecutive += 1
-            log(f"  [CRM] {lead.get('name') or inn}: {why}")
-            if consecutive >= error_limit:
-                remaining = len(leads) - len(ok) - len(failed)
-                log(f"  [CRM] {consecutive} отказа подряд — выгрузка остановлена, "
-                    f"не отправлено ещё {max(0, remaining)}")
+        prepared.append((inn, lead))
+
+    if prepared and index is None:
+        try:
+            index = fetch_existing_leads()
+        except CRMIndexError as exc:
+            # Не фатально: конфликтующие ИНН всё равно назовёт сама create-only ручка.
+            log(f"  [CRM] индекс недоступен ({exc}) — дубли отсечёт сама CRM")
+    if index is not None:
+        keep = []
+        for inn, lead in prepared:
+            if index.contains(lead):
+                skipped.append(inn)
+            else:
+                keep.append((inn, lead))
+        prepared = keep
+
+    chunks = [prepared[start:start + COLLECTED_BATCH]
+              for start in range(0, len(prepared), COLLECTED_BATCH)]
+    pushed, consecutive = [], 0
+    for position, chunk in enumerate(chunks):
+        while chunk:
+            inns = [inn for inn, _ in chunk]
+            try:
+                create_researched_batch([lead for _, lead in chunk],
+                                        _collected_run_id(inns, note))
+            except CRMBatchError as exc:
+                known = exc.conflict_inns & set(inns)
+                if known:               # завели параллельно — это не наш сбой
+                    skipped.extend(inn for inn in inns if inn in known)
+                    chunk = [(inn, lead) for inn, lead in chunk if inn not in known]
+                    log(f"  [CRM] {len(known)} компаний уже в CRM — пакет ушёл без них")
+                    continue
+                failed.extend((lead, str(exc)) for _, lead in chunk)
+                consecutive += 1
+                log(f"  [CRM] пакет из {len(chunk)} не принят: {exc}")
                 break
-    return ok, failed
+            pushed.extend(inns)
+            consecutive = 0
+            break
+        if consecutive >= error_limit:
+            left = sum(len(rest) for rest in chunks[position + 1:])
+            log(f"  [CRM] {consecutive} пакета подряд не приняты — выгрузка остановлена"
+                + (f", не отправлено ещё {left}" if left else ""))
+            break
+    return pushed, failed, skipped
 
 
 def lead_url(lead_id=None):
@@ -583,11 +660,12 @@ def main():
     ap.add_argument("--ping", action="store_true", help="проверить настройку и доступность CRM")
     ap.add_argument("--demo", action="store_true", help="залить тестовый лид (ИНН 0000000000)")
     ap.add_argument("--leads", metavar="JSON",
-                    help="выгрузить собранный ФАЗОЙ 1 JSON лидов (upsert по ИНН)")
+                    help="выгрузить собранный ФАЗОЙ 1 JSON лидов в раздел "
+                         "«Исследован, письмо не готовилось»")
     ap.add_argument("--note", default="", help="пометка в поле note каждого лида")
     ap.add_argument("--only-missing", dest="only_missing", action="store_true",
-                    help="с --leads: отправить только тех, кого в CRM ещё нет "
-                         "(дозалив после обрыва связи)")
+                    help="с --leads: требовать GET-индекс CRM и отсеять по нему уже "
+                         "заведённых (дозалив после обрыва связи)")
     args = ap.parse_args()
 
     if not (args.ping or args.demo or args.leads):
@@ -612,25 +690,28 @@ def main():
         if not isinstance(rows, list):
             print(f"[leads] {args.leads}: ожидался список лидов")
             return 2
+        index = None
         if args.only_missing:
-            # Дозалив после обрыва: upsert и так идемпотентен, но гонять всю пачку
-            # ради трёх недоехавших — лишняя нагрузка на ту же CRM, которая только
-            # что не справилась.
+            # Дозалив после обрыва: выгрузка и так спрашивает индекс, но здесь его
+            # недоступность — отказ, а не предупреждение. Просили ровно недоехавших.
             try:
                 index = fetch_existing_leads()
             except CRMIndexError as exc:
                 print(f"[leads] индекс CRM недоступен: {exc}")
                 return 3
-            known = len(rows)
-            rows = [row for row in rows if not index.contains(row)]
-            print(f"[leads] в CRM уже {known - len(rows)} из {known}")
-            if not rows:
+            known = sum(1 for row in rows if index.contains(row))
+            print(f"[leads] в CRM уже {known} из {len(rows)}")
+            if known == len(rows):
                 print("[leads] дозаливать нечего")
                 return 0
         print(f"[leads] {len(rows)} лидов из {args.leads} -> {base_url()}")
-        pushed, failed = push_collected(rows, note=args.note or None)
-        print(f"[leads] в CRM: {len(pushed)} | не удалось: {len(failed)}")
-        return 0 if pushed and not failed else 3
+        pushed, failed, skipped = push_collected(
+            rows, note=args.note or None, index=index)
+        print(f"[leads] заведено: {len(pushed)} | уже были: {len(skipped)} "
+              f"| не удалось: {len(failed)}")
+        for lead, why in failed[:10]:
+            print(f"  - {lead.get('name') or lead.get('_inn')}: {why}")
+        return 0 if not failed and len(pushed) + len(skipped) == len(rows) else 3
 
     demo_lead = {
         "name": "ООО «Демо-компания» (тест стадии 9)",

@@ -115,13 +115,17 @@ def check_push_crm_only_after_collect():
     после ФАЗЫ 2 у госрежима свой атомарный batch исследованных. Поэтому флаг
     привязан к `--collect-only`, запрещён в dry-run (заглушки в CRM не льём) и
     выгружает ПОСЛЕ сохранения JSON — иначе упавшая выгрузка унесла бы с собой
-    и результат сбора."""
+    и результат сбора.
+
+    Сам запрос обёртка не собирает: и статус лида, и выбор ручки CRM живут в
+    `crm_push.push_collected` — одно место, где решается, чем именно сырой сбор
+    отличается от отправленного письма."""
     source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
     assert '"--push-crm работает только с --collect-only"' in source
     assert "--push-crm несовместим с --dry-run" in source
     pusher = source[source.index("def _push_collected_to_crm"):source.index("def _collect_state_owned")]
-    assert "create_researched_batch" not in pusher,         "сырой сбор нельзя заводить пакетом исследованных лидов"
     assert "push_collected(" in pusher
+    assert "create_researched_batch" not in pusher and "push_lead(" not in pusher,         "обёртка не выбирает ручку CRM сама — это решает push_collected"
     call = source.index("            _push_collected_to_crm(")   # вызов, а не определение
     assert source.index("[итог] collect-only:") < call,         "выгрузка обязана идти после сохранения JSON: по нему её можно повторить"
     assert call < source.index("ресёрчим ВСЕХ"),         "выгрузка сырого сбора не должна доживать до ФАЗЫ 2"
