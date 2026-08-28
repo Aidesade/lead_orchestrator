@@ -435,6 +435,39 @@ def check_state_share_mapping(monkeypatched):
     print("  ✓ госдоля: доля в контракте, порог за CRM, источник отдельной ручкой")
 
 
+def check_push_contacts(monkeypatched):
+    """Догруз контактов: PUT, пустое не стирает, 405 = ручки нет на проде."""
+    _configure()
+    seen = []
+
+    def fake(req, timeout=None):
+        seen.append((req.get_method(), req.full_url, json.loads(req.data.decode("utf-8"))))
+        return FakeResponse(json.dumps(
+            {"updated": 1, "not_found": ["7736050003"], "filled": 3}).encode())
+
+    monkeypatched(fake)
+    updated, missing, why = CRM.push_contacts([
+        dict(LEAD, phone="+7 (843) 294-97-36", email="a@b.ru",
+             website="https://x.ru", contact_person="Иванов И.И.", _ceo_post="Директор"),
+        {"name": "ПАО «Без контактов»", "_inn": "7736050003"},          # нечего слать
+        {"name": "ПАО «Только почта»", "_inn": "7707083893", "email": "c@d.ru"},
+    ])
+    assert (updated, missing, why) == (1, ["7736050003"], ""), (updated, missing, why)
+    method, url, body = seen[0]
+    assert method == "PUT" and url.endswith("/api/leads/ingest/contacts"), (method, url)
+    # Лид без единого контакта в пакет не попадает: пустое поле стёрло бы найденное раньше.
+    assert [item["inn"] for item in body["items"]] == ["6234065445", "7707083893"], body
+    assert body["items"][0]["contact_post"] == "Директор", body
+    assert set(body["items"][1]) == {"inn", "email"}, body["items"][1]
+
+    # Ручка не выкачена — говорим это прямо, а не «CRM HTTP 405».
+    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.HTTPError(req.full_url, 405, "Method Not Allowed", None, io.BytesIO(b"{}"))))
+    updated, _missing, why = CRM.push_contacts([dict(LEAD, phone="+7 000")])
+    assert updated == 0 and "не выкачена" in why, why
+    print("  ✓ догруз контактов: PUT, пустое не стирает, 405 читается как «нет ручки»")
+
+
 def check_push_collected(monkeypatched):
     """Выгрузка сырого сбора: пакет researched, дубли отсеяны, серия отказов = стоп."""
     _configure()
@@ -552,6 +585,7 @@ def main():
         check_lookup_fail_closed(monkeypatched)
         check_atomic_batch_and_no_redirect(monkeypatched)
         check_state_share_mapping(monkeypatched)
+        check_push_contacts(monkeypatched)
         check_push_collected(monkeypatched)
     finally:
         CRM._urlopen = original

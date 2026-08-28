@@ -420,6 +420,63 @@ def push_state_share(rows, attempts=3):
     return updated, missing, ""
 
 
+CONTACT_FIELDS = (("phone", "phone"), ("email", "email"), ("website", "website"),
+                  ("contact_person", "contact_person"), ("_ceo_post", "contact_post"))
+
+
+def push_contacts(leads, attempts=3):
+    """Дозаполнить контакты УЖЕ заведённых лидов: `PUT /api/leads/ingest/contacts`.
+
+    Отдельно от `push_lead`, потому что `POST /ingest` вместе с контактами
+    ПЕРЕСТАВЛЯЕТ статус на «письмо отправлено» — собранному, но не тронутому лиду
+    это приписало бы касание, которого не было. PUT ничего не создаёт: неизвестный
+    ИНН вернётся в `not_found`, а не заведётся пустым лидом.
+
+    Пустые поля не отправляются вовсе: «не нашли телефон» не должно стирать телефон,
+    найденный другим источником в прошлый раз.
+
+    -> (обновлено, не найдено, причина). Исключений не бросает."""
+    items = []
+    for lead in leads or ():
+        lead = lead or {}
+        inn = _digits(lead.get("_inn") or lead.get("inn"))
+        if not _valid_org_inn(inn):
+            continue
+        item = {"inn": inn}
+        for source, field in CONTACT_FIELDS:
+            value = str(lead.get(source) or "").strip()
+            if value:
+                item[field] = value
+        if len(item) > 1:
+            items.append(item)
+    if not items:
+        return 0, [], "нечего обновлять"
+    if not is_configured():
+        return 0, [], "CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)"
+
+    updated, missing = 0, []
+    for start in range(0, len(items), 500):        # предел ручки — 500 записей
+        chunk = items[start:start + 500]
+        body = json.dumps({"items": chunk}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url()}/api/leads/ingest/contacts", data=body, method="PUT")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        req.add_header("X-Ingest-Token", token())
+        try:
+            with _urlopen(req, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 405:
+                return updated, missing, ("CRM не умеет PUT /api/leads/ingest/contacts "
+                                          "(405) — ручка не выкачена на прод")
+            return updated, missing, _safe_index_error(f"CRM HTTP {exc.code}")
+        except Exception as exc:                   # noqa: BLE001 — догруз не валит прогон
+            return updated, missing, _safe_index_error(f"{type(exc).__name__}: {exc}")
+        updated += int(data.get("updated") or 0)
+        missing.extend(data.get("not_found") or [])
+    return updated, missing, ""
+
+
 def build_payload(lead, sent=None, *, draft=False, onepager=""):
     """Лид пайплайна + факт отправки -> тело запроса CRM.
 
