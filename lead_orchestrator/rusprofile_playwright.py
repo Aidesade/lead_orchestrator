@@ -583,6 +583,35 @@ class RusProfilePlaywrightSession:
             and bool(_REAL_TEL.search(combined))
         )
 
+    def card_by_inn(self, inn, *, include_inactive=False, deadline=None):
+        """Карточка компании по ИНН через тот же advanced-search XHR. -> запись | None.
+
+        Нужна там, где лид пришёл НЕ из RusProfile (ГИР БО, OfData, готовый JSON) и
+        ссылки на карточку у него нет: `enrich_leads` умеет работать только с готовым
+        `_rusprofile_url`. Публичный поиск `/search?query=<ИНН>` для этого не годится —
+        сейчас он отдаёт 404 (проверено 2026-08-28), а XHR отвечает и сразу несёт
+        руководителя, адрес, ОКВЭД и выручку, экономя открытие страницы.
+
+        ⚠️ По умолчанию ищутся только ДЕЙСТВУЮЩИЕ юрлица (`state_1`): ГИР БО статус не
+        отдаёт, и «не нашлось» здесь означает в том числе «ликвидировано». Кому нужен
+        сам факт — `include_inactive=True` и поле `inactive` в ответе.
+
+        ИНН в ответе размечен маркерами подсветки (`!~~1654038766~~!`), поэтому
+        совпадение сверяется по цифрам, а не по строке."""
+        inn = re.sub(r"\D", "", str(inn or ""))
+        if len(inn) not in (10, 12):
+            raise RusProfilePlaywrightError("card_by_inn: ожидается ИНН из 10 или 12 цифр")
+        if "/search-advanced" not in (self.page.url or ""):
+            self._goto(ADV_URL, settle_ms=5_000, deadline=deadline)
+        states = {f"state_{n}": (n == 1 or include_inactive) for n in range(1, 6)}
+        payload = self._post({
+            "action": "search_advanced", "query": inn, "okved_strict": True,
+            "okved": [], "finance_revenue_from": "0", **states})
+        for item in ((payload.get("data") or {}).get("items") or []):
+            if re.sub(r"\D", "", str(item.get("inn") or "")) == inn:
+                return item
+        return None
+
     def card_facts_by_url(self, link, *, expected_inn="", deadline=None):
         """Открыть карточку и извлечь показатели строгого отбора."""
         _url, _title, text, _html = self._snapshot(link, deadline=deadline)

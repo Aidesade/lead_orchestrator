@@ -359,6 +359,39 @@ def _check_goto_survives_site_redirect() -> None:
     print("  OK: чужой редирект переживается, таймаут/бан летит наружу сразу")
 
 
+def _check_card_by_inn() -> None:
+    """Поиск карточки по ИНН: сверка по цифрам, статус-фильтр, отсутствие != ошибка."""
+    sent = []
+
+    session = object.__new__(RPW.RusProfilePlaywrightSession)
+    session.page = SimpleNamespace(url="https://www.rusprofile.ru/search-advanced")
+    session._goto = lambda *_a, **_k: None
+    session._post = lambda body, **_k: (sent.append(body), {"data": {"items": [
+        {"inn": "!~~1654038766~~!", "link": "/id/1359085", "name": 'ГУП "Таттехмедфарм"'},
+        {"inn": "7736050003", "link": "/id/2", "name": "Чужая компания"},
+    ]}})[1]
+
+    item = session.card_by_inn("1654038766")
+    assert item and item["link"] == "/id/1359085", item
+    assert sent[0]["query"] == "1654038766"
+    assert sent[0]["state_1"] is True and sent[0]["state_2"] is False,         "по умолчанию ищем только действующие юрлица"
+
+    session.card_by_inn("1654038766", include_inactive=True)
+    assert all(sent[1][f"state_{n}"] is True for n in range(1, 6)), sent[1]
+
+    # Чужой ИНН в выдаче не должен подменить компанию: сверка по цифрам, а не «первый».
+    assert session.card_by_inn("5028006494") is None
+
+    for bad in ("", "12345", "abc"):
+        try:
+            session.card_by_inn(bad)
+        except RPW.RusProfilePlaywrightError:
+            pass
+        else:
+            raise AssertionError(f"мусорный ИНН принят: {bad!r}")
+    print("  OK: карточка по ИНН — сверка по цифрам, статус-фильтр, мусор отвергнут")
+
+
 def _check_card_schema_fail_closed() -> None:
     session = object.__new__(RPW.RusProfilePlaywrightSession)
     session._snapshot = lambda *_args, **_kwargs: (
@@ -413,6 +446,7 @@ def main() -> int:
     _check_staff_filter_body()
     _check_card_url_and_search_failure()
     _check_goto_survives_site_redirect()
+    _check_card_by_inn()
     _check_card_schema_fail_closed()
 
     rows = RPW.normalize_cookie_rows([
