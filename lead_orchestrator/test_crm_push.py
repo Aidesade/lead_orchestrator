@@ -460,11 +460,13 @@ def check_push_contacts(monkeypatched):
     assert body["items"][0]["contact_post"] == "Директор", body
     assert set(body["items"][1]) == {"inn", "email"}, body["items"][1]
 
-    # Ручка не выкачена — говорим это прямо, а не «CRM HTTP 405».
-    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(
-        urllib.error.HTTPError(req.full_url, 405, "Method Not Allowed", None, io.BytesIO(b"{}"))))
-    updated, _missing, why = CRM.push_contacts([dict(LEAD, phone="+7 000")])
-    assert updated == 0 and "не выкачена" in why, why
+    # Ручка не выкачена — говорим это прямо, а не «CRM HTTP 404/405». 404 (маршрута
+    # нет) и 405 (путь занят другим методом) для нас одно и то же: сборка без ручки.
+    for code, reason in ((404, "Not Found"), (405, "Method Not Allowed")):
+        monkeypatched(lambda req, timeout=None, _c=code, _r=reason: (_ for _ in ()).throw(
+            urllib.error.HTTPError(req.full_url, _c, _r, None, io.BytesIO(b"{}"))))
+        updated, _missing, why = CRM.push_contacts([dict(LEAD, phone="+7 000")])
+        assert updated == 0 and "не выкачена" in why, (code, why)
     print("  ✓ догруз контактов: PUT, пустое не стирает, 405 читается как «нет ручки»")
 
 

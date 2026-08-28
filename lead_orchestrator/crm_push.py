@@ -466,9 +466,12 @@ def push_contacts(leads, attempts=3):
             with _urlopen(req, timeout=TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace"))
         except urllib.error.HTTPError as exc:
-            if exc.code == 405:
-                return updated, missing, ("CRM не умеет PUT /api/leads/ingest/contacts "
-                                          "(405) — ручка не выкачена на прод")
+            if exc.code in (404, 405):
+                # 404 — маршрута нет вовсе, 405 — путь занят другим методом. Для нас
+                # это одно и то же: на проде крутится сборка без этой ручки.
+                return updated, missing, (
+                    f"CRM не знает PUT /api/leads/ingest/contacts ({exc.code}) — "
+                    "ручка не выкачена на прод")
             return updated, missing, _safe_index_error(f"CRM HTTP {exc.code}")
         except Exception as exc:                   # noqa: BLE001 — догруз не валит прогон
             return updated, missing, _safe_index_error(f"{type(exc).__name__}: {exc}")
