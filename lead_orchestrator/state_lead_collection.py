@@ -50,9 +50,16 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
     # Фильтр по штату (240–260) удалён 2026-08-19: критерий устарел.
     # Серверный фильтр региона критичен для воронки: без него выдача — топ РФ по
     # выручке, и Татарстана в первых 1000 строк единицы (боевой прогон: 24/1000).
+    regions = split_regions(region_query)
+    codes = split_regions(region_code)
+
+    def in_region(value):
+        """Регион подходит, если совпал ХОТЯ БЫ с одним из перечисленных."""
+        return any(region_matches(value, name) for name in regions)
+
     items = session.search(
         [], min_revenue, max_pages=max_pages, deadline=deadline,
-        region_codes=[region_code] if (region_query and region_code) else None)
+        region_codes=codes if (regions and codes) else None)
     if time.monotonic() >= deadline:
         raise RusProfileDeadlineReached(
             "общий лимит строгого добора истёк внутри поиска RusProfile")
@@ -108,8 +115,8 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         # решит строгая проверка юрадреса по выписке; БЕЗ ownership выписки не
         # будет, поэтому пустой регион при заданном фильтре = отказ (fail-closed).
         source_region = str(item.get("region") or item.get("region_name") or "").strip()
-        if region_query:
-            if source_region and not region_matches(source_region, region_query):
+        if regions:
+            if source_region and not in_region(source_region):
                 stats["region_source"] += 1
                 continue
             if not verify_ownership and not source_region:
@@ -212,12 +219,12 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
             # Строгий регион-гейт: принимается только юрадрес нужного субъекта РФ
             # из той же выписки ЕГРЮЛ, что доказала госдолю. Нет региона в выписке —
             # отказ: «не извлекли» не значит «Татарстан».
-            if region_query:
+            if regions:
                 egrul_region = (result.region or "").strip()
                 if not egrul_region:
                     stats["region_unknown"] += 1
                     continue
-                if not region_matches(egrul_region, region_query):
+                if not in_region(egrul_region):
                     stats["region_egrul"] += 1
                     continue
 
@@ -341,6 +348,14 @@ def lead_region_query():
     if value.lower().replace("ё", "е") in ("*", "любой", "любая", "все", "any"):
         return ""
     return value
+
+
+def split_regions(value):
+    """«Татарстан, Башкортостан» -> ["Татарстан", "Башкортостан"].
+
+    Округ — это не один субъект: чтобы собрать по ПФО, гейт обязан принимать
+    ЛЮБОЙ из перечисленных регионов. Пустой список = фильтр выключен."""
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
 
 
 def lead_region_code():

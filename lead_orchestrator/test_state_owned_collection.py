@@ -504,6 +504,58 @@ def check_region_filter():
     print("  ✓ регион: дёшево по выдаче, строго по выписке ЕГРЮЛ, выключается явно")
 
 
+def check_multi_region():
+    """Список регионов = округ: подходит ЛЮБОЙ из них, чужой по-прежнему отсекается.
+
+    Округ собирается одним прогоном, потому что дедуп, дедлайн и счётчик ровно N
+    общие: два последовательных прогона по половине округа дали бы 2N лидов и
+    разъехавшуюся статистику."""
+    inns = [valid_test_inn(i) for i in range(80, 84)]
+    kazan = item(inns[0], "ГУП Казанская")
+    ufa = item(inns[1], "ГУП Уфимская")
+    ufa["region_name"] = "Республика Башкортостан"
+    samara = item(inns[2], "ГУП Самарская")
+    samara["region_name"] = "Самарская область"
+    moscow = item(inns[3], "ГУП Московская")
+    moscow["region_name"] = "г. Москва"
+    rows = [kazan, ufa, samara, moscow]
+    verifier_rows = {
+        inns[0]: ownership(True, 100),
+        inns[1]: ownership(True, 100, region="РЕСПУБЛИКА БАШКОРТОСТАН"),
+        inns[2]: ownership(True, 100, region="ОБЛАСТЬ САМАРСКАЯ"),
+        inns[3]: ownership(True, 100, region="ГОРОД МОСКВА"),
+    }
+    okrug = "Татарстан, Башкортостан, Самарская"
+
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        3, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        ownership_verifier=FakeVerifier(verifier_rows), region=okrug,
+        log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == inns[:3], leads
+    assert moscow["url"] not in session.fact_calls, "чужой регион дошёл до карточки"
+
+    # Порядок слов в выписке ЕГРЮЛ другой («ОБЛАСТЬ САМАРСКАЯ»), поэтому в списке
+    # держим основу названия, а не полное имя субъекта.
+    assert any(lead["_egrul_region"] == "ОБЛАСТЬ САМАРСКАЯ" for lead in leads)
+
+    saved = os.environ.get("STATE_LEAD_REGION_CODE")
+    try:
+        os.environ["STATE_LEAD_REGION_CODE"] = "16, 02,63"
+        session = FakeSession(rows, {row["url"]: facts() for row in rows})
+        SR.harvest_state_owned(
+            3, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            ownership_verifier=FakeVerifier(verifier_rows), region=okrug,
+            log=lambda _line: None)
+    finally:
+        if saved is None:
+            os.environ.pop("STATE_LEAD_REGION_CODE", None)
+        else:
+            os.environ["STATE_LEAD_REGION_CODE"] = saved
+    assert session.search_kwargs[2]["region_codes"] == ["16", "02", "63"],         "серверный фильтр обязан получить ВСЕ коды округа, иначе выдача — топ РФ"
+    print("  ✓ округ: подходит любой регион из списка, коды уходят на сервер целиком")
+
+
 def check_no_ownership_and_timezone():
     """STATE_LEAD_OWNERSHIP=0: критерии — выручка/регион/пояс, ЕГРЮЛ не зовётся."""
     # «*» отключает регион-фильтр: PowerShell не передаёт детям пустую env,
@@ -649,6 +701,7 @@ def main():
     check_deadline_inside_search_is_not_exhaustion()
     check_invalid_target()
     check_region_filter()
+    check_multi_region()
     check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()
     check_min_revenue_toggle()
