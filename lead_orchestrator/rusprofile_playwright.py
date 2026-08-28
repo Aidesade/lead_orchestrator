@@ -368,9 +368,23 @@ class RusProfilePlaywrightSession:
             raise RusProfileDeadlineReached("общий лимит времени RusProfile исчерпан")
         return min(int(fallback), remaining)
 
+    # Playwright считает ошибкой ЧУЖОЙ редирект: если сайт сам уводит с запрошенного
+    # адреса, goto падает вместо перехода. У RusProfile так ведут себя устаревшие id
+    # карточек — они редиректят на актуальный id той же компании.
+    _REDIRECTED = "interrupted by another navigation"
+
     def _goto(self, url, *, settle_ms=3_000, deadline=None):
-        timeout_ms = self._remaining_ms(deadline, self.timeout_ms)
-        self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # Повтор попадает уже на конечный адрес. Не «проглатывание ошибки»: что на
+        # странице нужная компания, проверяет expected_inn в card_facts_by_url, а
+        # настоящий бан/таймаут по-прежнему летит наружу с первой попытки.
+        for attempt in (1, 2, 3):
+            timeout_ms = self._remaining_ms(deadline, self.timeout_ms)
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                break
+            except Exception as exc:
+                if attempt == 3 or self._REDIRECTED not in str(exc):
+                    raise
         self.page.wait_for_timeout(self._remaining_ms(deadline, settle_ms))
         # Cloudflare иногда успевает завершить challenge уже после DOMContentLoaded.
         challenge_end = time.monotonic() + 20

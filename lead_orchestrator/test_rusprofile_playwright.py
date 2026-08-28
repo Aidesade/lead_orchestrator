@@ -303,6 +303,62 @@ def _check_card_url_and_search_failure() -> None:
         raise AssertionError("изменившаяся pagination metadata вернула partial results")
 
 
+def _check_goto_survives_site_redirect() -> None:
+    """Собственный редирект RusProfile — не сбой источника.
+
+    Устаревший id карточки уводит на актуальный, и Playwright сообщает об этом
+    ИСКЛЮЧЕНИЕМ, а не переходом. Раньше три такие подряд останавливали строгий
+    добор fail-closed «карточки не разобраны» — источник при этом был жив.
+    Настоящий сбой (таймаут, бан) обязан лететь наружу с первой попытки."""
+    calls = []
+
+    class Page:
+        def __init__(self, fail_times):
+            self.left = fail_times
+
+        def goto(self, url, **_kwargs):
+            calls.append(url)
+            if self.left > 0:
+                self.left -= 1
+                raise RuntimeError(
+                    f'Page.goto: Navigation to "{url}" is interrupted '
+                    'by another navigation to "/id/999"')
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+        @staticmethod
+        def title():
+            return "Компания"
+
+    session = object.__new__(RPW.RusProfilePlaywrightSession)
+    session.timeout_ms = 1_000
+    session.page = Page(fail_times=1)
+    session._goto("https://www.rusprofile.ru/id/1")
+    assert len(calls) == 2, calls
+
+    calls.clear()
+    session.page = Page(fail_times=9)
+    try:
+        session._goto("https://www.rusprofile.ru/id/2")
+    except RuntimeError:
+        assert len(calls) == 3, "повторов должно быть ровно три, а не бесконечность"
+    else:
+        raise AssertionError("бесконечный редирект обязан оставаться ошибкой")
+
+    calls.clear()
+    session.page = Page(fail_times=0)
+    session.page.goto = lambda url, **_k: (calls.append(url), (_ for _ in ()).throw(
+        RuntimeError("Timeout 30000ms exceeded")))[0]
+    try:
+        session._goto("https://www.rusprofile.ru/id/3")
+    except RuntimeError as exc:
+        assert "Timeout" in str(exc) and len(calls) == 1,             "настоящий сбой нельзя повторять и прятать"
+    else:
+        raise AssertionError("таймаут навигации проглочен")
+    print("  OK: чужой редирект переживается, таймаут/бан летит наружу сразу")
+
+
 def _check_card_schema_fail_closed() -> None:
     session = object.__new__(RPW.RusProfilePlaywrightSession)
     session._snapshot = lambda *_args, **_kwargs: (
@@ -356,6 +412,7 @@ def main() -> int:
     _check_card_parsers()
     _check_staff_filter_body()
     _check_card_url_and_search_failure()
+    _check_goto_survives_site_redirect()
     _check_card_schema_fail_closed()
 
     rows = RPW.normalize_cookie_rows([
