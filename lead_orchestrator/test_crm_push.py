@@ -398,6 +398,43 @@ def check_atomic_batch_and_no_redirect(monkeypatched):
     print("  ✓ atomic create-only batch и запрет redirect с CRM-токеном")
 
 
+def check_state_share_mapping(monkeypatched):
+    """Метка госсектора: отдаём ДОЛЮ, порог применяет CRM; источник — отдельной ручкой."""
+    _configure()
+    assert "state_share" not in CRM.build_payload(dict(LEAD)),         "лид без проверки госдоли не должен утверждать, что доля равна нулю"
+    assert CRM.build_payload(dict(LEAD, _state_share=100))["state_share"] == 100.0
+    assert CRM.build_payload(dict(LEAD, _state_share="24,9"))["state_share"] == 24.9
+    for junk in ("", "нет", None, True, -1, 101):
+        payload = CRM.build_payload(dict(LEAD, _state_share=junk))
+        assert "state_share" not in payload, junk
+
+    seen = []
+
+    def fake(req, timeout=None):
+        seen.append((req.full_url, json.loads(req.data.decode("utf-8"))))
+        return FakeResponse(json.dumps({"updated": 1, "not_found": ["7736050003"]}).encode())
+
+    monkeypatched(fake)
+    updated, missing, why = CRM.push_state_share([
+        ("6234065445", 100, "ГУП: имущество в государственной собственности"),
+        ("7736050003", 100, "МУП: муниципальная собственность"),
+        ("", 100, "без ИНН — не отправляется"),
+        ("6234065445", None, "без доли — не отправляется"),
+    ])
+    assert (updated, missing, why) == (1, ["7736050003"], ""), (updated, missing, why)
+    url, body = seen[0]
+    assert url.endswith("/api/leads/ingest/state-share"), url
+    assert [item["inn"] for item in body["items"]] == ["6234065445", "7736050003"], body
+    assert body["items"][0]["source"].startswith("ГУП:"), body
+
+    # Сбой пометки возвращается причиной, а не исключением: лиды уже заведены.
+    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.URLError("connection refused")))
+    updated, _missing, why = CRM.push_state_share([("6234065445", 100, "x")])
+    assert updated == 0 and "URLError" in why, why
+    print("  ✓ госдоля: доля в контракте, порог за CRM, источник отдельной ручкой")
+
+
 def check_push_collected(monkeypatched):
     """Выгрузка сырого сбора: пакет researched, дубли отсеяны, серия отказов = стоп."""
     _configure()
@@ -514,6 +551,7 @@ def main():
         check_clients_fail_closed(monkeypatched)
         check_lookup_fail_closed(monkeypatched)
         check_atomic_batch_and_no_redirect(monkeypatched)
+        check_state_share_mapping(monkeypatched)
         check_push_collected(monkeypatched)
     finally:
         CRM._urlopen = original

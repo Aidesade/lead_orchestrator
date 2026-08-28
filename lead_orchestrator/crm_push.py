@@ -364,6 +364,62 @@ def fetch_existing_leads(attempts=3, *, deadline=None):
     raise last_error or CRMIndexError("CRM GET-индекс недоступен")
 
 
+def _state_share(lead):
+    """Госдоля лида в процентах для контракта CRM; None — не проверяли.
+
+    Отдаём именно ДОЛЮ, а не готовый флаг «гос»: порог (25%, включительно) — это
+    бизнес-правило CRM, и она обязана применить своё, а не наше. Мусор и значения
+    вне 0..100 тихо отбрасываем: «непонятная доля» и «доли нет» для приёмника
+    одно и то же, а вот неверная доля переключила бы флаг молча."""
+    raw = lead.get("_state_share", lead.get("state_share"))
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        share = float(str(raw).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+    return share if 0 <= share <= 100 else None
+
+
+def push_state_share(rows, attempts=3):
+    """Проставить основание госдоли пачкой: `POST /ingest/state-share`.
+
+    Отдельным вызовом после заливки, потому что ingest принимает долю, но НЕ
+    принимает её источник, а для этих лидов источник и есть главное: доля 100%
+    следует из организационно-правовой формы, а не из выписки ЕГРЮЛ. Менеджеру
+    видно, чем метка «гос» подтверждена.
+
+    `rows` — [(ИНН, доля, источник)]. -> (обновлено, не найдено, причина)."""
+    items = []
+    for inn, share, source in rows or ():
+        inn = _digits(inn)
+        if not _valid_org_inn(inn) or share is None:
+            continue
+        items.append({"inn": inn, "state_share": float(share),
+                      "source": str(source or "")[:200]})
+    if not items:
+        return 0, [], "нечего проставлять"
+    if not is_configured():
+        return 0, [], "CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)"
+
+    updated, missing = 0, []
+    for start in range(0, len(items), 500):        # предел ручки — 500 записей
+        chunk = items[start:start + 500]
+        body = json.dumps({"items": chunk}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base_url()}/api/leads/ingest/state-share", data=body, method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        req.add_header("X-Ingest-Token", token())
+        try:
+            with _urlopen(req, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:               # noqa: BLE001 — метка не валит выгрузку
+            return updated, missing, _safe_index_error(f"{type(exc).__name__}: {exc}")
+        updated += int(data.get("updated") or 0)
+        missing.extend(data.get("not_found") or [])
+    return updated, missing, ""
+
+
 def build_payload(lead, sent=None, *, draft=False, onepager=""):
     """Лид пайплайна + факт отправки -> тело запроса CRM.
 
@@ -390,6 +446,7 @@ def build_payload(lead, sent=None, *, draft=False, onepager=""):
         "sent_draft": bool(draft),
         "onepager": os.path.basename(onepager) if onepager else None,
         "note": lead.get("_crm_note") or None,
+        "state_share": _state_share(lead),
     }
     return {k: v for k, v in payload.items() if v is not None}
 
