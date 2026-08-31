@@ -208,7 +208,7 @@ def build_argv(p: Dict[str, Any]) -> List[str]:
     if (p.get("out") or "").strip():
         cmd += ["--out", p["out"].strip()]
     model = str(p.get("model") or "").strip().lower()
-    if model not in ("kimi", "claude"):
+    if model not in ("kimi", "glm", "claude"):
         model = _default_model_flag()          # пустое поле -> runtime-дефолт ветки
     cmd += ["--model", model]
     cmd += ["--workers", str(int(p.get("workers") or 2))]

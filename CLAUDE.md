@@ -40,11 +40,21 @@ checkpoint'ы: под них подложен Kimi-совместимый ада
 `lead_orchestrator_kimi/claude_kimi_adapter.py` (тот же интерфейс `prompt()`), а агентные
 подпроцессы запускаются python'ом ОСНОВНОГО окружения вместо `.venv_kimi`.
 
-- `kimi_config.runtime()` → `claude` (кодовый дефолт `ORQ_LLM_RUNTIME=claude`) | `kimi`.
+- `kimi_config.runtime()` → `claude` (кодовый дефолт `ORQ_LLM_RUNTIME=claude`) | `kimi` | `glm`.
   `ORQ_KIMI_ONLY` — **кодовый дефолт `0`**; `=1` возвращает прежний Kimi-only режим ЦЕЛИКОМ
-  (все guard'ы ветки `kimi` продолжают работать — их держит `test_kimi_only.py`).
-- `--model` у `orchestrator.py` — **дефолт по runtime** (`claude`); `--model kimi` на прогон
-  включает kimi-runtime (нужен ключ шлюза). Значение прокидывается детям через env.
+  (все guard'ы ветки `kimi` продолжают работать — их держит `test_kimi_only.py`; glm при этом
+  заперт так же, как claude).
+- `--model` у `orchestrator.py` — **дефолт по runtime** (`claude`); `--model kimi`/`--model glm`
+  на прогон включают шлюзовой runtime (нужен ключ шлюза). Значение прокидывается детям через env.
+- **Runtime `glm` (2026-08-31) — НЕ отдельный SDK**: та же OpenAI-совместимая механика, что у
+  kimi (движок/контроллер через `AsyncOpenAI`, агентные стадии в `.venv_kimi`, one-pager тем же
+  подпроцессом), только ключ/endpoint/модель резолвятся из `GLM_API_KEY` (фолбэк —
+  `KIMI_API_KEY`/`GPLLM_API_KEY`: шлюз тот же), `GLM_BASE_URL`, `GLM_MODEL_NAME` (дефолт
+  `glm-4.6`; **ID на шлюзе может отличаться — проверить и задать явно**). Детям значения едут
+  ПРЕЖНИМ env-каналом `KIMI_*` — venv-агенты о «бренде» модели не знают; фолбэка
+  `GLM_MODEL_NAME`→`KIMI_MODEL_NAME` нет намеренно (иначе glm молча поехал бы на K2.7).
+  `DR_LLM_PROVIDER=glm` идёт тем же OpenAI-путём движка, что `kimi`. Стадия письма outreach
+  на glm, как и на kimi, не реализована — только claude. Контракт держит `test_glm_runtime.py`.
 - Модели стадий Claude (алиасы CLI, перекрываются env): писатель `opus` (`ORQ_WRITER_MODEL`),
   роли `sonnet` (`ORQ_ENRICH_MODEL`), one-pager `opus` (`ORQ_ONEPAGER_MODEL`), контроллер
   `sonnet` (`ORQ_CONTROLLER_MODEL`), субагенты писателя `sonnet`
@@ -53,7 +63,7 @@ checkpoint'ы: под них подложен Kimi-совместимый ада
 - Авторизация — логин Claude Code (`~/.claude`, доезжает в урезанное env подпроцессов через
   `USERPROFILE`) либо `ANTHROPIC_API_KEY`. Ключ Kimi в claude-runtime НЕ нужен; стоимость
   сессий писателя отдаёт SDK (попадает в `[ГОТОВО] | стоимость`).
-- Веб: `/api/models` отдаёт `claude` (дефолт) и `kimi`; `POST /api/runs` принимает оба.
+- Веб: `/api/models` отдаёт `claude` (дефолт), `kimi` и `glm`; `POST /api/runs` принимает все три.
 - ⚠️ CLI отдаёт MCP-тулы «отложенными»: модель в начале сессии зовёт служебный `ToolSearch`,
   затем работает `Lead*` как обычно. Это штатный хоп, не баг.
 - **Docker остаётся на kimi-runtime** (`ORQ_KIMI_ONLY=1` в образе/compose): headless-логина
@@ -220,7 +230,7 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 перекрывает `--count`; в NL-обёртке это `count_per_industry`), `--min-revenue` (1e9),
 `--region "..."` (поддерживает ОТРИЦАНИЕ: `"НЕ Москва"`, `!X`, `-X`, `кроме X`; смешивание через
 запятую), `--workers N` (2, авто→1 при <3 ГБ RAM — только в боевом запуске, в dry-run проверки нет),
-`--model kimi`, `--no-presentation`, `--no-person-enrich`, `--show-browser`, `--out <json>`
+`--model kimi|glm`, `--no-presentation`, `--no-person-enrich`, `--show-browser`, `--out <json>`
 (плюс `--collect-only` — стоп после ФАЗЫ 1 и `--push-crm` — выгрузить собранное в CRM; второй
 работает только с первым: после ФАЗЫ 2 у госрежима свой batch исследованных лидов),
 (дефолт `D:\лиды\leads_<отрасли>.json`), `--base` (`disk:/Лиды`), `--account`, `--redo`
@@ -243,6 +253,7 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 ```
 py -m py_compile orchestrator.py writer_kimi.py deep_research_engine.py company_research_agent.py  # из app/
 py test_claude_runtime.py        # ШТАТ ветки: дефолт claude, диспатч, модели стадий, адаптер
+py test_glm_runtime.py           # третий runtime glm: шлюзовой путь, канал KIMI_*, запреты kimi-only
 py test_kimi_only.py             # откат ORQ_KIMI_ONLY=1: Kimi K2.7 runtime цел и запирает Claude
 py test_kimi_agent_freedom.py    # контракт свободного Agent loop писателя
 py test_research_enrichment.py   # scheduler/контракты/cache/DOCX-adapter пяти ролей (вкл. деградацию)
@@ -278,7 +289,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
 `test_source_ofdata.py`, `test_source_girbo.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
-`test_claude_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
+`test_claude_runtime.py`, `test_glm_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
 `test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_verify_xlsx.py`,
 `test_outlook_send.py`,
 `apply_patches.py --check` и импорт Kimi-стадии. Добавил тест — добавь его и в гейт.
@@ -531,9 +542,9 @@ Crawl4AI пускает lxml 6 только с 0.9.2 (у 0.9.0 был потол
 только после перезапуска (ярлык открывает свежую консоль).
 
 **Переключатели режима:** `LEAD_SOURCE` (`rusprofile` дефолт | `ofdata` | `checko`),
-`ORQ_STORE` (`local` дефолт | `disk`), `ORQ_LLM_RUNTIME` (`claude` дефолт ветки | `kimi`),
+`ORQ_STORE` (`local` дефолт | `disk`), `ORQ_LLM_RUNTIME` (`claude` дефолт ветки | `kimi` | `glm`),
 `ORQ_KIMI_ONLY` (`0`; `=1` — полный Kimi-режим, перекрывает всё),
-`DR_LLM_PROVIDER` (по runtime: `claude` | `kimi`; можно перекрыть отдельно).
+`DR_LLM_PROVIDER` (по runtime: `claude` | `kimi` | `glm`; можно перекрыть отдельно).
 **Модели claude-стадий:** `ORQ_WRITER_MODEL` (`opus`), `ORQ_ENRICH_MODEL` (`sonnet`),
 `ORQ_ONEPAGER_MODEL` (`opus`), `ORQ_CONTROLLER_MODEL` (`sonnet`),
 `ORQ_SCOUT_MODEL`/`ORQ_CRITIC_MODEL`/`ORQ_VERIFIER_MODEL` (`sonnet`), `DR_EXTRACT_MODEL` (`sonnet`).

@@ -330,8 +330,11 @@ def _build_cmd(plan: dict) -> tuple[list[str] | None, str | None]:
 
 def _runtime_label() -> str:
     """Человекочитаемая метка активного runtime для консоли."""
-    if KC.runtime() == "kimi":
+    active = KC.runtime()
+    if active == "kimi":
         return f"Kimi {KC.model_name()}"
+    if active == "glm":
+        return f"GLM {KC.model_name()} (шлюз)"
     return f"Claude Agent SDK ({KC.claude_model('controller')})"
 
 

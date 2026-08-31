@@ -101,7 +101,8 @@ def kimi_model(model: str | None = None) -> str:
     """Имя модели ПИСАТЕЛЯ у активного провайдера. UI/CLI передаёт псевдоним
     ('kimi'/'claude') — реальное имя резолвит конфиг; явное имя модели идёт как есть."""
     m = (model or "").strip()
-    if m and m.lower() not in ("kimi", "kimi-writer", "claude", "claude-writer"):
+    if m and m.lower() not in ("kimi", "kimi-writer", "glm", "glm-writer",
+                               "claude", "claude-writer"):
         return m                                   # явное имя модели передали как есть
     if KC.runtime() == "claude":
         return KC.claude_model("writer")
@@ -121,6 +122,11 @@ def kimi_base_url() -> str:
 
 def is_kimi(model: str | None) -> bool:
     return str(model or "").strip().lower().startswith("kimi")
+
+
+def is_glm(model: str | None) -> bool:
+    """Псевдоним glm-runtime: тот же шлюзовой pipeline, что kimi, но модель GLM."""
+    return str(model or "").strip().lower().startswith("glm")
 
 
 def is_claude(model: str | None) -> bool:
@@ -143,9 +149,11 @@ def _agent_files_missing(cli: pathlib.Path) -> list[str]:
 
 
 def _require_provider_key() -> None:
-    """Ключ нужен только kimi-runtime; Claude авторизуется логином Claude Code/ANTHROPIC_*."""
+    """Ключ нужен только шлюзовым runtime (kimi/glm); Claude авторизуется логином
+    Claude Code/ANTHROPIC_*."""
     if KC.runtime() != "claude" and not kimi_key():
-        raise RuntimeError("нет ключа Kimi: задай KIMI_API_KEY или GPLLM_API_KEY")
+        raise RuntimeError(
+            "нет ключа шлюза: задай KIMI_API_KEY/GPLLM_API_KEY (для glm — GLM_API_KEY)")
 
 
 def _agent_enabled() -> bool:
@@ -165,7 +173,8 @@ def _agent_env(api_model: str, share_dir: str) -> dict[str, str]:
     env["KIMI_API_KEY"] = kimi_key()
     env["KIMI_BASE_URL"] = kimi_base_url()
     # У claude имя модели едет в request.json, а KIMI_MODEL_NAME остаётся валидным дефолтом.
-    env["KIMI_MODEL_NAME"] = api_model if runtime == "kimi" else KC.DEFAULT_MODEL
+    # Шлюзовые runtime (kimi/glm) отдают venv-агенту РЕАЛЬНЫЙ ID модели этим же каналом.
+    env["KIMI_MODEL_NAME"] = api_model if runtime != "claude" else KC.DEFAULT_MODEL
     env["ORQ_LLM_RUNTIME"] = runtime
     env["PYTHONIOENCODING"] = "utf-8"
     env["ORQ_MAIN_PY"] = sys.executable

@@ -86,7 +86,8 @@ DR_MAX_PAGES = int(os.environ.get("DR_MAXPAGES", "25"))       # кап стра�
 DR_LLM_CONCURRENCY = int(os.environ.get("DR_LLM_CONCURRENCY", "2"))   # параллельных Kimi-вызовов
 DR_CRAWL_CONCURRENCY = int(os.environ.get("DR_CRAWL_CONCURRENCY", "4"))  # параллельных HTTP-фетчей
 EXTRACT_MODEL = os.environ.get("DR_EXTRACT_MODEL", "sonnet")  # дешёвая модель для экстракта/критика
-# Провайдер LLM-экстракта: штатно Kimi через общий OpenAI-совместимый шлюз.
+# Провайдер LLM-экстракта: штатно OpenAI-совместимый шлюз ('kimi' либо 'glm' —
+# путь один, различаются только ключ/модель, их резолвит kimi_config по runtime).
 # Claude разрешён только при явном аварийном opt-out ORQ_KIMI_ONLY=0.
 DR_LLM_PROVIDER = (os.environ.get("DR_LLM_PROVIDER", "kimi") or "kimi").strip().lower()
 DR_USE_LLM = os.environ.get("DR_USE_LLM", "1") not in ("0", "false", "no", "")
@@ -1047,7 +1048,7 @@ async def _kimi_extract(system, prompt):
         return ""
     key = KC.api_key()
     if not key:
-        _note("нет ключа Kimi (KIMI_API_KEY/GPLLM_API_KEY) для LLM-экстракта")
+        _note("нет ключа шлюза (GLM_API_KEY/KIMI_API_KEY/GPLLM_API_KEY) для LLM-экстракта")
         return ""
     model = KC.model_name()
     timeout = float(os.environ.get("DR_LLM_TIMEOUT", "300"))
@@ -1095,8 +1096,8 @@ async def llm_extract(pages, focus="", model=EXTRACT_MODEL, aspects=""):
               f"контактные лица закупок, соцсети, ИТ/цифровизация, ИТ-ландшафт "
               f"(системы/вендоры/годы внедрения — особенно на страницах tadviser.ru), проектный институт, "
               f"вертикаль/экосистема (учредитель, ведомство, сестринские структуры, комиссии).\n\n{blob}")
-    # Kimi-путь: тот же промпт, но через OpenAI-совместимый шлюз — весь пайплайн без Anthropic.
-    if DR_LLM_PROVIDER == "kimi":
+    # Шлюзовой путь (kimi/glm): тот же промпт через OpenAI-совместимый шлюз — без Anthropic.
+    if DR_LLM_PROVIDER in ("kimi", "glm"):
         return _extract_json(await _kimi_extract(_EXTRACT_SYSTEM, prompt))
     try:
         from claude_agent_sdk import (query, ClaudeAgentOptions, AssistantMessage,

@@ -58,11 +58,12 @@ async def industries() -> List[Dict[str, Any]]:
 
 @app.get("/api/models")
 async def models() -> List[Dict[str, Any]]:
-    """Runtime ПИСАТЕЛЯ двух .docx (флаг --model): kimi (дефолт) и claude.
+    """Runtime ПИСАТЕЛЯ двух .docx (флаг --model): kimi (дефолт), glm и claude.
 
-    `claude`/`kimi` — псевдонимы: конкретные модели резолвит kimi_config
-    (ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL или единый KIMI_MODEL_NAME). У Kimi биллинг
-    провайдера: цену за вызов шлюз наружу не отдаёт; у Claude стоимость отдаёт SDK.
+    `claude`/`kimi`/`glm` — псевдонимы: конкретные модели резолвит kimi_config
+    (ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL, единый KIMI_MODEL_NAME либо GLM_MODEL_NAME).
+    У шлюзовых (kimi/glm) биллинг провайдера: цену за вызов шлюз наружу не отдаёт;
+    у Claude стоимость отдаёт SDK.
     """
     import kimi_config as _kc                  # лежит в пакете оркестратора (sys.path уже добавлен в leads.py)
     default = _kc.default_model_flag()
@@ -75,6 +76,8 @@ async def models() -> List[Dict[str, Any]]:
          "label": f"Claude Agent SDK ({_kc.claude_model('writer')}+{_kc.claude_model('enrich')})",
          "billing": "sdk", "default": default == "claude"},
         kimi,
+        {"id": "glm", "label": f"GLM ({_kc.glm_model_name()}, шлюз)",
+         "billing": "provider", "default": default == "glm"},
     ]
 
 

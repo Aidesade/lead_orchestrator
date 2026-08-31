@@ -224,7 +224,7 @@ async def write_letter(lead, pain="", industry_cfg=None, model=None, log=print,
         runtime = "claude"
     if runtime != "claude":
         raise LetterError(
-            "стадия письма реализована для claude-runtime; для kimi запусти прогон с "
+            "стадия письма реализована для claude-runtime; для kimi/glm запусти прогон с "
             "ORQ_LLM_RUNTIME=claude либо добавь подпроцесс в .venv_kimi")
     if KIMI_DIR not in sys.path:
         sys.path.insert(0, KIMI_DIR)

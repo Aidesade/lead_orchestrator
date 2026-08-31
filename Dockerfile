@@ -112,6 +112,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
     && python lead_orchestrator/tests/test_state_owned_wiring.py \
     && python lead_orchestrator/tests/test_kimi_only.py \
     && python lead_orchestrator/tests/test_claude_runtime.py \
+    && python lead_orchestrator/tests/test_glm_runtime.py \
     && python lead_orchestrator/tests/test_kimi_agent_freedom.py \
     && python lead_orchestrator/tests/test_research_enrichment.py \
     && python lead_orchestrator/tests/test_email_guess.py \

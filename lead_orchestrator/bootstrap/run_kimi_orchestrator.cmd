@@ -47,14 +47,22 @@ if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
 if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\..\env\rusprofile_cookies.json"
 if /I "%ORQ_LLM_RUNTIME%"=="kimi" (
     set "DR_LLM_PROVIDER=kimi"
+) else if /I "%ORQ_LLM_RUNTIME%"=="glm" (
+    set "DR_LLM_PROVIDER=glm"
 ) else (
     if not defined DR_LLM_PROVIDER set "DR_LLM_PROVIDER=claude"
 )
 
-if /I not "%ORQ_LLM_RUNTIME%"=="kimi" goto runtime_ready
+rem Both gateway runtimes (kimi and glm) need a gateway key; api_key() resolves
+rem GLM_API_KEY itself when ORQ_LLM_RUNTIME=glm.
+if /I "%ORQ_LLM_RUNTIME%"=="kimi" goto gateway_key_check
+if /I "%ORQ_LLM_RUNTIME%"=="glm" goto gateway_key_check
+goto runtime_ready
+:gateway_key_check
 "%ORQ_MAIN_PY%" -c "import sys;sys.path.insert(0,r'%~dp0..\app');from project_env import load_project_env;load_project_env();import kimi_config as k;raise SystemExit(0 if k.api_key() else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] No KIMI_API_KEY or GPLLM_API_KEY in "%~dp0..\..\env\.env" or environment.
+    echo [ERROR] No gateway key. Set KIMI_API_KEY or GPLLM_API_KEY, for glm also
+    echo         GLM_API_KEY works, in "%~dp0..\..\env\.env" or environment.
     echo         Add the key there; the env folder is Git-ignored.
     exit /b 7
 )

@@ -183,7 +183,7 @@ def _kimi_env():
     env["KIMI_API_KEY"] = _kimi_key()
     env["KIMI_BASE_URL"] = KC.base_url()
     env["KIMI_MODEL_NAME"] = KC.model_name()
-    env["ORQ_LLM_RUNTIME"] = KC.runtime()      # claude|kimi — выбирает ветку в onepager_kimi
+    env["ORQ_LLM_RUNTIME"] = KC.runtime()      # claude|kimi|glm — выбирает ветку в onepager_kimi
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
@@ -378,7 +378,7 @@ async def _research_one(lead, idx, d_tmp, s_tmp, model, person_enrich=True):
     # Оба псевдонима runtime ведут в ТЕКУЩИЙ pipeline: разница только в SDK под стадиями.
     # Ниже по файлу остаётся ДРУГАЯ архитектура — legacy «агент ресёрчит сам», достижимая
     # только явным именем модели (opus/sonnet) при ORQ_KIMI_ONLY=0.
-    if WK.is_kimi(model) or WK.is_claude(model):
+    if WK.is_kimi(model) or WK.is_glm(model) or WK.is_claude(model):
         return await _research_one_kimi(
             lead, idx, d_tmp, s_tmp, model, person_enrich=person_enrich)
 
@@ -625,7 +625,8 @@ def _presentation_prereqs():
                        "(создай: py -m venv .venv_kimi && .venv_kimi\\Scripts\\python.exe -m pip "
                        "install kimi-agent-sdk playwright — и применить патчи, см. CLAUDE.md той папки)")
     if not _kimi_key():
-        return False, "не задан ключ Kimi (KIMI_API_KEY или GPLLM_API_KEY)"
+        return False, ("не задан ключ шлюза (KIMI_API_KEY или GPLLM_API_KEY; "
+                       "для glm — GLM_API_KEY)")
     return True, ""
 
 
@@ -1380,8 +1381,9 @@ async def main():
                     help="параллельных Kimi-ресёрчей; при нехватке RAM авто-снижается до 1")
     ap.add_argument("--model", default=KC.default_model_flag(),
                     help="runtime писателя двух .docx: 'claude' (штат ветки, Claude Agent SDK; "
-                         "модели стадий — ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL и т.д.) или 'kimi' "
-                         "(точный ID из KIMI_MODEL_NAME, дефолт kimi-k2.7-code)")
+                         "модели стадий — ORQ_WRITER_MODEL/ORQ_ENRICH_MODEL и т.д.), 'kimi' "
+                         "(точный ID из KIMI_MODEL_NAME, дефолт kimi-k2.7-code) или 'glm' "
+                         "(тот же шлюз, ID из GLM_MODEL_NAME, дефолт glm-4.6)")
     ap.add_argument("--dry-run", action="store_true", help="ресёрч без LLM — заготовки (бесплатно)")
     ap.add_argument("--no-upload", action="store_true", help="ресёрч-файлы не грузить на Диск")
     ap.add_argument("--redo", action="store_true",
@@ -1405,26 +1407,30 @@ async def main():
     ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
                     help="не обогащать ЛПР прямыми контактами")
     a = ap.parse_args()
-    model_is_kimi = str(a.model or "").strip().lower().startswith("kimi")
+    _model_flag = str(a.model or "").strip().lower()
+    # kimi* и glm* — оба шлюзовых runtime (OpenAI-совместимый путь), остальное -> claude.
+    model_runtime = ("kimi" if _model_flag.startswith("kimi")
+                     else "glm" if _model_flag.startswith("glm") else "claude")
+    model_is_gateway = model_runtime != "claude"
     if KC.kimi_only():
-        if not model_is_kimi:
+        if model_runtime != "kimi":
             raise SystemExit(
-                "Kimi-only режим: Claude/Anthropic отключён. Используй --model kimi "
+                "Kimi-only режим: Claude/Anthropic и glm отключены. Используй --model kimi "
                 "или явно задай ORQ_KIMI_ONLY=0 для аварийного legacy-отката.")
         a.model = "kimi"
         KC.ensure_env(require_key=not a.dry_run)
         print(f"[LLM] Kimi-only: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
     else:
-        # Runtime на прогон определяет флаг --model: kimi* -> kimi (нужен ключ шлюза),
-        # всё остальное -> claude. Дочерние процессы наследуют выбор через env.
-        os.environ["ORQ_LLM_RUNTIME"] = "kimi" if model_is_kimi else "claude"
-        if model_is_kimi:
-            # Явный --model kimi сильнее унаследованного env: ensure_env ставит провайдера
+        # Runtime на прогон определяет флаг --model. Дочерние процессы наследуют выбор через env.
+        os.environ["ORQ_LLM_RUNTIME"] = model_runtime
+        if model_is_gateway:
+            # Явный --model kimi/glm сильнее унаследованного env: ensure_env ставит провайдера
             # только через setdefault, а для claude он и так выставит "claude".
-            os.environ["DR_LLM_PROVIDER"] = "kimi"
+            os.environ["DR_LLM_PROVIDER"] = model_runtime
         KC.ensure_env(require_key=not a.dry_run)
-        if model_is_kimi:
-            print(f"[LLM] Kimi runtime: все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
+        if model_is_gateway:
+            print(f"[LLM] {'Kimi' if model_runtime == 'kimi' else 'GLM'} runtime (шлюз): "
+                  f"все модельные стадии -> {KC.model_name()} ({KC.base_url()})")
         else:
             print(f"[LLM] Claude Agent SDK: писатель={KC.claude_model('writer')}, "
                   f"роли={KC.claude_model('enrich')}, one-pager={KC.claude_model('onepager')}, "
@@ -1541,9 +1547,9 @@ async def main():
     import writer_kimi as WK          # лёгкий модуль: CRA внутри него импортируется лениво
     if not a.dry_run:
         _what = ("2 .docx + one-pager .pdf" if a.presentation else "2 .docx")
-        if WK.is_kimi(a.model):
-            # Вилка в долларах верна ТОЛЬКО для Claude-сессий. На Kimi писателя считает
-            # провайдер (gpllmkeeper), цену за вызов он наружу не отдаёт — врать вилкой нельзя.
+        if WK.is_kimi(a.model) or WK.is_glm(a.model):
+            # Вилка в долларах верна ТОЛЬКО для Claude-сессий. На шлюзе (kimi/glm) писателя
+            # считает провайдер (gpllmkeeper), цену за вызов он наружу не отдаёт — врать нельзя.
             print(f"[оценка] {len(sel)} компаний, писатель на {WK.kimi_model(a.model)} "
                   f"({_what} на компанию). Стоимость считает провайдер Kimi — "
                   "оркестратор её не видит, в итоге будет $0.")
@@ -1570,7 +1576,7 @@ async def main():
             gen_pdf = False
         else:
             print("[onepager] стадия включена: по каждой компании будет one-pager .pdf "
-                  f"({'Kimi' if KC.runtime() == 'kimi' else 'Claude'}).")
+                  f"({ {'kimi': 'Kimi', 'glm': 'GLM'}.get(KC.runtime(), 'Claude') }).")
     # Транзитная рабочая папка. Файлы здесь ВРЕМЕННЫЕ: после заливки на Я.Диск папка удаляется
     # (см. конец) — на компьютере ничего не остаётся. Предпочитаем D: (на C: мало места);
     # если D: нет — системный %TEMP%.
@@ -1604,7 +1610,8 @@ async def main():
     # Агентный писатель с веером субагентов может работать дольше 30 минут; в текущем
     # pipeline (kimi и claude) общий дедлайн по умолчанию не ставим — у стадий свои
     # таймауты. Прежний предохранитель 1800с остаётся только для legacy-архитектуры.
-    default_research_timeout = ("0" if (WK.is_kimi(a.model) or WK.is_claude(a.model))
+    default_research_timeout = ("0" if (WK.is_kimi(a.model) or WK.is_glm(a.model)
+                                        or WK.is_claude(a.model))
                                 else "1800")
     research_timeout = float(os.environ.get("ORQ_RESEARCH_TIMEOUT", default_research_timeout))
     pdf_timeout = float(os.environ.get("ORQ_ONEPAGER_TIMEOUT", "900"))        # сек на попытку one-pager
