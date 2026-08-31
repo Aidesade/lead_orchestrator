@@ -16,8 +16,9 @@ import zipfile
 from types import SimpleNamespace
 
 
-ROOT = pathlib.Path(__file__).resolve().parent
-KIMI = ROOT.parent / "lead_orchestrator_kimi"
+HERE = pathlib.Path(__file__).resolve().parent
+APP = HERE.parent / "app"            # код пайплайна
+KIMI = HERE.parents[1] / "lead_orchestrator_kimi"
 SPEC = importlib.util.spec_from_file_location(
     "research_enrichment_agent_under_test", KIMI / "research_enrichment_agent.py")
 R = importlib.util.module_from_spec(SPEC)
@@ -443,7 +444,7 @@ def test_contract_guards():
 
 def test_docx_adapter():
     import sys
-    sys.path.insert(0, str(ROOT))
+    sys.path.insert(0, str(APP))
     import writer_kimi as writer
 
     enrichment = {

@@ -11,6 +11,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 venv нужен только kimi); веб — `web/`; контейнеризация — `Dockerfile`/`docker-compose.yml`.
 Python 3.12, основная платформа Windows, прод-цель — Docker в Linux. Комментарии в коде — на русском.
 
+**Раскладка `lead_orchestrator/` (2026-08-31):** плоская папка разложена на три —
+`app/` (весь код пайплайна + `assets/` и `connectors/`), `tests/` (все `test_*.py` и
+json-фикстуры прогонов), `bootstrap/` (лаунчеры `run_*.cmd`/`.ps1` и `requirements.txt`).
+В корне папки остались только `README.md` и `.gitignore`. Импорты внутри `app/` остались
+ПЛОСКИМИ (`import orchestrator`), пакета не заведено: точка входа — файл, а не модуль
+(`py app/orchestrator.py`), и подпроцессы зовут именно файлы. Тесты добавляют `app/` в
+`sys.path` сами (`APP = HERE.parent / "app"`), поэтому гонять их можно из любой папки.
+Корень репозитория внутри кода теперь на ДВА уровня выше файла — не «упрощать» обратно
+к `parent.parent` (`project_env.py`, `rusprofile_session.py`, `orchestrator.REPO_ROOT`,
+`outreach.REPO_ROOT`, `outreach_letter`, `writer_kimi.KIMI_DIR`).
+
 Оркестратор **детерминированный Python**, а не LLM-оркестратор: модель принимает решения только
 внутри стадий (NL-контроллер, ресёрч, enrichment, писатель), а порядок и устойчивость — код.
 
@@ -57,7 +68,7 @@ Legacy-архитектура Claude «агент ресёрчит сам» (`_r
 ## Outreach-пайплайн (главное в ЭТОЙ ветке)
 
 Второй, **самостоятельный** пайплайн: не материалы для ручной рассылки, а письмо ЛПР целиком.
-Вход — `lead_orchestrator/outreach.py`, лаунчер — `run_outreach.cmd`, ярлык на рабочем столе —
+Вход — `lead_orchestrator/app/outreach.py`, лаунчер — `bootstrap/run_outreach.cmd`, ярлык на рабочем столе —
 **`New Kimi Orchestrator`** (иконка Outlook, чтобы не путать с `new_orchestrator` — тот запускает
 старый пайплайн с двумя `.docx`). Порядок держит код, модель работает ровно в одном месте —
 текст письма.
@@ -121,8 +132,10 @@ SMTP-проба в стадии 6 выключена кодом (`smtp=False`), 
 
 ## Запуск
 
-Ярлык на рабочем столе **`new_orchestrator`** → `run_orchestrator.cmd` (канонический делегат) →
-`run_kimi_orchestrator.cmd` → NL-контроллер `orchestrator_agent.py` → **`orchestrator.py`**.
+Ярлык на рабочем столе **`new_orchestrator`** → `bootstrap/run_orchestrator.cmd` (канонический
+делегат) → `bootstrap/run_kimi_orchestrator.cmd` → NL-контроллер `app/orchestrator_agent.py` →
+**`app/orchestrator.py`**. ⚠️ После раскладки 2026-08-31 ярлыки надо перенацелить на
+`D:\lead_gen\lead_orchestrator\bootstrap\` — заглушек на прежних путях намеренно НЕ оставлено.
 Лаунчер выставляет `ORQ_LLM_RUNTIME=claude` (`ORQ_KIMI_ONLY=0`), `DR_LLM_PROVIDER=claude`,
 `LEAD_SOURCE=rusprofile`, `RUSPROFILE_BROWSER=playwright` + Kimi-дефолты (безвредны для claude,
 обязательны для отката `ORQ_KIMI_ONLY=1`). Прекондишены — жёсткая ошибка ДО запуска, а не тихий
@@ -135,7 +148,10 @@ RusProfile — в обоих режимах.
 по ней находит основной venv для read-only веб-моста Kimi→движок. Задавая её вручную, указывай
 питон с зависимостями пайплайна.
 
-Оба `.cmd` — строго **ASCII+CRLF**: cmd.exe портит UTF-8/LF батники.
+Оба `.cmd` — строго **ASCII+CRLF**: cmd.exe портит UTF-8/LF батники. Лаунчеры лежат в
+`bootstrap/` и ходят к коду через `%~dp0..\app\`, а к `env/.env` — через `%~dp0..\..\env\`.
+
+Команды ниже — **из `lead_orchestrator/app/`** (там лежит код; тесты — в соседней `tests/`).
 
 ```
 # полная цепочка (сбор + ресёрч + 3 файла), ВСЯ отрасль (по умолчанию 200 компаний):
@@ -159,7 +175,7 @@ py orchestrator.py "D:\лиды\leads_mining.json"
 py orchestrator.py "D:\лиды\leads_mining.json" --no-presentation   # без 3-й стадии, только 2 .docx
 py orchestrator.py "D:\лиды\leads_mining.json" --no-upload         # файлы остаются в temp, путь печатается
 py orchestrator.py "D:\лиды\leads_mining.json" --dry-run --no-upload  # заглушки, без LLM и без следов
-py orchestrator.py sample_ryazanavtodor.json --no-upload           # разовый прогон одной компании
+py orchestrator.py ..	ests\sample_ryazanavtodor.json --no-upload   # разовый прогон одной компании
 # ВЕТКА outreach — рассылка (лаунчер run_outreach.cmd; БЕЗ --send письма ложатся в Черновики):
 py outreach.py --check                                 # стадия 8: кому писали, где застряли
 py outreach.py --industries mining --count 10          # сбор + весь цикл до черновиков
@@ -211,9 +227,9 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 (ВЫКЛючить резюм). NL-обёртка прокидывает лишь подмножество (нет `--no-person-enrich`/`--out`/
 `--base`/`--headless`).
 
-**Разовые/партийные точки входа** (не канон пайплайна, но живые): `run_cit_kimi.cmd` — фиксированный
-прогон по `cit_lead.json` (только 2 `.docx`, `ORQ_STORE=local`, самопроверка `CIT_KIMI_VERIFY=1`);
-`run_kimi_oil28.cmd` / `.ps1` (он же `run_kimi_orchestrator.cmd oil28`) — партия из
+**Разовые/партийные точки входа** (не канон пайплайна, но живые): `bootstrap/run_cit_kimi.cmd` — фиксированный
+прогон по `tests/cit_lead.json` (только 2 `.docx`, `ORQ_STORE=local`, самопроверка `CIT_KIMI_VERIFY=1`);
+`bootstrap/run_kimi_oil28.cmd` / `.ps1` (он же `run_kimi_orchestrator.cmd oil28`) — партия из
 `rusprofile_28_pending.json` в `D:\лиды_нефтяная_отрасль`. В корне репо трекаются одноразовые
 подготовители этой партии `_prepare_rusprofile_28.py` / `_prepare_researched_subset.py`;
 сами `rusprofile_28_*.json` — гитигнор. Ничего из этого не трогать при правках пайплайна.
@@ -221,10 +237,11 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 ## Проверка правки
 
 Тесты **не pytest** — это самостоятельные скрипты, поэтому «прогнать один тест» = запустить один файл.
-Гонять из `lead_orchestrator/`.
+Гонять из `lead_orchestrator/tests/` — они сами кладут соседнюю `app/` в `sys.path`, так что
+рабочая папка им безразлична. Всё, что помечено `# из app/`, запускается из `lead_orchestrator/app/`.
 
 ```
-py -m py_compile orchestrator.py writer_kimi.py deep_research_engine.py company_research_agent.py
+py -m py_compile orchestrator.py writer_kimi.py deep_research_engine.py company_research_agent.py  # из app/
 py test_claude_runtime.py        # ШТАТ ветки: дефолт claude, диспатч, модели стадий, адаптер
 py test_kimi_only.py             # откат ORQ_KIMI_ONLY=1: Kimi K2.7 runtime цел и запирает Claude
 py test_kimi_agent_freedom.py    # контракт свободного Agent loop писателя
@@ -242,19 +259,19 @@ py test_state_ownership.py       # госдоля: выписка ЕГРЮЛ, Р
 py test_state_owned_collection.py # строгий добор ровно N: дедуп CRM/реестра, гейты 2025 / госдоля >=25% / Татарстан
 py test_state_owned_wiring.py    # CLI/NL-подключение госрежима: фикс. профиль нельзя ослабить
 DR_USE_LLM=0 py test_deep_research.py   # смоук движка: экстракт, completeness_critic, петля добора
-py orchestrator_agent.py --selftest     # план NL-контроллера -> argv
-py kimi_research_cli.py --selftest      # subprocess-мост URL-инструментов
-py connectors\yadisk_mcp.py --selftest  # ядро Яндекс Диска офлайн
-py ..\web\api\test_events.py            # парсер stdout -> SSE на НАСТОЯЩИХ логах D:\orq_tmp\run_*.log
-py orchestrator.py sample_ryazanavtodor.json --dry-run --no-upload   # вся цепочка офлайн, заглушки
-py outreach.py sample_ryazanavtodor.json --dry-run   # ВЕТКА outreach: стадии офлайн, без писем
-py crm_push.py --ping            # ВЕТКА outreach, стадия 9: настроена ли CRM и отвечает ли она
-py outlook_send.py --check       # ВЕТКА outreach: жив ли Outlook и есть ли ящик @tatar.ru
+py orchestrator_agent.py --selftest     # из app/: план NL-контроллера -> argv
+py kimi_research_cli.py --selftest      # из app/: subprocess-мост URL-инструментов
+py connectors\yadisk_mcp.py --selftest  # из app/: ядро Яндекс Диска офлайн
+py ..\..\web\api\test_events.py         # парсер stdout -> SSE на логах D:\orq_tmp\run_*.log
+py orchestrator.py ..\tests\sample_ryazanavtodor.json --dry-run --no-upload   # из app/: цепочка офлайн
+py outreach.py ..\tests\sample_ryazanavtodor.json --dry-run   # из app/: ВЕТКА outreach офлайн
+py crm_push.py --ping            # из app/: стадия 9 — настроена ли CRM и отвечает ли она
+py outlook_send.py --check       # из app/: жив ли Outlook и есть ли ящик @tatar.ru
 ```
 
 Агентные селфтесты: claude-режим — ОСНОВНЫМ python'ом
-(`set ORQ_LLM_RUNTIME=claude && py ..\lead_orchestrator_kimi\writer_kimi_agent.py --selftest`,
-`py ..\lead_orchestrator_kimi\claude_kimi_adapter.py` — оба уже гоняет `test_claude_runtime.py`);
+(из `app/`: `set ORQ_LLM_RUNTIME=claude && py ..\..\lead_orchestrator_kimi\writer_kimi_agent.py --selftest`,
+`py ..\..\lead_orchestrator_kimi\claude_kimi_adapter.py` — оба уже гоняет `test_claude_runtime.py`);
 kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `.venv_kimi\Scripts\python.exe writer_kimi_agent.py --selftest` и
 `... research_enrichment_agent.py --selftest`, плюс `patches/apply_patches.py --check`.
@@ -273,7 +290,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 ## ФАЗА 1 — сбор
 
 Источник выбирается env `LEAD_SOURCE`. **Кодовый дефолт и desktop-лаунчер — `rusprofile`**
-(`orchestrator.py:650`, `run_kimi_orchestrator.cmd:38`). `ofdata` выставлен **только в Docker**
+(`orchestrator.py:737`, `run_kimi_orchestrator.cmd:45`). `ofdata` выставлен **только в Docker**
 (`Dockerfile`, `docker-compose.yml`), потому что в образе нет Chrome. `checko` — второй API-откат.
 
 - **`rusprofile`** (`source_rusprofile.py` + `rusprofile_playwright.py`) — штатный локальный путь.
@@ -340,7 +357,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
    отделы, филиалы, официальные контакты, план захода, оговорки.
 3. `<Компания>_презентация_Telepatt.pdf` — клиентский one-pager (см. ниже).
 
-Порядок в `_research_one_kimi` (`orchestrator.py:234`) — менять только осознанно:
+Порядок в `_research_one_kimi` (`orchestrator.py:270`) — менять только осознанно:
 
 1. **Пред-запуск движка ДО сессии писателя, ДВА прохода.** `RESEARCH_PASSES` гоняет
    `deep_research_engine.deep_research()` дважды со своими `aspects`: проход **`process`** (профиль,
@@ -372,7 +389,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
    ⚠️ **Мягкая деградация (2026-07-22, `4317dc4`): сбой роли НЕ роняет компанию.** Упавшая роль и её
    downstream пишутся в `roles_failed`, наружу идёт частичное досье (`complete=False`), писатель
    добирает недостающее из находок движка. Вызов обёрнут в try/except — **писатель запускается ВСЕГДА**
-   (`orchestrator.py:280-299`). Раньше любая ошибка роли → `RuntimeError` → exit 1 → писатель вообще
+   (`orchestrator.py:327-334`). Раньше любая ошибка роли → `RuntimeError` → exit 1 → писатель вообще
    не стартовал, а лог винил писателя («не сохранил .docx»). **Не возвращать `raise` в `run()`.**
    Родитель (`writer_kimi.run_research_subagents`) поднимает НАСТОЯЩУЮ причину из stdout, а не хвост
    stderr с шумом `authlib.jose` DeprecationWarning.
@@ -444,7 +461,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `connectors/` | `yadisk_client.py` — ядро Яндекс Диска на официальном REST API (stdlib); `yadisk_mcp.py` — MCP-обёртка над ним |
 | `project_env.py` | тихая загрузка `env/.env` в desktop/CLI без печати значений (`ORQ_ENV_FILE` перекрывает путь) |
 | `pipeline.py` | отбор `_select` + сохранение `_save`; его СОБСТВЕННАЯ цепочка `run()` работает только при прямом `py pipeline.py` — оркестратор её не вызывает |
-| `../lead_orchestrator_kimi/` | **агенты Фазы 2 для обоих runtime**: `research_enrichment_agent.py` (пять ролей, schema v3, evidence trace), `writer_kimi_agent.py` (агентный писатель одного документа), `claude_kimi_adapter.py` (**Kimi-совместимый `prompt()` поверх Claude Agent SDK**; MCP-тулы Lead* + нативные субагенты; импортировать только основным python), `onepager_kimi.py`+`html_to_pdf.py` (3-я стадия), `leadgen_tools.py` (kosong-тулы kimi-cli). `.venv_kimi` нужен только kimi-runtime. Свой `CLAUDE.md` — читать перед правкой |
+| `lead_orchestrator_kimi/` (соседняя с `lead_orchestrator/`) | **агенты Фазы 2 для обоих runtime**: `research_enrichment_agent.py` (пять ролей, schema v3, evidence trace), `writer_kimi_agent.py` (агентный писатель одного документа), `claude_kimi_adapter.py` (**Kimi-совместимый `prompt()` поверх Claude Agent SDK**; MCP-тулы Lead* + нативные субагенты; импортировать только основным python), `onepager_kimi.py`+`html_to_pdf.py` (3-я стадия), `leadgen_tools.py` (kosong-тулы kimi-cli). `.venv_kimi` нужен только kimi-runtime. Свой `CLAUDE.md` — читать перед правкой |
 | `web/` | FastAPI + React/Vite. Спавнит `orchestrator.py` подпроцессом и парсит его stdout в SSE; один активный прогон (второй → 409). Свой `README.md` |
 | `Dockerfile` / `docker-compose.yml` | два venv в образе (`/opt/venv` + `/opt/kimi-venv`), БЕЗ Chrome/Xvfb → `source_rusprofile` в контейнере неработоспособен. Сборка = build-gate (см. «Проверка правки») |
 | `assets/` | `bulat_zamaliev.png` — фото эксперта (вшивается в one-pager). `citrt_logo.png` остался от .pptx-стадии; в one-pager логотип — текстовый словомарк |
@@ -632,7 +649,7 @@ Microsoft 365 принимает почти всё и проверяет пол�
 в профиле Outlook), `OUTREACH_SIGNER_NAME` (`Булат Замалиев`) + `OUTREACH_SIGNER_POST`,
 `OUTREACH_CONTACT1_NAME`/`_EMAIL`/`_PHONE` (Шабанов — тот же контакт, что напечатан в one-pager)
 и `OUTREACH_CONTACT2_NAME`/`_EMAIL`/`_PHONE` (Байрашев — владелец ящика рассылки),
-`OUTREACH_ONEPAGER_DIR` (`lead_orchestrator/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь
+`OUTREACH_ONEPAGER_DIR` (`lead_orchestrator/app/assets/onepagers`), `ORQ_OUTREACH_REGISTRY` (путь
 к реестру, дефолт `<ORQ_DATA_ROOT>/orq_outreach/registry.json`), `ORQ_LETTER_MODEL` (`sonnet`).
 ⚠️ Подписывает письмо ОДИН человек (Замалиев), а контактов в подписи ДВА, и это осознанно:
 письмо уходит с ящика Байрашева — ответ придёт туда, — а телефон во вложенном one-pager
@@ -672,7 +689,7 @@ Microsoft 365 принимает почти всё и проверяет пол�
 - **Яндекс Диск 423 (DiskResourceLockedError):** файлы, синхронизированные десктоп-клиентом, лочатся —
   перезапись даёт 423. `_mkdir`/`_upload` ретраят, но устойчивый лок не снимется. Обходы: заливка
   в соседнюю папку либо пауза синка. Удаление/Корзина — тулзы MCP `yadisk` или `yadisk_client` напрямую.
-- **Две копии кода:** живая `D:\lead_gen\lead_orchestrator` — **авторитетная, её запускает ярлык**.
+- **Две копии кода:** живая `D:\lead_gen\lead_orchestrator\app` — **авторитетная, её запускает ярлык**.
   Копия-скилл `C:\Users\abalb\.claude\skills\lead-finder\scripts` — **старого поколения**
   (`DOSSIER_SYSTEM`/`save_dossier_docx`, ОДИН документ — не текущая архитектура из 2 .docx), а не
   «отличается только CRLF/LF». Синхронизировать её только осознанно. Удалять без бэкапа нельзя:

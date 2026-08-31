@@ -97,8 +97,8 @@ py html_to_pdf.py raw.html out.pdf --photo ..\lead_orchestrator\assets\bulat_zam
 writer_kimi_agent.py research_enrichment_agent.py leadgen_tools.py` +
 `.venv_kimi\Scripts\python.exe writer_kimi_agent.py --selftest` +
 `.venv_kimi\Scripts\python.exe research_enrichment_agent.py --selftest` +
-`py ..\lead_orchestrator\test_research_enrichment.py` +
-`py ..\lead_orchestrator\test_kimi_only.py`. Для one-pager дополнительно
+`py ..\lead_orchestrator\tests\test_research_enrichment.py` +
+`py ..\lead_orchestrator\tests\test_kimi_only.py`. Для one-pager дополнительно
 прогон рендера на сохранённом `raw.html`; страницы PDF — `pdfinfo` из Poppler.
 
 ## Подводные камни
@@ -132,7 +132,7 @@ writer_kimi_agent.py research_enrichment_agent.py leadgen_tools.py` +
 - **HTML-каркас `x-dc`/`support.js` не самодостаточен** — модель по промпту выдаёт обёртку с
   `<script src="./support.js">`; рендерер вынимает внутренний лист, отбрасывая обёртку.
 - **Фото спикера** — модель ставит `<img src="SPEAKER_PHOTO">`, рендерер подменяет токен на data-URI
-  из `../lead_orchestrator/assets/bulat_zamaliev.png` (бинарник не дублируется). Логотип отправителя
+  из `../lead_orchestrator/app/assets/bulat_zamaliev.png` (бинарник не дублируется). Логотип отправителя
   в этом дизайне — текстовый словомарк, PNG не нужен.
 - **Playwright/chromium:** playwright ставится в venv, но браузер **переиспользуется глобальный**
   (общий каталог `ms-playwright`). `render_pdf` импортит playwright ЛЕНИВО — `import html_to_pdf`

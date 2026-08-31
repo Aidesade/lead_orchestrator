@@ -16,8 +16,10 @@ import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-KIMI = HERE.parent / "lead_orchestrator_kimi"
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"            # код пайплайна
+ROOT = HERE.parents[1]               # корень репозитория
+KIMI = ROOT / "lead_orchestrator_kimi"
+sys.path.insert(0, str(APP))
 
 # Явный Claude-откат: без наследованных переключателей из консоли/лаунчера.
 for name in ("ORQ_KIMI_ONLY", "ORQ_LLM_RUNTIME", "DR_LLM_PROVIDER",
@@ -126,7 +128,7 @@ def main() -> int:
     assert probe.returncode == 0, probe.stderr or probe.stdout
 
     # Веб отдаёт оба runtime, дефолт — claude.
-    web_runs = (HERE.parent / "web" / "api" / "runs.py").read_text(encoding="utf-8")
+    web_runs = (ROOT / "web" / "api" / "runs.py").read_text(encoding="utf-8")
     assert '_default_model_flag()' in web_runs and '"--model", model' in web_runs
 
     print("test_claude_runtime: OK — явный откат на Claude Agent SDK работает "

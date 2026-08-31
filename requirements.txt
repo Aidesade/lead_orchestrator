@@ -5,7 +5,7 @@
 #   py -m playwright install chromium          # Chromium для RusProfile, Crawl4AI и рендера PDF
 #
 # Что ставится:
-#   lead_orchestrator/requirements.txt — pinned-lock ОСНОВНОГО окружения (пайплайн, outreach,
+#   lead_orchestrator/bootstrap/requirements.txt — pinned-lock ОСНОВНОГО окружения (пайплайн, outreach,
 #                                         Claude Agent SDK, Playwright, Crawl4AI, python-docx…);
 #   web/api/requirements.txt           — FastAPI-слой веб-интерфейса (тонкий, без пинов).
 #
@@ -17,5 +17,5 @@
 #   .venv_kimi\Scripts\python.exe patches\apply_patches.py
 #
 # Dockerfile собирает оба venv сам из тех же двух файлов — этот агрегатор он не читает.
--r lead_orchestrator/requirements.txt
+-r lead_orchestrator/bootstrap/requirements.txt
 -r web/api/requirements.txt

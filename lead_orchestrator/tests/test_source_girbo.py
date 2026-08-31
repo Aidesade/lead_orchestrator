@@ -6,12 +6,17 @@
 пересчитывается из тысяч в рубли, фильтр года отсекает старую отчётность, а
 предел offset не даёт уйти в бесконечную пагинацию.
 """
+import os
 import sys
 import types
 import unittest
 from unittest import mock
 
-import source_girbo as SG
+# Тесты живут в lead_orchestrator/tests, код пайплайна — в соседней app/.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
+
+import source_girbo as SG  # noqa: E402
 
 
 def _record(inn, name, okved, gain_thousands, period="2025", region="ТАТАРСТАН"):

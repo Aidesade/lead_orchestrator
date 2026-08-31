@@ -10,8 +10,12 @@ import urllib.parse
 from pathlib import Path
 from unittest import mock
 
-from project_env import load_project_env
-import source_ofdata as OD
+# Тесты живут в lead_orchestrator/tests, код пайплайна — в соседней app/.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app"))
+
+from project_env import load_project_env  # noqa: E402
+import source_ofdata as OD  # noqa: E402
 
 
 class _Response:

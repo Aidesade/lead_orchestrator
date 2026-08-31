@@ -53,6 +53,9 @@ from typing import Annotated
 warnings.filterwarnings("ignore", message=r".*doesn't match a supported version.*")
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+# Код пайплайна лежит в lead_orchestrator/app, поэтому корень репозитория — на ДВА
+# уровня выше: отсюда берутся соседние папки (lead_orchestrator_kimi, env, web).
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPTS))
 sys.path.insert(0, SCRIPTS)
 
 from project_env import load_project_env
@@ -100,7 +103,7 @@ PHOTO_PNG = os.path.join(ASSETS_DIR, "bulat_zamaliev.png")   # фото Була
 # claude-agent-sdk (pydantic-core), поэтому в один интерпретатор их ставить нельзя. Отсюда зовём
 # её подпроцессом venv-питона — это и есть «сведение двух SDK» в одном прогоне.
 KIMI_DIR = os.environ.get(
-    "KIMI_DIR", os.path.join(os.path.dirname(SCRIPTS), "lead_orchestrator_kimi"))
+    "KIMI_DIR", os.path.join(REPO_ROOT, "lead_orchestrator_kimi"))
 KIMI_PY = os.environ.get(
     "KIMI_PY",
     os.path.join(KIMI_DIR, ".venv_kimi", "Scripts", "python.exe"),

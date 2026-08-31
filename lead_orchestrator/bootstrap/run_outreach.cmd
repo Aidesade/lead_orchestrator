@@ -26,7 +26,7 @@ rem Letter stage runs on the Claude Agent SDK in the MAIN environment.
 if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=claude"
 if not defined LEAD_SOURCE set "LEAD_SOURCE=rusprofile"
 if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
-if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\env\rusprofile_cookies.json"
+if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\..\env\rusprofile_cookies.json"
 if not defined OUTREACH_FROM set "OUTREACH_FROM=tatar.ru"
 
 title Outreach - collect, find LPR mailbox, letter from @tatar.ru
@@ -60,12 +60,12 @@ echo Unknown choice "%pick%".
 goto menu
 
 :report
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" --check
+"%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" --check
 goto done
 
 :precheck_only
 call :warnings
-"%ORQ_MAIN_PY%" "%~dp0outlook_send.py" --check
+"%ORQ_MAIN_PY%" "%~dp0..\app\outlook_send.py" --check
 goto done
 
 :collect
@@ -84,7 +84,7 @@ set /p "howmany=How many companies in total [10]: "
 if not defined howmany set "howmany=10"
 echo.
 echo Running: --industries %inds% --count %howmany%  (letters go to Drafts)
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" --industries %inds% --count %howmany%
+"%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" --industries %inds% --count %howmany%
 goto done
 
 :fromjson
@@ -97,7 +97,7 @@ if not defined leadsfile (
     echo No path given.
     goto done
 )
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" %leadsfile%
+"%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" %leadsfile%
 goto done
 
 :sendmode
@@ -108,7 +108,7 @@ echo.
 echo   *** REAL SENDING ***
 echo   Letters cannot be recalled. Review the drafts in Outlook first.
 echo   Sender resolved from OUTREACH_FROM="%OUTREACH_FROM%":
-"%ORQ_MAIN_PY%" "%~dp0outlook_send.py" --check
+"%ORQ_MAIN_PY%" "%~dp0..\app\outlook_send.py" --check
 if errorlevel 1 (
     echo   Sender mailbox is not available - nothing to send from.
     goto done
@@ -126,9 +126,9 @@ if not "%sure%"=="SEND" (
     goto done
 )
 if defined leadsfile (
-    "%ORQ_MAIN_PY%" "%~dp0outreach.py" %leadsfile% --send --limit %howmany%
+    "%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" %leadsfile% --send --limit %howmany%
 ) else (
-    "%ORQ_MAIN_PY%" "%~dp0outreach.py" --industries mining --count %howmany% --send --limit %howmany%
+    "%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" --industries mining --count %howmany% --send --limit %howmany%
 )
 goto done
 
@@ -136,7 +136,7 @@ goto done
 call :requirements
 if errorlevel 1 goto done
 call :warnings
-"%ORQ_MAIN_PY%" "%~dp0outreach.py" %*
+"%ORQ_MAIN_PY%" "%~dp0..\app\outreach.py" %*
 goto done
 
 rem ---------------------------------------------------------------- helpers --
@@ -159,7 +159,7 @@ exit /b 0
 if not exist "%RUSPROFILE_COOKIES_FILE%" (
     echo [WARN] No RusProfile cookie file at "%RUSPROFILE_COOKIES_FILE%".
     echo        Fresh collection will fail; a ready leads JSON still works.
-    echo        Login once: py rusprofile_session.py --login
+    echo        Login once from app: py rusprofile_session.py --login
 )
 exit /b 0
 

@@ -14,7 +14,8 @@ import tempfile
 from types import SimpleNamespace
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+sys.path.insert(0, str(APP))
 
 import outreach as OUT                              # noqa: E402
 import outreach_letter as LT                        # noqa: E402

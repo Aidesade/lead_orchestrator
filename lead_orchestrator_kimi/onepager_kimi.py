@@ -89,7 +89,7 @@ FOOTER = "АО «ЦИТ РТ» · ИНН 1655505808 · ОГРН 1241600056829 ·
 
 # Фото спикера (переиспользуем ассет рабочего пайплайна, не дублируем бинарник).
 _DEFAULT_PHOTO = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "..", "lead_orchestrator", "assets", "bulat_zamaliev.png")
+                              "..", "lead_orchestrator", "app", "assets", "bulat_zamaliev.png")
 
 
 def build_user_content(company_name, industry="", pain="", contacts=None):

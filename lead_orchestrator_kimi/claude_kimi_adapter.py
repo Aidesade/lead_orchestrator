@@ -34,7 +34,7 @@ import sys
 SERVER = "lead"
 _MCP_PREFIX = f"mcp__{SERVER}__"
 HERE = pathlib.Path(__file__).resolve().parent
-_DEFAULT_TOOL = HERE.parent / "lead_orchestrator" / "kimi_research_cli.py"
+_DEFAULT_TOOL = HERE.parent / "lead_orchestrator" / "app" / "kimi_research_cli.py"
 _TIMEOUT = float(os.environ.get("ORQ_KIMI_TOOL_TIMEOUT", "180"))
 
 # Побочные эффекты запрещены по построению — у kimi-агентов не было ни файловых,

@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
-_DEFAULT_TOOL = _ROOT / "lead_orchestrator" / "kimi_research_cli.py"
+_DEFAULT_TOOL = _ROOT / "lead_orchestrator" / "app" / "kimi_research_cli.py"
 _TIMEOUT = float(os.environ.get("ORQ_KIMI_TOOL_TIMEOUT", "180"))
 
 

@@ -8,8 +8,10 @@ from __future__ import annotations
 import pathlib
 
 
-ROOT = pathlib.Path(__file__).resolve().parent
-KIMI = ROOT.parent / "lead_orchestrator_kimi"
+HERE = pathlib.Path(__file__).resolve().parent
+APP = HERE.parent / "app"            # код пайплайна
+BOOT = HERE.parent / "bootstrap"     # лаунчеры
+KIMI = HERE.parents[1] / "lead_orchestrator_kimi"
 
 
 def _text(path: pathlib.Path) -> str:
@@ -17,7 +19,7 @@ def _text(path: pathlib.Path) -> str:
 
 
 def test_launcher_uses_agent() -> None:
-    launcher = _text(ROOT / "run_cit_kimi.cmd")
+    launcher = _text(BOOT / "run_cit_kimi.cmd")
     assert 'set "KIMI_WRITER_AGENT=1"' in launcher
     assert 'set "KIMI_WRITER_AGENT=0"' not in launcher
 
@@ -47,7 +49,7 @@ def test_writer_logs_direct_research() -> None:
 
 
 def test_parent_kills_process_tree() -> None:
-    parent = _text(ROOT / "writer_kimi.py")
+    parent = _text(APP / "writer_kimi.py")
     assert "async def _kill_tree" in parent
     assert '"taskkill", "/PID", str(proc.pid), "/T", "/F"' in parent
     assert "except asyncio.CancelledError" in parent
@@ -77,12 +79,12 @@ def test_five_research_subagents_have_dependency_graph_and_tools() -> None:
     assert "allowed_candidates" in contacts
     assert "contact_kind" in contacts and "source_context" in contacts and "best_use" in contacts
     assert "outreach_policy" in contacts
-    cli = _text(ROOT / "kimi_research_cli.py")
+    cli = _text(APP / "kimi_research_cli.py")
     assert 'os.environ["DR_USE_CRAWL4AI"] = "0"' in cli
 
 
 def test_enrichment_is_cached_and_given_to_both_documents() -> None:
-    orchestrator = _text(ROOT / "orchestrator.py")
+    orchestrator = _text(APP / "orchestrator.py")
     assert "enrichment_{key}.json" in orchestrator
     assert "checkpoint=enrichment_path, checkpoint_ttl_h=ttl_h" in orchestrator
     assert 'findings["process"] = (findings.get("process") or "") + (' in orchestrator

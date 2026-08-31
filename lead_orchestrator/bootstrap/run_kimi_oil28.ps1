@@ -1,6 +1,7 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$candidateRoot = Split-Path -Parent $PSScriptRoot
+# Лаунчеры лежат в lead_orchestrator/bootstrap: корень репозитория на два уровня выше.
+$candidateRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $repoRoot = if (Test-Path -LiteralPath (Join-Path $candidateRoot "rusprofile_28_pending.json")) {
     $candidateRoot
 } else {
@@ -49,7 +50,7 @@ Write-Host "Результаты: $outputDir\<название компании>
 Write-Host "Tool-use логи: $env:KIMI_TOOL_LOG_DIR"
 Write-Host ""
 
-Push-Location $PSScriptRoot
+Push-Location (Join-Path (Split-Path -Parent $PSScriptRoot) "app")
 try {
     & $mainPython "orchestrator.py" $inputJson --model kimi --workers 1
     $rc = $LASTEXITCODE

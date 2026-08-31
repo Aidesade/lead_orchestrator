@@ -13,8 +13,9 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+if str(APP) not in sys.path:
+    sys.path.insert(0, str(APP))
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

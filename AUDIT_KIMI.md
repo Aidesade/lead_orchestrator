@@ -32,7 +32,7 @@
 ## 1. Зависимости
 
 ### Основной venv — в порядке
-`lead_orchestrator/requirements.txt`: **130 пакетов, все прибиты через `==`**, непинованных строк
+`lead_orchestrator/bootstrap/requirements.txt`: **130 пакетов, все прибиты через `==`**, непинованных строк
 нет. Ключевые: `claude-agent-sdk==0.2.103`, `playwright==1.60.0`, `undetected-chromedriver==3.5.5`,
 `Crawl4AI==0.9.0`, `python-docx==1.2.0`, `pywin32==311` (в Linux вырезается `Dockerfile:35-42`).
 
@@ -112,7 +112,7 @@ prompt` — импортится; `onepager_kimi` импортится и `build
 ### Побочно найдено и исправлено
 `pip` на Windows читает `requirements.txt` локальной кодировкой (cp1251) и падает
 `UnicodeDecodeError` на кириллице в комментариях, если в первых двух строках нет PEP-263 куки.
-В новый лок кука добавлена. ⚠️ **`lead_orchestrator/requirements.txt` этой куки не имеет** — в
+В новый лок кука добавлена. ⚠️ **`lead_orchestrator/bootstrap/requirements.txt` этой куки не имеет** — в
 Docker (локаль UTF-8) он ставится, а вот локальная установка на Windows упадёт. Одна строка.
 
 ---
@@ -260,7 +260,7 @@ Docstring и README говорят «не хватает endpoint провайд
    связка 1.12.0 работает не только на импорте. Пока живой вызов не сделан ни на одной версии.
 2. **Валидация PDF после рендера** (§4.3) — иначе брак вёрстки уходит заказчику с кодом возврата 0.
 3. **Единый источник дефолтов** endpoint/модели (сейчас три копии) + `.env.example`.
-4. Кука `# -*- coding: utf-8 -*-` в `lead_orchestrator/requirements.txt` — одна строка, иначе
+4. Кука `# -*- coding: utf-8 -*-` в `lead_orchestrator/bootstrap/requirements.txt` — одна строка, иначе
    локальная установка на Windows падает.
 5. Мелочи: `Bash(py probe9.py)` в settings; абсолютные пути в `.mcp.json`; маскировка ключа в
    хвосте лога.

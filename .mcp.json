@@ -2,7 +2,7 @@
   "mcpServers": {
     "yadisk": {
       "command": "py",
-      "args": ["D:\\lead_gen\\lead_orchestrator\\connectors\\yadisk_mcp.py"],
+      "args": ["D:\\lead_gen\\lead_orchestrator\\app\\connectors\\yadisk_mcp.py"],
       "description": "Яндекс Диск целиком (python-аналог дисковых тулз yacli: info/list/mkdir/upload/download/publish + удаление, Корзина, move/copy). Токен: env YANDEX_DISK_TOKEN"
     }
   }

@@ -10,8 +10,10 @@ import sys
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"            # код пайплайна
+BOOT = HERE.parent / "bootstrap"     # лаунчеры
+ROOT = HERE.parents[1]               # корень репозитория
+sys.path.insert(0, str(APP))
 
 for name in ("ORQ_KIMI_ONLY", "ORQ_LLM_RUNTIME", "DR_LLM_PROVIDER"):
     os.environ.pop(name, None)
@@ -104,10 +106,10 @@ def main() -> int:
     assert error is None and cmd is not None
     assert cmd[cmd.index("--model") + 1] == "kimi"
 
-    imports = _imports(HERE / "orchestrator_agent.py")
+    imports = _imports(APP / "orchestrator_agent.py")
     assert not any(name == "anthropic" or name.startswith("claude_agent_sdk") for name in imports)
 
-    orchestrator_source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    orchestrator_source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     assert 'ap.add_argument("--model", default=KC.default_model_flag()' in orchestrator_source
     assert "if KC.kimi_only():" in orchestrator_source
     assert "return await _research_one_kimi(" in orchestrator_source
@@ -119,16 +121,18 @@ def main() -> int:
     assert "KIMI_API_KEY:" not in compose
     assert "OFDATA_API_KEY:" not in compose
 
-    launcher = (HERE / "run_kimi_orchestrator.cmd").read_text(encoding="ascii")
+    launcher = (BOOT / "run_kimi_orchestrator.cmd").read_text(encoding="ascii")
     assert 'if not defined ORQ_LLM_RUNTIME set "ORQ_LLM_RUNTIME=kimi"' in launcher
     assert 'set "LEAD_SOURCE=rusprofile"' in launcher
     assert 'set "RUSPROFILE_BROWSER=playwright"' in launcher
     assert "rusprofile_cookies.json" in launcher
     assert "from project_env import load_project_env" in launcher
-    assert "r'%~dp0.'" in launcher  # %~dp0 ends with \ and is invalid as a raw string
+    # Лаунчер лежит в bootstrap/, код — в соседней app/: путь в sys.path идёт именно туда.
+    # Хвост без завершающего "\" обязателен — %~dp0 оканчивается слэшем и рвёт raw-строку.
+    assert r"r'%~dp0..\app'" in launcher
     assert "orchestrator_agent.py" in launcher
 
-    canonical = (HERE / "run_orchestrator.cmd").read_text(encoding="ascii")
+    canonical = (BOOT / "run_orchestrator.cmd").read_text(encoding="ascii")
     assert "run_kimi_orchestrator.cmd" in canonical
     web_runs = (ROOT / "web" / "api" / "runs.py").read_text(encoding="utf-8")
     assert 'return "kimi"' in web_runs

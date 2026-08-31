@@ -40,7 +40,7 @@ kimi-cli==1.12.0                # ПИН ОБЯЗАТЕЛЕН: единстве�
 kosong==0.42.0                  # LLM-абстракция kimi (тянет anthropic/openai/google-genai)
 
 # --- Рендер HTML -> PDF ---
-# 1.60.0 — та же версия, что в основном venv (lead_orchestrator/requirements.txt) и в Dockerfile.
+# 1.60.0 — та же версия, что в основном venv (lead_orchestrator/bootstrap/requirements.txt) и в Dockerfile.
 # Версия playwright задаёт РЕВИЗИЮ chromium: разойдутся версии — разойдутся и ревизии, общий кэш
 # браузеров (PLAYWRIGHT_BROWSERS_PATH / ms-playwright) перестанет переиспользоваться, и в
 # контейнере рендер упадёт с «Executable doesn't exist».

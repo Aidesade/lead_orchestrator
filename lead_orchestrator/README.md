@@ -4,6 +4,20 @@
 
 Собрано из рабочего скилла `lead-finder` (`~/.claude/skills/lead-finder/scripts/`) — только модули, относящиеся к оркестратору. B2C-ветка (2ГИС/Яндекс-карты, `run.py` и т.п.), тестовые данные, Chrome-профиль и секреты намеренно не включены.
 
+## Раскладка папки
+
+С 2026-08-31 папка разложена на три части, плоского списка файлов в корне больше нет:
+
+- `app/` — весь код пайплайна (плюс `assets/` и `connectors/`). Импорты внутри остались
+  плоскими, точка входа — файл: `py app\orchestrator.py`.
+- `tests/` — самостоятельные скрипты-тесты (не pytest) и json-фикстуры прогонов; `app/` они
+  кладут в `sys.path` сами, так что рабочая папка им безразлична.
+- `bootstrap/` — лаунчеры `run_*.cmd`/`.ps1` (на них смотрят ярлыки рабочего стола) и
+  `requirements.txt` основного окружения.
+
+Таблица файлов ниже перечисляет модули по именам — все они лежат в `app/`, кроме `test_*.py`
+(в `tests/`) и `run_*.cmd` (в `bootstrap/`).
+
 ## Архитектура
 
 **Фаза 1 — сбор** (`orchestrator._collect`):
@@ -51,7 +65,7 @@
 | `inn_util.py` | валидация/поиск ИНН/ОГРН |
 | `site_verify.py`, `harvest_inn_site.py`, `webutil.py`, `email_finder.py` | контакт-верификация и сбор email с сайтов (зависимости `pipeline`) |
 | `disk_organize.py` | раскладка по Яндекс Диску через CLI `yacli` |
-| `run_kimi_orchestrator.cmd` | desktop-лаунчер Kimi K2.7 + RusProfile/Playwright |
+| `bootstrap/run_kimi_orchestrator.cmd` | desktop-лаунчер Kimi K2.7 + RusProfile/Playwright |
 
 ## Запуск
 
@@ -60,6 +74,7 @@
 # KIMI_API_KEY=ваш-kimi-ключ
 # cookie RusProfile: env/rusprofile_cookies.json (не коммитится)
 
+# все команды ниже — из lead_orchestrator\app
 # сбор + ресёрч по отрасли (Kimi K2.7 — дефолт)
 py orchestrator.py --industries mining --count 10
 
@@ -85,7 +100,7 @@ py orchestrator_agent.py "собери 10 по mining, dry-run"
 
 Единый и зафиксированный ID всех модельных стадий: `KIMI_MODEL_NAME=kimi-k2.7-code`.
 Попытка подменить его в Kimi-only режиме завершает запуск до API-вызова. Проверка маршрута без
-сети: `py test_kimi_only.py`.
+сети: `py ..\tests\test_kimi_only.py`.
 
 OfData фильтрует включённый регион серверно по двухзначному коду. Отрицательный фильтр
 (`НЕ Москва`) применяется клиентски и поэтому требует больше API-запросов.

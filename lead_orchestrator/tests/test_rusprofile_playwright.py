@@ -11,7 +11,8 @@ from types import SimpleNamespace
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+sys.path.insert(0, str(APP))
 
 import rusprofile_playwright as RPW  # noqa: E402
 import source_rusprofile as RP  # noqa: E402

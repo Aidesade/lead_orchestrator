@@ -34,8 +34,8 @@ set "KIMI_WRITER_AGENT_TIMEOUT=0"
 set "ORQ_STORE=local"
 
 if /I "%CIT_KIMI_VERIFY%"=="1" (
-    if not exist "%~dp0orchestrator.py" exit /b 3
-    if not exist "%~dp0cit_lead.json" exit /b 4
+    if not exist "%~dp0..\app\orchestrator.py" exit /b 3
+    if not exist "%~dp0..\tests\cit_lead.json" exit /b 4
     echo VERIFY OK: CIT Kimi launcher is ready.
     exit /b 0
 )
@@ -49,7 +49,7 @@ echo Starting fresh Kimi deep research for AO CIT RT...
 echo Output: D:\deliverables\1655505808
 echo.
 
-"%ORQ_MAIN_PY%" "%~dp0orchestrator.py" "%~dp0cit_lead.json" --model kimi --no-presentation --redo
+"%ORQ_MAIN_PY%" "%~dp0..\app\orchestrator.py" "%~dp0..\tests\cit_lead.json" --model kimi --no-presentation --redo
 set "RC=%ERRORLEVEL%"
 
 echo.

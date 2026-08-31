@@ -35,7 +35,7 @@ raw.html
 /chromedriver-win64.zip
 /rusprofile_*.json
 /rusprofile_*.txt
-/lead_orchestrator/cit_lead.json
+/lead_orchestrator/tests/cit_lead.json
 
 # Служебная папка прогона в корне репо (штатная живёт в D:\orq_tmp, эта заводится,
 # когда скрипт запущен с ORQ_DATA_ROOT по умолчанию из другого каталога) — там

@@ -1,6 +1,6 @@
 # Веб-интерфейс лидген-оркестратора
 
-Фронт (React + Vite) поверх FastAPI-обвязки над `lead_orchestrator/orchestrator.py`.
+Фронт (React + Vite) поверх FastAPI-обвязки над `lead_orchestrator/app/orchestrator.py`.
 Умеет: запускать прогоны, показывать живой прогресс, вести таблицу лидов и карточку компании.
 
 ```

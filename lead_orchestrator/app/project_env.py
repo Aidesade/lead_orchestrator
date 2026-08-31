@@ -10,7 +10,9 @@ import os
 import re
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Код пайплайна лежит в lead_orchestrator/app, поэтому корень репозитория — на два
+# уровня выше файла, а не на один.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = PROJECT_ROOT / "env" / ".env"
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

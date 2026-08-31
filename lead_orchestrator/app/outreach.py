@@ -74,7 +74,8 @@ if (os.environ.get("OUTREACH_TRANSPORT") or "outlook").strip().lower() == "yande
 else:
     import outlook_send as MAIL                    # noqa: E402
 
-REPO_ROOT = os.path.dirname(SCRIPTS)
+# lead_orchestrator/app -> корень репозитория на два уровня выше.
+REPO_ROOT = os.path.dirname(os.path.dirname(SCRIPTS))
 KIMI_DIR = os.environ.get("KIMI_DIR") or os.path.join(REPO_ROOT, "lead_orchestrator_kimi")
 ONEPAGER_CLI = os.path.join(KIMI_DIR, "onepager_kimi.py")
 ONEPAGER_DIR = (os.environ.get("OUTREACH_ONEPAGER_DIR")

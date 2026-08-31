@@ -14,7 +14,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+sys.path.insert(0, str(APP))
 
 import state_ownership as SO  # noqa: E402
 

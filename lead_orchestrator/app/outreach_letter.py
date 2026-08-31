@@ -36,8 +36,9 @@ except Exception:
 
 import email_guess as EG                            # noqa: E402 — split_fio/is_person
 
+# lead_orchestrator/app -> корень репозитория на два уровня выше.
 KIMI_DIR = os.environ.get("KIMI_DIR") or os.path.join(
-    os.path.dirname(SCRIPTS), "lead_orchestrator_kimi")
+    os.path.dirname(os.path.dirname(SCRIPTS)), "lead_orchestrator_kimi")
 AGENT_FILE = os.path.join(KIMI_DIR, "kimi_agent", "outreach_letter.yaml")
 
 # Подписывает письмо один человек, а связываться предлагается с двумя: адресат

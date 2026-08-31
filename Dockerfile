@@ -18,7 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
 # ⚠️ ЗДЕСЬ БОЛЬШЕ НЕТ НИ GOOGLE CHROME, НИ XVFB — и это осознанно.
 # Они стояли ради ОДНОГО: Фаза 1 скребла RusProfile через undetected-chromedriver, а тот
 # требует НАСТОЯЩИЙ Chrome в headed-режиме (отсюда и Xvfb — виртуальный экран под него).
-# Источник лидов заменён на OfData API (lead_orchestrator/source_ofdata.py): обычные HTTPS-
+# Источник лидов заменён на OfData API (lead_orchestrator/app/source_ofdata.py): обычные HTTPS-
 # запросы — ни браузера, ни Cloudflare, ни кук, ни зависимости от репутации IP. Вместе с ними
 # из образа ушло ~1,5 ГБ и главный операционный риск деплоя.
 #
@@ -38,7 +38,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY lead_orchestrator/requirements.txt /tmp/requirements.txt
+COPY lead_orchestrator/bootstrap/requirements.txt /tmp/requirements.txt
 
 # pywin32 неприменим в Linux. Остальной lock устанавливается в основном venv.
 RUN python -m venv /opt/venv \
@@ -74,55 +74,55 @@ RUN python -m venv /opt/kimi-venv \
 COPY . /app
 RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache /data/orq_outbox \
     && python -m py_compile \
-       lead_orchestrator/orchestrator.py \
-       lead_orchestrator/kimi_config.py \
-       lead_orchestrator/orchestrator_agent.py \
-       lead_orchestrator/project_env.py \
-       lead_orchestrator/source_ofdata.py \
-       lead_orchestrator/source_rusprofile.py \
-       lead_orchestrator/rusprofile_playwright.py \
-       lead_orchestrator/state_ownership.py \
-       lead_orchestrator/state_lead_collection.py \
-       lead_orchestrator/crm_push.py \
-       lead_orchestrator/writer_kimi.py \
-       lead_orchestrator/kimi_research_cli.py \
-       lead_orchestrator/rusprofile_session.py \
-       lead_orchestrator/deep_research_engine.py \
-       lead_orchestrator/company_research_agent.py \
-       lead_orchestrator/email_guess.py \
-       lead_orchestrator/email_verify.py \
-       lead_orchestrator/person_enrich.py \
-       lead_orchestrator/outreach.py \
-       lead_orchestrator/outreach_registry.py \
-       lead_orchestrator/outreach_letter.py \
-       lead_orchestrator/outlook_send.py \
+       lead_orchestrator/app/orchestrator.py \
+       lead_orchestrator/app/kimi_config.py \
+       lead_orchestrator/app/orchestrator_agent.py \
+       lead_orchestrator/app/project_env.py \
+       lead_orchestrator/app/source_ofdata.py \
+       lead_orchestrator/app/source_rusprofile.py \
+       lead_orchestrator/app/rusprofile_playwright.py \
+       lead_orchestrator/app/state_ownership.py \
+       lead_orchestrator/app/state_lead_collection.py \
+       lead_orchestrator/app/crm_push.py \
+       lead_orchestrator/app/writer_kimi.py \
+       lead_orchestrator/app/kimi_research_cli.py \
+       lead_orchestrator/app/rusprofile_session.py \
+       lead_orchestrator/app/deep_research_engine.py \
+       lead_orchestrator/app/company_research_agent.py \
+       lead_orchestrator/app/email_guess.py \
+       lead_orchestrator/app/email_verify.py \
+       lead_orchestrator/app/person_enrich.py \
+       lead_orchestrator/app/outreach.py \
+       lead_orchestrator/app/outreach_registry.py \
+       lead_orchestrator/app/outreach_letter.py \
+       lead_orchestrator/app/outlook_send.py \
        lead_orchestrator_kimi/onepager_kimi.py \
        lead_orchestrator_kimi/writer_kimi_agent.py \
        lead_orchestrator_kimi/research_enrichment_agent.py \
        lead_orchestrator_kimi/claude_kimi_adapter.py \
        lead_orchestrator_kimi/leadgen_tools.py \
        lead_orchestrator_kimi/html_to_pdf.py \
-    && DR_USE_LLM=0 python lead_orchestrator/test_deep_research.py \
-    && python lead_orchestrator/test_source_ofdata.py \
-    && python lead_orchestrator/test_source_girbo.py \
-    && python lead_orchestrator/test_rusprofile_playwright.py \
-    && python lead_orchestrator/test_crm_push.py \
-    && python lead_orchestrator/test_state_ownership.py \
-    && python lead_orchestrator/test_state_owned_collection.py \
-    && python lead_orchestrator/test_state_owned_wiring.py \
-    && python lead_orchestrator/test_kimi_only.py \
-    && python lead_orchestrator/test_claude_runtime.py \
-    && python lead_orchestrator/test_kimi_agent_freedom.py \
-    && python lead_orchestrator/test_research_enrichment.py \
-    && python lead_orchestrator/test_email_guess.py \
-    && python lead_orchestrator/test_email_verify.py \
-    && python lead_orchestrator/test_outreach.py \
-    && python lead_orchestrator/test_verify_xlsx.py \
-    && python lead_orchestrator/test_outlook_send.py \
+    && DR_USE_LLM=0 python lead_orchestrator/tests/test_deep_research.py \
+    && python lead_orchestrator/tests/test_source_ofdata.py \
+    && python lead_orchestrator/tests/test_source_girbo.py \
+    && python lead_orchestrator/tests/test_rusprofile_playwright.py \
+    && python lead_orchestrator/tests/test_crm_push.py \
+    && python lead_orchestrator/tests/test_state_ownership.py \
+    && python lead_orchestrator/tests/test_state_owned_collection.py \
+    && python lead_orchestrator/tests/test_state_owned_wiring.py \
+    && python lead_orchestrator/tests/test_kimi_only.py \
+    && python lead_orchestrator/tests/test_claude_runtime.py \
+    && python lead_orchestrator/tests/test_kimi_agent_freedom.py \
+    && python lead_orchestrator/tests/test_research_enrichment.py \
+    && python lead_orchestrator/tests/test_email_guess.py \
+    && python lead_orchestrator/tests/test_email_verify.py \
+    && python lead_orchestrator/tests/test_outreach.py \
+    && python lead_orchestrator/tests/test_verify_xlsx.py \
+    && python lead_orchestrator/tests/test_outlook_send.py \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/patches/apply_patches.py --check \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/writer_kimi_agent.py --selftest \
     && /opt/kimi-venv/bin/python lead_orchestrator_kimi/research_enrichment_agent.py --selftest \
-    && python lead_orchestrator/kimi_research_cli.py --selftest \
+    && python lead_orchestrator/app/kimi_research_cli.py --selftest \
     && /opt/kimi-venv/bin/python -c "import sys; sys.path.insert(0, '/app/lead_orchestrator_kimi'); import onepager_kimi; assert onepager_kimi.build_user_content('Тест')"
 
 VOLUME ["/data"]
@@ -131,12 +131,12 @@ VOLUME ["/data"]
 #   ORQ_KIMI_ONLY=1       — контейнер ОСТАЁТСЯ на Kimi-runtime: claude-runtime требует
 #                           авторизации Anthropic (логин Claude Code недоступен headless;
 #                           нужен ANTHROPIC_API_KEY в env/.env + ORQ_KIMI_ONLY=0 осознанно).
-# Локальный desktop-дефолт также Kimi (см. run_kimi_orchestrator.cmd).
+# Локальный desktop-дефолт также Kimi (см. bootstrap/run_kimi_orchestrator.cmd).
 ENV LEAD_SOURCE=ofdata \
     DR_LLM_PROVIDER=kimi \
     ORQ_KIMI_ONLY=1 \
     KIMI_MODEL_NAME=kimi-k2.7-code
 # Без xvfb-run: виртуальный экран был нужен только headed-Chrome под RusProfile. Оставшиеся
 # браузеры (Crawl4AI, рендер PDF) работают headless и запускаются напрямую.
-ENTRYPOINT ["python", "/app/lead_orchestrator/orchestrator.py"]
+ENTRYPOINT ["python", "/app/lead_orchestrator/app/orchestrator.py"]
 CMD ["--help"]

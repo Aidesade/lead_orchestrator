@@ -108,7 +108,7 @@ LLM-платформу **Telepatt** (RAG-база знаний, автономн
 py -m pip install -r requirements.txt        # основное окружение + web/api
 py -m playwright install chromium            # RusProfile, Crawl4AI, рендер PDF
 copy .env.example env\.env                   # заполнить нужное режиму; папка env/ в .gitignore
-cd lead_orchestrator
+cd lead_orchestrator\app
 py rusprofile_session.py --login             # разовый логин RusProfile → env/rusprofile_cookies.json
 
 py orchestrator.py mining --count 10                      # сбор + ресёрч + 3 файла
@@ -125,12 +125,14 @@ Kimi-runtime (`ORQ_LLM_RUNTIME=kimi` / Docker) требует отдельный
 
 | Папка / файл | Что там |
 |---|---|
-| `lead_orchestrator/` | ядро: `orchestrator.py` (ФАЗА 1+2), `outreach.py` (рассылка), источники, движок ресёрча, писатель, тесты-скрипты |
+| `lead_orchestrator/app/` | ядро: `orchestrator.py` (ФАЗА 1+2), `outreach.py` (рассылка), источники, движок ресёрча, писатель, `assets/`, `connectors/` |
+| `lead_orchestrator/tests/` | тесты-скрипты (не pytest) и json-фикстуры прогонов; сами кладут `app/` в `sys.path` |
+| `lead_orchestrator/bootstrap/` | лаунчеры `run_*.cmd`/`.ps1` (цель ярлыков на рабочем столе) и `requirements.txt` |
 | `lead_orchestrator_kimi/` | агенты ФАЗЫ 2 для обоих runtime: пять ролей, писатель документа, `claude_kimi_adapter`, one-pager |
 | `web/` | FastAPI + React: спавнит `orchestrator.py`, парсит stdout в SSE, отдаёт деливераблы |
 | `Dockerfile`, `docker-compose.yml` | образ с двумя venv; сборка = build-gate из тестов |
 | `.env.example` | все переменные окружения с дефолтами → копировать в `env/.env` |
-| `requirements.txt` | агрегатор: лок `lead_orchestrator/` + `web/api/` |
+| `requirements.txt` | агрегатор: лок `lead_orchestrator/bootstrap/` + `web/api/` |
 
 ## Документация
 

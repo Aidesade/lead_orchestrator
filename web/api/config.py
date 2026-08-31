@@ -14,7 +14,8 @@ from pathlib import Path
 
 WEB_DIR = Path(__file__).resolve().parent.parent          # <repo>/web
 REPO_ROOT = Path(os.environ.get("ORQ_REPO_ROOT") or WEB_DIR.parent)
-ORCH_DIR = REPO_ROOT / "lead_orchestrator"
+# Код пайплайна живёт в lead_orchestrator/app (рядом с ним tests/ и bootstrap/).
+ORCH_DIR = REPO_ROOT / "lead_orchestrator" / "app"
 ORCH_PY = ORCH_DIR / "orchestrator.py"
 RUSPROFILE_PY = ORCH_DIR / "rusprofile_session.py"
 

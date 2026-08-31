@@ -36,7 +36,7 @@ try:
 except Exception:
     pass
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]   # lead_orchestrator/app -> корень репо
 PROJECT_COOKIES_FILE = PROJECT_ROOT / "env" / "rusprofile_cookies.json"
 LEGACY_COOKIES_FILE = Path(
     r"C:\Users\abalb\.claude\skills\lead-finder\.rp_cookies.json")

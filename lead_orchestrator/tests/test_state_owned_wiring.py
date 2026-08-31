@@ -6,7 +6,8 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+sys.path.insert(0, str(APP))
 
 import orchestrator_agent as OA
 
@@ -43,7 +44,7 @@ def check_conflicts():
         "action": "run", "state_owned": True, "count_total": 201,
     })
     assert plan["action"] == "clarify"
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     assert "not 1 <= a.count <= 200" in source
     print("  ✓ госрежим нельзя смешать с отраслью/JSON и ограничен 200 лидами")
 
@@ -60,7 +61,7 @@ def check_fixed_profile_not_overridden():
 
 
 def check_crm_batch_after_phase_two():
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     collector = source[source.index("def _collect_state_owned"):source.index("def _collect(")]
     assert "create_researched_batch" not in collector
     assert source.index("results.append(r)") < source.index("create_researched_batch")
@@ -69,7 +70,7 @@ def check_crm_batch_after_phase_two():
 
 
 def check_collect_only_stops_before_phase_two():
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     assert "--collect-only" in source
     assert "работает только со сбором" in source
     # Выход collect-only стоит ДО отбора компаний в Фазу 2 («ресёрчим ВСЕХ»).
@@ -78,7 +79,7 @@ def check_collect_only_stops_before_phase_two():
 
 
 def check_one_deadline_wraps_all_preconditions():
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     collector = source[source.index("def _collect_state_owned"):source.index("def _collect(")]
     assert collector.index("deadline = time.monotonic()") < collector.index("fetch_existing_leads(")
     assert "fetch_existing_leads(deadline=deadline)" in collector
@@ -95,7 +96,7 @@ def check_clients_reach_collector():
     снаружи, — иначе офлайн-вызовы полезли бы в сеть. Цена этого решения в том,
     что потерянный `client_index=` не сломает ничего явно: сбор просто перестанет
     отсеивать клиентов и молча пойдёт к своим. Этот тест и есть та поломка."""
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     collector = source[source.index("def _collect_state_owned"):source.index("def _collect(")]
     assert "fetch_existing_clients(deadline=deadline)" in collector, \
         "боевой вход перестал читать индекс клиентов"
@@ -120,7 +121,7 @@ def check_push_crm_only_after_collect():
     Сам запрос обёртка не собирает: и статус лида, и выбор ручки CRM живут в
     `crm_push.push_collected` — одно место, где решается, чем именно сырой сбор
     отличается от отправленного письма."""
-    source = (HERE / "orchestrator.py").read_text(encoding="utf-8")
+    source = (APP / "orchestrator.py").read_text(encoding="utf-8")
     assert '"--push-crm работает только с --collect-only"' in source
     assert "--push-crm несовместим с --dry-run" in source
     pusher = source[source.index("def _push_collected_to_crm"):source.index("def _collect_state_owned")]

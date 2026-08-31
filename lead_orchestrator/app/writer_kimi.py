@@ -53,7 +53,9 @@ TIMEOUT = float(os.environ.get("KIMI_WRITER_TIMEOUT", "600"))
 ATTEMPTS = int(os.environ.get("KIMI_WRITER_ATTEMPTS", "3"))
 
 HERE = pathlib.Path(__file__).resolve().parent
-KIMI_DIR = pathlib.Path(os.environ.get("KIMI_DIR") or (HERE.parent / "lead_orchestrator_kimi"))
+# HERE — lead_orchestrator/app, соседняя папка Kimi-стадии лежит на уровень выше неё.
+KIMI_DIR = pathlib.Path(
+    os.environ.get("KIMI_DIR") or (HERE.parents[1] / "lead_orchestrator_kimi"))
 KIMI_PY = pathlib.Path(os.environ.get("KIMI_PY") or (
     KIMI_DIR / ".venv_kimi" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 ))

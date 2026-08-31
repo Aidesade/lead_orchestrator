@@ -12,7 +12,8 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
+APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
+sys.path.insert(0, str(APP))
 
 import outlook_send as MAIL                         # noqa: E402
 

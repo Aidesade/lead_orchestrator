@@ -44,7 +44,7 @@ if not defined KIMI_BASE_URL set "KIMI_BASE_URL=https://gpllmkeeper.dtc.tatar/v1
 if not defined KIMI_MODEL_NAME set "KIMI_MODEL_NAME=kimi-k2.7-code"
 if not defined LEAD_SOURCE set "LEAD_SOURCE=rusprofile"
 if not defined RUSPROFILE_BROWSER set "RUSPROFILE_BROWSER=playwright"
-if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\env\rusprofile_cookies.json"
+if not defined RUSPROFILE_COOKIES_FILE set "RUSPROFILE_COOKIES_FILE=%~dp0..\..\env\rusprofile_cookies.json"
 if /I "%ORQ_LLM_RUNTIME%"=="kimi" (
     set "DR_LLM_PROVIDER=kimi"
 ) else (
@@ -52,9 +52,9 @@ if /I "%ORQ_LLM_RUNTIME%"=="kimi" (
 )
 
 if /I not "%ORQ_LLM_RUNTIME%"=="kimi" goto runtime_ready
-"%ORQ_MAIN_PY%" -c "import sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();import kimi_config as k;raise SystemExit(0 if k.api_key() else 1)" >nul 2>&1
+"%ORQ_MAIN_PY%" -c "import sys;sys.path.insert(0,r'%~dp0..\app');from project_env import load_project_env;load_project_env();import kimi_config as k;raise SystemExit(0 if k.api_key() else 1)" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] No KIMI_API_KEY or GPLLM_API_KEY in "%~dp0..\env\.env" or environment.
+    echo [ERROR] No KIMI_API_KEY or GPLLM_API_KEY in "%~dp0..\..\env\.env" or environment.
     echo         Add the key there; the env folder is Git-ignored.
     exit /b 7
 )
@@ -68,9 +68,9 @@ if errorlevel 1 (
 )
 :claude_ready
 if /I "%LEAD_SOURCE%"=="ofdata" (
-    "%ORQ_MAIN_PY%" -c "import os,sys;sys.path.insert(0,r'%~dp0.');from project_env import load_project_env;load_project_env();raise SystemExit(0 if os.environ.get('OFDATA_API_KEY') else 1)" >nul 2>&1
+    "%ORQ_MAIN_PY%" -c "import os,sys;sys.path.insert(0,r'%~dp0..\app');from project_env import load_project_env;load_project_env();raise SystemExit(0 if os.environ.get('OFDATA_API_KEY') else 1)" >nul 2>&1
     if errorlevel 1 (
-        echo [ERROR] No OfData key in "%~dp0..\env\.env".
+        echo [ERROR] No OfData key in "%~dp0..\..\env\.env".
         echo         Add OFDATA_API_KEY there; the env folder is Git-ignored.
         exit /b 8
     )
@@ -78,7 +78,7 @@ if /I "%LEAD_SOURCE%"=="ofdata" (
 if /I "%LEAD_SOURCE%"=="rusprofile" (
     if not exist "%RUSPROFILE_COOKIES_FILE%" (
         echo [ERROR] No RusProfile cookie file at "%RUSPROFILE_COOKIES_FILE%".
-        echo         Run: py rusprofile_session.py --login
+        echo         Run from app: py rusprofile_session.py --login
         exit /b 9
     )
     "%ORQ_MAIN_PY%" -c "import playwright.sync_api" >nul 2>&1
@@ -90,7 +90,7 @@ if /I "%LEAD_SOURCE%"=="rusprofile" (
 )
 
 title Lead Orchestrator [%ORQ_LLM_RUNTIME%] - end to end
-"%ORQ_MAIN_PY%" "%~dp0orchestrator_agent.py" %*
+"%ORQ_MAIN_PY%" "%~dp0..\app\orchestrator_agent.py" %*
 echo.
 echo --- agent finished, press any key to close ---
 pause >nul

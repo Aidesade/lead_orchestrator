@@ -11,7 +11,9 @@ import os
 import sys
 
 os.environ.setdefault("DR_USE_LLM", "0")  # тест чисто логический — LLM не дёргаем
-SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+# Тесты живут в lead_orchestrator/tests, код пайплайна — в соседней app/.
+SCRIPTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
 sys.path.insert(0, SCRIPTS)
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
