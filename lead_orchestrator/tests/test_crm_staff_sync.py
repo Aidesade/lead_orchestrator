@@ -77,7 +77,13 @@ def check_verdicts_and_targets():
         "5000000000": "unknown"}, rows
     assert rows[INN_B]["name"] == "ООО Малое"
     assert CSS.purge_targets(rows) == [INN_B], "по умолчанию удаляется только подтверждённое below"
-    assert set(CSS.purge_targets(rows, include_unknown=True)) == {INN_B, INN_C, INN_D, "5000000000"}
+    # С --purge-unknown уходят и «нет показателя за 2025», и «не найдено», но компания
+    # с ССЧ ≥ порога по последнему известному году (ПАО Давно: 300 в 2023) остаётся.
+    assert set(CSS.purge_targets(rows, include_unknown=True, min_staff=50)) == {
+        INN_B, INN_D, "5000000000"}
+    rows[INN_C]["count"] = 49
+    assert INN_C in CSS.purge_targets(rows, include_unknown=True, min_staff=50), \
+        "старый год ниже порога — удаляется"
     assert CSS.verdict_for({"count": 50, "year": 2025, "found": True}, 50) == "ok", "ровно 50 проходит"
     print("  ✓ вердикты по правилу лидгена; purge без флага — только below")
 

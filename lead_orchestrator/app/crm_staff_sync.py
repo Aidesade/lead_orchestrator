@@ -16,7 +16,8 @@
     py crm_staff_sync.py                      # свод + отчёт; CRM не меняется
     py crm_staff_sync.py --push               # проставить ССЧ в CRM (PUT /ingest/staff)
     py crm_staff_sync.py --purge              # удалить из CRM «below» (POST /ingest/purge)
-    py crm_staff_sync.py --purge --purge-unknown   # ...и «unknown»/«not_found» тоже
+    py crm_staff_sync.py --purge --purge-unknown   # ...и «unknown»/«not_found» тоже,
+                                              # кроме тех, у кого по прошлому году ССЧ ≥ порога
     py crm_staff_sync.py --no-rusprofile      # только партии и кэш, без браузера
 
 Удаление необратимо: только по явному флагу и по умолчанию лишь подтверждённое «below».
@@ -219,9 +220,21 @@ def build_rows(inns, local, cache, min_staff):
     return rows
 
 
-def purge_targets(rows, *, include_unknown=False):
-    kinds = {"below"} | ({"unknown", "not_found"} if include_unknown else set())
-    return [inn for inn, row in rows.items() if row["verdict"] in kinds]
+def purge_targets(rows, *, include_unknown=False, min_staff=None):
+    """Кого удалять: всегда «below»; с include_unknown — ещё «unknown» и «not_found»,
+    КРОМЕ тех, у кого по последнему известному году ССЧ не ниже порога (решение
+    пользователя 2026-09-03: «был штат ≥50, просто за 2025 не отчитались» — оставить)."""
+    targets = []
+    for inn, row in rows.items():
+        verdict = row["verdict"]
+        if verdict == "below":
+            targets.append(inn)
+        elif include_unknown and verdict in ("unknown", "not_found"):
+            count = row.get("count")
+            if count is not None and min_staff is not None and count >= min_staff:
+                continue
+            targets.append(inn)
+    return targets
 
 
 def main(argv=None):
@@ -230,7 +243,8 @@ def main(argv=None):
     ap.add_argument("--purge", action="store_true",
                     help="удалить из CRM лиды с вердиктом below (POST /ingest/purge)")
     ap.add_argument("--purge-unknown", action="store_true",
-                    help="вместе с --purge удалять и unknown/not_found")
+                    help="вместе с --purge удалять и unknown/not_found, кроме тех, у кого "
+                         "по последнему известному году ССЧ не ниже порога")
     ap.add_argument("--no-rusprofile", action="store_true",
                     help="не ходить в RusProfile: только партии JSON и кэш")
     ap.add_argument("--pace", type=float, default=1.0, help="пауза между запросами RusProfile, с")
@@ -313,12 +327,17 @@ def main(argv=None):
             exit_code = 1
 
     if a.purge:
-        targets = purge_targets(rows, include_unknown=a.purge_unknown)
+        targets = purge_targets(rows, include_unknown=a.purge_unknown, min_staff=min_staff)
         if not targets:
             print("[чистка] удалять нечего")
         else:
             reason = (f"ССЧ за {SR.STAFF_YEAR} ниже {min_staff} по RusProfile"
                       + (" либо не известна" if a.purge_unknown else ""))
+            if a.purge_unknown:
+                kept = sum(1 for inn, row in rows.items()
+                           if row["verdict"] in ("unknown", "not_found") and inn not in targets)
+                print(f"[чистка] без показателя за {SR.STAFF_YEAR}, но по прошлому году "
+                      f">={min_staff} — оставлено {kept}")
             print(f"[чистка] к удалению {len(targets)} лидов: {reason}")
             deleted, skipped, missing, why = crm_push.purge_leads(targets, reason)
             print(f"[CRM] удалено {len(deleted)} | пропущено CRM {len(skipped)} | "
