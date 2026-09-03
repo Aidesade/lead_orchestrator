@@ -44,7 +44,7 @@ def facts(year=2025, staff=250, revenue="2,5 млрд руб."):
         "_revenue_year": year,
         "_revenue_display": revenue,
         "_staff_count": staff,
-        "_staff_year": 2024,
+        "_staff_year": 2025,
         "_ceo_fio": "Иванов Иван Иванович",
     }
 
@@ -686,6 +686,58 @@ def check_min_revenue_toggle():
     print("  ✓ порог выручки: тумблер двигает сервер и карточку, мусор и «ниже пола» — отказ")
 
 
+def check_staff_gate():
+    """ССЧ ≥50 за 2025 с карточки — нижняя граница, fail-closed.
+
+    Ниже порога — отказ; показателя за 2025 нет (в том числе есть только за
+    2024) — тоже отказ: «был штат когда-то» не значит «есть штат сейчас».
+    Ровно 50 проходит. `LEAD_MIN_STAFF=0` выключает гейт, мусор в нём — стоп."""
+    assert SR.lead_min_staff() == 50, "дефолт порога ССЧ обязан остаться 50"
+
+    inns = [valid_test_inn(i) for i in range(1, 5)]
+    rows = [item(inns[0], "ООО Тридцать", revenue=5_000_000_000),
+            item(inns[1], "ООО Без штата", revenue=4_000_000_000),
+            item(inns[2], "ООО Старый штат", revenue=3_000_000_000),
+            item(inns[3], "ООО Ровно пятьдесят", revenue=2_500_000_000)]
+    metrics = {rows[0]["url"]: facts(staff=30),
+               rows[1]["url"]: facts(staff=None),
+               rows[2]["url"]: dict(facts(staff=80), _staff_year=2024),
+               rows[3]["url"]: facts(staff=50)}
+
+    session = FakeSession(rows, metrics)
+    try:
+        SR.harvest_state_owned(
+            2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            verify_ownership=False, region="", log=lambda *_: None)
+    except SR.StateLeadExhausted as exc:
+        assert exc.found == 1, exc.stats
+        assert exc.stats["staff_below"] == 1, exc.stats
+        assert exc.stats["staff_unknown"] == 2, exc.stats
+    else:
+        raise AssertionError("компании ниже порога ССЧ или без ССЧ за 2025 прошли отбор")
+    # До ССЧ дошли все четыре карточки: гейт стоит ПОСЛЕ выручки, а не вместо неё.
+    assert len(session.fact_calls) == 4, session.fact_calls
+
+    os.environ["LEAD_MIN_STAFF"] = "0"
+    try:
+        leads = SR.harvest_state_owned(
+            4, session=FakeSession(rows, metrics), crm_index=FakeCRM(),
+            local_registry=FakeLocal(), verify_ownership=False, region="",
+            log=lambda *_: None)
+        assert [lead["_inn"] for lead in leads] == inns, "LEAD_MIN_STAFF=0 обязан выключать гейт"
+
+        os.environ["LEAD_MIN_STAFF"] = "много"
+        try:
+            SR.lead_min_staff()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("нечисловой порог ССЧ принят молча")
+    finally:
+        os.environ.pop("LEAD_MIN_STAFF", None)
+    print("  ✓ ССЧ: ниже 50 и без показателя за 2025 — отказ, ровно 50 проходит, 0 выключает")
+
+
 def main():
     print("добор госкомпаний — офлайн-регрессии:")
     check_exact_n_and_order()
@@ -706,6 +758,7 @@ def main():
     check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()
     check_min_revenue_toggle()
+    check_staff_gate()
 
     print("test_state_owned_collection: OK")
     return 0

@@ -32,7 +32,8 @@ class FakeSession:
         return list(self.items)
 
 
-def _item(inn, revenue, *, region="Республика Татарстан", inactive=False):
+def _item(inn, revenue, *, region="Республика Татарстан", inactive=False,
+          staff="250", staff_year="2025"):
     return {
         "inn": inn,
         "name": f"Компания {inn}",
@@ -41,6 +42,8 @@ def _item(inn, revenue, *, region="Республика Татарстан", ina
         "inactive": inactive,
         "link": f"/id/{inn}",
         "main_okved_id": "10.11",
+        "sshr": staff,
+        "sshr_year": staff_year,
     }
 
 
@@ -486,6 +489,10 @@ def main() -> int:
             _item("1000000003", 900_000_000),
             _item("1000000004", "5 000 000 000"),
             _item("1000000005", 8_000_000_000, inactive=True),
+            # Порог ССЧ (дефолт 50 за 2025) режет по sshr из выдачи, до карточки:
+            # мало людей — мимо, показатель только за прошлый год — тоже мимо.
+            _item("1000000007", 7_000_000_000, staff="20"),
+            _item("1000000008", 6_000_000_000, staff_year="2024"),
         ])
         leads = RP.harvest(
             [industry],

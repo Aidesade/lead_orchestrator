@@ -2,7 +2,9 @@
 """Bounded-добор новых госкомпаний поверх CRM, RusProfile и ЕГРЮЛ.
 
 Профиль отбора фиксирован кодом: выручка ≥2 млрд ₽ за 2025
-(порог — единственная цифра профиля с тумблером, `STATE_LEAD_MIN_REVENUE`),
+(порог — цифра профиля с тумблером, `STATE_LEAD_MIN_REVENUE`), среднесписочная
+численность ≥50 за 2025 по карточке RusProfile (тумблер общий с обычным сбором —
+`LEAD_MIN_STAFF`, правило — `SR.staff_verdict`),
 прямая/косвенная госдоля ≥25% (ЕГРЮЛ + Росимущество) и юрадрес в регионе
 `STATE_LEAD_REGION` (дефолт — Татарстан). Регион отклоняется дёшево по выдаче
 RusProfile, а ПРИНИМАЕТСЯ только по субъекту РФ из официальной выписки ЕГРЮЛ:
@@ -38,7 +40,7 @@ def load_local_registry_strict(path=None, log=SR.log):
 def _with_session(session, requested_count, crm_index, client_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
                   ownership_error_limit, card_error_limit, region_query, region_code,
-                  verify_ownership, tz_limit):
+                  verify_ownership, tz_limit, min_staff):
     from rusprofile_playwright import RusProfileCardSourceError, RusProfileDeadlineReached
     from state_ownership import (StateOwnershipDeadline, StateOwnershipSourceError,
                                  region_matches)
@@ -47,7 +49,9 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         raise SR.StateOwnershipUnavailable("общий лимит строгого добора истёк до RusProfile")
     min_revenue = lead_min_revenue()
     revenue_year = 2025
-    # Фильтр по штату (240–260) удалён 2026-08-19: критерий устарел.
+    # ССЧ читается с карточки (блок «Среднесписочная численность»), гейт — нижняя
+    # граница за тот же 2025 год, что и выручка. Прежнее окно штата 240–260
+    # удалено 2026-08-19; порог «от 50» введён 2026-09-03 (`LEAD_MIN_STAFF`).
     # Серверный фильтр региона критичен для воронки: без него выдача — топ РФ по
     # выручке, и Татарстана в первых 1000 строк единицы (боевой прогон: 24/1000).
     regions = split_regions(region_query)
@@ -74,6 +78,7 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         "run_duplicate": 0,
         "invalid_inn": 0, "invalid_name": 0, "inactive": 0,
         "revenue": 0, "revenue_year": 0,
+        "staff_below": 0, "staff_unknown": 0,
         "card_error": 0, "state_below_25": 0,
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
         "region_source": 0, "region_egrul": 0, "region_unknown": 0,
@@ -194,6 +199,11 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
             continue
         # Значение и год теперь принадлежат одному блоку основной карточки.
         lead["_revenue"] = card_revenue
+        if min_staff:
+            verdict = SR.staff_verdict(lead, min_staff)
+            if verdict != "ok":
+                stats["staff_below" if verdict == "below" else "staff_unknown"] += 1
+                continue
 
         result = None
         if verify_ownership:
@@ -271,6 +281,8 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         f"CRM-дублей {stats['crm_duplicate']} | клиентов {stats['client_duplicate']} | "
         f"локальных дублей {stats['local_duplicate']} | "
         f"не 2025 {stats['revenue_year']} | "
+        f"ССЧ <{min_staff} {stats['staff_below']} | "
+        f"ССЧ не {SR.STAFF_YEAR} {stats['staff_unknown']} | "
         f"госдоля <25 {stats['state_below_25']} | "
         f"ownership unknown {stats['state_unknown']} | "
         f"вне региона {stats['region_source'] + stats['region_egrul']} | "
@@ -399,15 +411,18 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         deadline=None,
                         out_path=None, log=SR.log,
                         ownership_error_limit=3, card_error_limit=3,
-                        region=None, verify_ownership=None, tz_limit=None):
-    """Ровно N новых компаний: CRM→RusProfile→2025→[госдоля ≥25%]→регион/пояс.
+                        region=None, verify_ownership=None, tz_limit=None,
+                        min_staff=None):
+    """Ровно N новых компаний: CRM→RusProfile→2025→ССЧ→[госдоля ≥25%]→регион/пояс.
 
     ``region`` (дефолт — ``STATE_LEAD_REGION`` = Татарстан) проверяется по субъекту РФ
     из выписки ЕГРЮЛ; пустая строка осознанно выключает фильтр (вся РФ).
     ``verify_ownership`` (дефолт — ``STATE_LEAD_OWNERSHIP``) выключает проверку
     госдоли целиком; без неё регион-фильтр работает по выдаче RusProfile.
     ``tz_limit`` (дефолт — ``STATE_LEAD_TZ_LIMIT``) — макс. |отклонение| часового
-    пояса региона от МСК в часах; None — пояс не проверяется."""
+    пояса региона от МСК в часах; None — пояс не проверяется.
+    ``min_staff`` (дефолт — ``LEAD_MIN_STAFF``, 50) — нижняя граница ССЧ за
+    ``SR.STAFF_YEAR`` по карточке; 0 выключает гейт."""
     try:
         requested_count = int(requested_count)
     except (TypeError, ValueError) as exc:
@@ -442,8 +457,10 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     if verify_ownership is None:
         verify_ownership = ownership_enabled()
     tz_limit = lead_tz_limit() if tz_limit is None else int(tz_limit)
+    min_staff = SR.lead_min_staff() if min_staff is None else max(0, int(min_staff))
     log("[госкомпании] госдоля: "
         + (">=25% (ЕГРЮЛ + Росимущество)" if verify_ownership else "НЕ проверяется")
+        + (f" | ССЧ >={min_staff} за {SR.STAFF_YEAR}" if min_staff else " | ССЧ НЕ проверяется")
         + f" | регион: {region or 'любой'}"
         + (f" (по {'выписке ЕГРЮЛ' if verify_ownership else 'выдаче RusProfile'})"
            if region else "")
@@ -475,7 +492,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     args = (
         requested_count, crm_index, client_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
-        region, region_code, verify_ownership, tz_limit,
+        region, region_code, verify_ownership, tz_limit, min_staff,
     )
     if session is not None:
         if not hasattr(session, "contacts_by_url"):

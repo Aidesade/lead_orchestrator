@@ -107,6 +107,7 @@ RUN mkdir -p /data/leads /data/rusprofile/profile /data/orq_tmp /data/orq_cache 
     && python lead_orchestrator/tests/test_source_girbo.py \
     && python lead_orchestrator/tests/test_rusprofile_playwright.py \
     && python lead_orchestrator/tests/test_crm_push.py \
+    && python lead_orchestrator/tests/test_crm_staff_sync.py \
     && python lead_orchestrator/tests/test_state_ownership.py \
     && python lead_orchestrator/tests/test_state_owned_collection.py \
     && python lead_orchestrator/tests/test_state_owned_wiring.py \

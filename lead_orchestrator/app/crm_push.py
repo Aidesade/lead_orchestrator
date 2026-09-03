@@ -480,6 +480,108 @@ def push_contacts(leads, attempts=3):
     return updated, missing, ""
 
 
+def _staff_count(lead):
+    """ССЧ лида целым числом для контракта CRM; мусор и отрицательное -> None."""
+    lead = lead or {}
+    raw = lead.get("_staff_count", lead.get("staff_count"))
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = int(float(str(raw).replace("\xa0", "").replace(" ", "").replace(",", ".")))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _batch_call(path, method, key, items, *, extra=None, chunk=500):
+    """Прогнать пакетную ingest-ручку кусками по 500. -> (список ответов, причина).
+
+    404/405 читаются словами «ручка не выкачена на прод» — как в `push_contacts`:
+    для нас это одно и то же, на проде крутится сборка без этой ручки.
+    Исключений не бросает; при сбое возвращает уже полученные ответы."""
+    responses = []
+    for start in range(0, len(items), chunk):
+        body = dict(extra or {})
+        body[key] = items[start:start + chunk]
+        req = urllib.request.Request(
+            f"{base_url()}{path}", data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            method=method)
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        req.add_header("X-Ingest-Token", token())
+        try:
+            with _urlopen(req, timeout=TIMEOUT) as resp:
+                responses.append(json.loads(resp.read().decode("utf-8", "replace")))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (404, 405):
+                return responses, (f"CRM не знает {method} {path} ({exc.code}) — "
+                                   "ручка не выкачена на прод")
+            detail = ""
+            try:
+                detail = json.loads(exc.read().decode("utf-8", "replace")).get("detail") or ""
+            except Exception:
+                pass
+            return responses, _safe_index_error(f"CRM HTTP {exc.code}: {detail}"[:300])
+        except Exception as exc:                   # noqa: BLE001 — пакет не валит вызывающего
+            return responses, _safe_index_error(f"{type(exc).__name__}: {exc}")
+    return responses, ""
+
+
+def push_staff(rows):
+    """Проставить ССЧ УЖЕ заведённым лидам: `PUT /api/leads/ingest/staff`.
+
+    `rows` — [(ИНН, численность, год)]. Ручка не трогает статус, контакты и
+    ответственного — поэтому она, а не `POST /ingest`, который вместе с данными
+    переставил бы статус на «письмо отправлено». Строки без ИНН или без
+    численности молча пропускаются: «не знаем штат» не должно ничего стирать.
+    -> (обновлено, не найдено, причина). Исключений не бросает."""
+    items = []
+    for inn, count, year in rows or ():
+        inn = _digits(inn)
+        count = _staff_count({"_staff_count": count})
+        if not _valid_org_inn(inn) or count is None:
+            continue
+        item = {"inn": inn, "staff_count": count}
+        year = str(year or "").strip()
+        if year:
+            item["staff_year"] = year
+        items.append(item)
+    if not items:
+        return 0, [], "нечего проставлять"
+    if not is_configured():
+        return 0, [], "CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)"
+    responses, why = _batch_call("/api/leads/ingest/staff", "PUT", "items", items)
+    updated = sum(int(data.get("updated") or 0) for data in responses)
+    missing = [inn for data in responses for inn in (data.get("not_found") or [])]
+    return updated, missing, why
+
+
+def purge_leads(inns, reason):
+    """Удалить из CRM лиды, переставшие проходить порог: `POST /api/leads/ingest/purge`.
+
+    Что трогать нельзя, решает CRM (ответ, звонок, отказ, сделка, ручной лид) и
+    возвращает это в `skipped` с причиной — здесь ничего не переспрашивается и не
+    повторяется: удаление необратимо. `reason` попадает в журнал CRM.
+    -> (удалённые ИНН, [{inn, reason}], не найдено, причина). Исключений не бросает."""
+    wanted = []
+    for inn in inns or ():
+        inn = _digits(inn)
+        if _valid_org_inn(inn) and inn not in wanted:
+            wanted.append(inn)
+    if not wanted:
+        return [], [], [], "нечего удалять"
+    if not is_configured():
+        return [], [], [], "CRM не настроена (нет CRM_URL / CRM_INGEST_TOKEN)"
+    reason = str(reason or "").strip()[:200] or "порог отбора лидгена"
+    responses, why = _batch_call("/api/leads/ingest/purge", "POST", "inns", wanted,
+                                 extra={"reason": reason})
+    deleted, skipped, missing = [], [], []
+    for data in responses:
+        deleted.extend(data.get("deleted") or [])
+        skipped.extend(row for row in (data.get("skipped") or []) if isinstance(row, dict))
+        missing.extend(data.get("not_found") or [])
+    return deleted, skipped, missing, why
+
+
 def build_payload(lead, sent=None, *, draft=False, onepager=""):
     """Лид пайплайна + факт отправки -> тело запроса CRM.
 
@@ -487,6 +589,7 @@ def build_payload(lead, sent=None, *, draft=False, onepager=""):
     CRM про внутренние имена лидгена знать не должна, маппинг живёт здесь."""
     lead = lead or {}
     sent = sent or {}
+    staff = _staff_count(lead)
     payload = {
         "inn": str(lead.get("_inn") or lead.get("inn") or "").strip() or None,
         "ogrn": str(lead.get("_ogrn") or lead.get("ogrn") or "").strip() or None,
@@ -498,6 +601,10 @@ def build_payload(lead, sent=None, *, draft=False, onepager=""):
         "region": lead.get("_region") or lead.get("region") or None,
         "revenue": lead.get("_revenue") or None,
         "revenue_year": str(lead.get("_revenue_year") or "").strip() or None,
+        "staff_count": staff,
+        # Год без значения — бессмыслица: без численности не шлём и его.
+        "staff_year": (str(lead.get("_staff_year") or "").strip() or None)
+        if staff is not None else None,
         "contact_person": lead.get("contact_person") or None,
         "contact_post": lead.get("_ceo_post") or None,
         "sent_to": sent.get("to") or None,

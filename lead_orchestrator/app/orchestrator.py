@@ -781,12 +781,15 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     tz_limit = lead_tz_limit()
     try:
         min_revenue = lead_min_revenue()
+        min_staff = RP.lead_min_staff()
     except ValueError as exc:
-        raise SystemExit(f"порог выручки: {exc}") from None
+        raise SystemExit(f"порог отбора: {exc}") from None
     print(
         f"[1/2] строгий добор {count} новых "
         + ("госкомпаний" if ownership_enabled() else "компаний")
         + f" | CRM {crm_index.total} лидов | выручка >={min_revenue / 1e9:g} млрд ₽ за 2025 | "
+        + (f"ССЧ >={min_staff} чел. за {RP.STAFF_YEAR} | " if min_staff
+           else "ССЧ НЕ проверяется | ")
         + ("прямая/косвенная госдоля >=25% | " if ownership_enabled()
            else "госдоля НЕ проверяется | ")
         + f"регион: {region_query or 'любой'}"

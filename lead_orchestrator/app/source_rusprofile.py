@@ -48,6 +48,41 @@ except Exception:
 ADV_URL = "https://www.rusprofile.ru/search-advanced"
 MIN_REVENUE_FLOOR = 1_000_000_000
 MAX_SEARCH_PAGES = 20
+# Порог среднесписочной численности (ССЧ — показатель RusProfile по данным ФНС):
+# компания годится от `LEAD_MIN_STAFF` человек (дефолт 50) и только за STAFF_YEAR.
+# Нет показателя за этот год — отказ (fail-closed), ровно как с выручкой за 2025.
+STAFF_YEAR = 2025
+DEFAULT_MIN_STAFF = 50
+
+
+def lead_min_staff():
+    """Порог ССЧ (`LEAD_MIN_STAFF`, дефолт 50; `0` — фильтр выключен).
+
+    Невалидное значение -> ValueError, а не молчаливый дефолт: опечатка в пороге
+    меняет ВЕСЬ отбор и обязана остановить прогон."""
+    raw = str(os.environ.get("LEAD_MIN_STAFF", "") or "").strip()
+    if not raw:
+        return DEFAULT_MIN_STAFF
+    try:
+        value = int(float(raw.replace(" ", "")))
+    except ValueError as exc:
+        raise ValueError(
+            "LEAD_MIN_STAFF должен быть целым числом сотрудников (напр. 50)") from exc
+    if value < 0:
+        raise ValueError("LEAD_MIN_STAFF не может быть отрицательным")
+    return value
+
+
+def staff_verdict(lead, min_staff, year=STAFF_YEAR):
+    """«ok» — ССЧ за нужный год не ниже порога; «below» — ниже порога;
+    «unknown» — показателя за нужный год нет (в том числе только за более
+    ранний: «был штат в 2023» ≠ «есть штат в 2025»)."""
+    lead = lead or {}
+    count = integer_value(lead.get("_staff_count"))
+    staff_year = integer_value(lead.get("_staff_year"))
+    if count is None or staff_year != year:
+        return "unknown"
+    return "ok" if count >= min_staff else "below"
 
 # ОКВЭД-2 коды по отраслям (RusProfile использует текущий ОКВЭД-2014).
 # Боль/оффер — те же, что в build_bigleads + ОПК.
@@ -533,7 +568,7 @@ def region_code_filter():
 
 
 def _harvest_with_session(session, industries, min_revenue, per_industry, region,
-                          out_path, exclude_regions, max_pages):
+                          out_path, exclude_regions, max_pages, min_staff=0):
     region_code = region_code_filter()
     inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
     if exclude_regions:                    # явные исключения (обратная совместимость)
@@ -560,7 +595,7 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
             key=lambda it: revenue_value(it.get("finance_revenue")) or -1,
             reverse=True,
         )
-        kept = 0
+        kept = skipped_staff = 0
         for it in items:
             inn = (it.get("inn") or "").strip()
             if not inn or inn in by_inn:
@@ -578,12 +613,19 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
             # пропустить пустую/некорректную выручку или регрессию API.
             if lead["_revenue"] is None or lead["_revenue"] < min_revenue:
                 continue
+            # Порог ССЧ — по sshr из той же выдачи: карточка ещё не открывалась,
+            # а показатель в XHR уже есть. Нет показателя за STAFF_YEAR — отказ.
+            if min_staff and staff_verdict(lead, min_staff) != "ok":
+                skipped_staff += 1
+                continue
             by_inn[inn] = lead
             kept += 1
             if kept >= per_industry:
                 break
         log(f"  -> отобрано {kept} по убыванию выручки (порог >={min_revenue/1e9:g} млрд"
-            + (f", регион «{region}»" if has_filter else "") + ")")
+            + (f", ССЧ >={min_staff} за {STAFF_YEAR}" if min_staff else "")
+            + (f", регион «{region}»" if has_filter else "") + ")"
+            + (f"; по ССЧ отсеяно {skipped_staff}" if skipped_staff else ""))
         if out_path:
             _save(list(by_inn.values()), out_path)
     res = list(by_inn.values())
@@ -608,10 +650,14 @@ def _browser_session_class():
 
 def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
             headless=False, out_path=None, exclude_regions=None, offscreen=False,
-            session=None, max_pages=None):
-    """Собрать лиды; переданный session удобен для одной Playwright-context Фазы 1."""
+            session=None, max_pages=None, min_staff=None):
+    """Собрать лиды; переданный session удобен для одной Playwright-context Фазы 1.
+
+    ``min_staff`` (дефолт — ``LEAD_MIN_STAFF``, 50) — нижняя граница ССЧ за
+    ``STAFF_YEAR``; 0 выключает фильтр."""
     min_revenue = max(float(min_revenue), float(MIN_REVENUE_FLOOR))
     per_industry = max(1, int(per_industry))
+    min_staff = lead_min_staff() if min_staff is None else max(0, int(min_staff))
     if max_pages is None:
         max_pages = os.environ.get("RUSPROFILE_MAX_PAGES", str(MAX_SEARCH_PAGES))
     try:
@@ -621,7 +667,7 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
 
     args = (
         industries, min_revenue, per_industry, region, out_path,
-        exclude_regions, max_pages,
+        exclude_regions, max_pages, min_staff,
     )
     if session is not None:
         return _harvest_with_session(session, *args)

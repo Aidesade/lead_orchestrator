@@ -33,6 +33,8 @@ LEAD = {
     "_industry": "construction",
     "_revenue": 6146868000,
     "_revenue_year": "2025",
+    "_staff_count": 203,
+    "_staff_year": 2025,
     "contact_person": "Руденко Сергей Александрович",
     "_ceo_post": "Генеральный директор",
 }
@@ -73,6 +75,13 @@ def check_payload_mapping():
     collected = CRM.build_payload(dict(LEAD, _crm_note="письмо не отправлялось"), {}, draft=True)
     assert collected["sent_draft"] is True and collected["note"] == "письмо не отправлялось"
     assert not any(k.startswith("_") for k in payload), payload
+    # ССЧ едет целым числом, год — строкой, как revenue_year; без численности
+    # не едет и год, мусор в численности — то же, что «нет показателя».
+    assert (payload["staff_count"], payload["staff_year"]) == (203, "2025"), payload
+    no_staff = CRM.build_payload(dict(LEAD, _staff_count=None, _staff_year=2025))
+    assert "staff_count" not in no_staff and "staff_year" not in no_staff, no_staff
+    junk = CRM.build_payload(dict(LEAD, _staff_count="░░", _staff_year=2025))
+    assert "staff_count" not in junk, junk
     print("  ✓ маппинг лида в контракт CRM")
 
 
@@ -471,6 +480,76 @@ def check_push_contacts(monkeypatched):
     print("  ✓ догруз контактов: PUT, пустое не стирает, 405 читается как «нет ручки»")
 
 
+def check_push_staff(monkeypatched):
+    """ССЧ старым лидам: PUT /ingest/staff, без численности строка не едет, 404 = нет ручки."""
+    _configure()
+    seen = []
+
+    def fake(req, timeout=None):
+        seen.append((req.get_method(), req.full_url, json.loads(req.data.decode("utf-8"))))
+        return FakeResponse(json.dumps({"updated": 2, "not_found": ["7707083893"]}).encode())
+
+    monkeypatched(fake)
+    updated, missing, why = CRM.push_staff([
+        ("6234065445", 203, 2025),
+        ("7707083893", "1 250", "2025"),      # строка с пробелом — как отдаёт RusProfile
+        ("7736050003", None, 2025),           # численности нет — не шлём и год
+        ("1234567890", 10, 2025),             # невалидный ИНН — мимо
+        ("6234065445", -5, 2025),             # мусор — мимо
+    ])
+    assert (updated, missing, why) == (2, ["7707083893"], ""), (updated, missing, why)
+    method, url, body = seen[0]
+    assert method == "PUT" and url.endswith("/api/leads/ingest/staff"), (method, url)
+    assert body == {"items": [
+        {"inn": "6234065445", "staff_count": 203, "staff_year": "2025"},
+        {"inn": "7707083893", "staff_count": 1250, "staff_year": "2025"},
+    ]}, body
+
+    assert CRM.push_staff([("7736050003", None, 2025)]) == (0, [], "нечего проставлять")
+    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.HTTPError(req.full_url, 404, "Not Found", None, io.BytesIO(b"{}"))))
+    updated, _missing, why = CRM.push_staff([("6234065445", 203, 2025)])
+    assert updated == 0 and "не выкачена" in why, why
+    print("  ✓ ССЧ старым лидам: PUT по ИНН, без численности не едет, 404 = «нет ручки»")
+
+
+def check_purge_leads(monkeypatched):
+    """Чистка по порогу: POST /ingest/purge, skipped с причиной не переспрашивается, сбой не летит."""
+    _configure()
+    seen = []
+
+    def fake(req, timeout=None):
+        seen.append((req.get_method(), req.full_url, json.loads(req.data.decode("utf-8"))))
+        return FakeResponse(json.dumps({
+            "deleted": ["6234065445"],
+            "skipped": [{"inn": "7707083893", "reason": "статус «Ответили» выставлен менеджером"}],
+            "not_found": ["7736050003"],
+        }).encode())
+
+    monkeypatched(fake)
+    deleted, skipped, missing, why = CRM.purge_leads(
+        ["6234065445", "7707083893", "7736050003", "6234065445", "мусор"],
+        reason="ССЧ за 2025 ниже 50 (RusProfile)")
+    assert (deleted, missing, why) == (["6234065445"], ["7736050003"], ""), (deleted, missing, why)
+    assert skipped == [{"inn": "7707083893", "reason": "статус «Ответили» выставлен менеджером"}]
+    method, url, body = seen[0]
+    assert method == "POST" and url.endswith("/api/leads/ingest/purge"), (method, url)
+    # Дубли и мусор в пакет не попадают, причина уезжает в журнал CRM.
+    assert body == {"reason": "ССЧ за 2025 ниже 50 (RusProfile)",
+                    "inns": ["6234065445", "7707083893", "7736050003"]}, body
+    assert len(seen) == 1, "покупка второй попытки удаления недопустима"
+
+    assert CRM.purge_leads([], "x")[3] == "нечего удалять"
+    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(
+        urllib.error.HTTPError(req.full_url, 405, "Method Not Allowed", None, io.BytesIO(b"{}"))))
+    deleted, _s, _m, why = CRM.purge_leads(["6234065445"], "x")
+    assert deleted == [] and "не выкачена" in why, why
+    monkeypatched(lambda req, timeout=None: (_ for _ in ()).throw(OSError("нет сети")))
+    deleted, _s, _m, why = CRM.purge_leads(["6234065445"], "x")
+    assert deleted == [] and "нет сети" in why, why
+    print("  ✓ чистка по порогу: POST по ИНН, skipped с причиной, сбой возвращается словами")
+
+
 def check_push_collected(monkeypatched):
     """Выгрузка сырого сбора: пакет researched, дубли отсеяны, серия отказов = стоп."""
     _configure()
@@ -589,6 +668,8 @@ def main():
         check_atomic_batch_and_no_redirect(monkeypatched)
         check_state_share_mapping(monkeypatched)
         check_push_contacts(monkeypatched)
+        check_push_staff(monkeypatched)
+        check_purge_leads(monkeypatched)
         check_push_collected(monkeypatched)
     finally:
         CRM._urlopen = original
