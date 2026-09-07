@@ -562,6 +562,13 @@ def main() -> int:
     assert [l["_inn"] for l in only_trim] == ["8"]
     assert "oilgas" in RP.INDUSTRY
     assert "06.10.1" in RP.INDUSTRY["oilgas"]["okved"], "нужны виды ОКВЭД, не только группы"
+    # «Производство» — раздел C целиком, но НИЖЕ групп: по группам NN.N строгий матч
+    # находил 39 компаний на весь ПФО, а КАМАЗ сидит на 29.10.4 (замер 2026-09-07).
+    manu = RP.INDUSTRY["manufacturing"]["okved"]
+    assert "29.10.4" in manu and "19.20.1" in manu and "10.11" in manu, "нужны все уровни раздела C"
+    assert all(len(code) >= 5 for code in manu), "коды уровня групп NN.N матчатся почти ни с чем"
+    assert all(10 <= int(code[:2]) <= 33 for code in manu), "чужой раздел в manufacturing"
+    assert len(manu) == len(set(manu)) == 910, len(manu)
     assert all(lead["_revenue"] >= RP.MIN_REVENUE_FLOOR for lead in leads)
     marker_item = _item("1000000006", 2_000_000_000)
     marker_item["main_okved_id"] = "!~.~1.01"
