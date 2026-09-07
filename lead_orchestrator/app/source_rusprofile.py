@@ -569,8 +569,11 @@ def region_patterns(query):
         return None
     if q in REGION_ALIASES:
         return REGION_ALIASES[q]
+    # Алиас — только целым словом: голой подстрокой «мск» сидит внутри «пер-мск-ий»,
+    # и «Пермский» превращался в фильтр по Москве (пермские компании молча выпадали
+    # из отраслевых сборов по ПФО до 2026-09-07). Дефис — граница: «ханты-мансийск».
     for key, pats in REGION_ALIASES.items():
-        if key in q:
+        if re.search(r"(?<![а-яёa-z])" + re.escape(key) + r"(?![а-яёa-z])", q):
             return pats
     return [q]
 

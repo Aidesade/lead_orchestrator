@@ -569,6 +569,20 @@ def main() -> int:
     assert all(len(code) >= 5 for code in manu), "коды уровня групп NN.N матчатся почти ни с чем"
     assert all(10 <= int(code[:2]) <= 33 for code in manu), "чужой раздел в manufacturing"
     assert len(manu) == len(set(manu)) == 910, len(manu)
+
+    # Регион: алиас — целым словом. «мск» голой подстрокой сидит внутри «Пермский»,
+    # и Пермский край молча выпадал из отраслевых сборов по ПФО (найдено 2026-09-07).
+    assert RP.region_patterns("Пермский") == ["пермский"], RP.region_patterns("Пермский")
+    assert RP.region_patterns("МСК") == ["москва"] and RP.region_patterns("не мск") == ["москва"]
+    assert RP.region_patterns("Ханты-Мансийск") == ["ханты-мансийск", "югра"]
+    assert RP.region_patterns("Ямало-Ненецкий") == ["ямало-ненецкий"]
+    pfo_inc, _ = RP.parse_region_query(
+        "Татарстан, Башкортостан, Марий Эл, Мордовия, Удмурт, Чуваш, Пермский, Кировская, "
+        "Нижегородская, Оренбургская, Пензенская, Самарская, Саратовская, Ульяновская")
+    for name in ("Пермский край", "Республика Татарстан", "Удмуртская республика",
+                 "Чувашская республика", "Республика Марий Эл"):
+        assert RP.region_included(name, pfo_inc), name
+    assert not RP.region_included("Москва", pfo_inc), "Москва пролезла в ПФО"
     assert all(lead["_revenue"] >= RP.MIN_REVENUE_FLOOR for lead in leads)
     marker_item = _item("1000000006", 2_000_000_000)
     marker_item["main_okved_id"] = "!~.~1.01"
