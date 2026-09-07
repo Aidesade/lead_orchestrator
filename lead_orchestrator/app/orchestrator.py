@@ -837,10 +837,16 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     return leads
 
 
-def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out):
+def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out,
+             crm_index=None):
     """ФАЗА 1 (первый агент): сбор -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
     Источник — env LEAD_SOURCE: 'rusprofile' (по умолчанию, Playwright+cookie),
-    'ofdata' или 'checko' (явные API-пути отката). Возвращает picked[]."""
+    'ofdata' или 'checko' (явные API-пути отката). Возвращает picked[].
+
+    `crm_index` (`crm_push.ExistingLeads`, приходит с --push-crm) — уже заведённые
+    в CRM компании отсеиваются в выдаче RusProfile ДО карточки, чтобы «N на
+    отрасль» означало N новых. API-пути индекс не применяют: дубли у них отбросит
+    сама выгрузка, но объём в итоге окажется меньше запрошенного."""
     import math
     import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
@@ -851,6 +857,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     per_ind = math.ceil(count / max(1, len(inds)))
 
     source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
+    if crm_index is not None and source not in ("rusprofile", "rp"):
+        print("[CRM] ⚠ отсев уже заведённых до карточки работает только с RusProfile "
+              f"(LEAD_SOURCE={source}); дубли отбросит выгрузка, итог может быть меньше N")
     if source in ("ofdata", "ofdata_api"):
         return _collect_ofdata(inds, count, min_revenue, region, base, account, json_out, per_ind)
     if source in ("checko", "checko_api", "api"):
@@ -865,8 +874,17 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
     threshold = max(float(min_revenue), float(RP.MIN_REVENUE_FLOOR))
     browser = (os.environ.get("RUSPROFILE_BROWSER") or "playwright").strip().lower()
+    # Гейт ССЧ: сервер фильтрует выдачу по sshr_from, а год подтверждает карточка
+    # (staff_gate), поэтому из выдачи берётся резерв сверх N на отрасль.
+    try:
+        min_staff = RP.lead_min_staff()
+        reserve = RP.staff_reserve(per_ind, min_staff)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     print(f"[1/2] RusProfile/{browser}: {inds} | порог >={threshold / 1e9:g} млрд"
-          + (f" | регион {region}" if region else ""))
+          + (f" | регион {region}" if region else "")
+          + (f" | ССЧ >={min_staff} за {RP.STAFF_YEAR} (сервер + карточка, "
+             f"резерв +{reserve} на отрасль)" if min_staff else " | ССЧ не проверяется"))
     leads = []
     res = {}
     if browser in ("playwright", "pw"):
@@ -880,8 +898,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
                 with RusProfilePlaywrightSession(
                         headless=headless, offscreen=offscreen) as rs:
                     leads = RP.harvest(
-                        inds, min_revenue=threshold, per_industry=per_ind,
-                        region=region, out_path=json_out, session=rs)
+                        inds, min_revenue=threshold, per_industry=per_ind + reserve,
+                        region=region, out_path=json_out, session=rs,
+                        exclude=crm_index, min_staff=min_staff)
                     if not leads:
                         raise RusProfilePlaywrightError(
                             "расширенный поиск вернул пустой список")
@@ -904,9 +923,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         for attempt in (1, 2):
             try:
                 leads = RP.harvest(
-                    inds, min_revenue=threshold, per_industry=per_ind,
+                    inds, min_revenue=threshold, per_industry=per_ind + reserve,
                     region=region, headless=headless, out_path=json_out,
-                    offscreen=offscreen)
+                    offscreen=offscreen, exclude=crm_index, min_staff=min_staff)
             except Exception as e:
                 print(f"[1/2] RusProfile/UC: {str(e)[:160]}")
                 leads = []
@@ -936,6 +955,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     if res.get("locked"):
         raise SystemExit("Контакты RusProfile закрыты — платная сессия протухла. Один раз: "
                          f"py rusprofile_session.py --login (сырой список уже сохранён: {json_out})")
+    # Окончательный гейт ССЧ по карточке и обрезка резерва до N на отрасль —
+    # ДО _select, иначе резерв одной отрасли добил бы недобор другой.
+    leads = RP.staff_gate(leads, per_ind, min_staff, log=print)
     picked = pipeline._select(leads, count, inds)
     pipeline._save(picked, json_out)
     print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
@@ -1366,7 +1388,8 @@ async def main():
                     help="остановиться после ФАЗЫ 1: лиды сохраняются в JSON, ресёрч не запускается")
     ap.add_argument("--push-crm", dest="push_crm", action="store_true",
                     help="с --collect-only: выгрузить собранных лидов в CRM сразу после ФАЗЫ 1 "
-                         "(upsert по ИНН, без ресёрча и писем)")
+                         "(без ресёрча и писем); уже заведённые в CRM отсеиваются в выдаче "
+                         "RusProfile до карточки, так что N — это N новых")
     ap.add_argument("--per-industry", dest="per_industry", type=int, default=None,
                     help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
@@ -1520,9 +1543,21 @@ async def main():
                 _collect_state_owned, a.count, headless, offscreen,
                 a.base, a.account, json_out, not a.dry_run)
         else:
+            crm_index = None
+            if a.push_crm:
+                # Индекс — ДО RusProfile и fail-closed, как в госрежиме: без него
+                # «собрать 50 новых» выродилось бы в «50 минус дубли», а окно
+                # выдачи и карточки ушли бы на компании, которые CRM уже знает.
+                from crm_push import CRMIndexError, fetch_existing_leads
+                try:
+                    crm_index = await asyncio.to_thread(fetch_existing_leads)
+                except CRMIndexError as e:
+                    raise SystemExit(f"--push-crm: {e}") from None
+                print(f"[CRM] индекс существующих лидов загружен: {crm_index.total} "
+                      "— уже заведённые отсеиваются до карточки")
             leads = await asyncio.to_thread(
                 _collect, a.industries, a.count, a.min_revenue, a.region,
-                headless, offscreen, a.base, a.account, json_out)
+                headless, offscreen, a.base, a.account, json_out, crm_index)
     elif a.leads:                                     # готовый JSON — только ресёрч
         leads = json.load(open(a.leads, encoding="utf-8"))
     else:

@@ -23,13 +23,25 @@ class FakeSession:
         self.items = items
         self.calls = []
 
-    def search(self, okved, revenue_from, max_pages=20, **_kwargs):
+    def search(self, okved, revenue_from, max_pages=20, **kwargs):
         self.calls.append({
             "okved": list(okved),
             "revenue_from": revenue_from,
             "max_pages": max_pages,
+            "region_codes": kwargs.get("region_codes"),
+            "staff_from": kwargs.get("staff_from"),
         })
         return list(self.items)
+
+
+class FakeIndex:
+    """Индекс CRM для harvest(exclude=...): только contains(lead), как ExistingLeads."""
+
+    def __init__(self, inns):
+        self.inns = set(inns)
+
+    def contains(self, lead):
+        return (lead.get("_inn") or "") in self.inns
 
 
 def _item(inn, revenue, *, region="Республика Татарстан", inactive=False,
@@ -480,8 +492,12 @@ def main() -> int:
         "pain": "",
         "offer": "",
     }
-    old_pages = os.environ.get("RUSPROFILE_MAX_PAGES")
+    old_env = {name: os.environ.get(name)
+               for name in ("RUSPROFILE_MAX_PAGES", "RUSPROFILE_REGION_CODE")}
     os.environ["RUSPROFILE_MAX_PAGES"] = "20"
+    # Округ одним запросом: список кодов уходит серверу списком, а не одной строкой
+    # «16, 02» — такую RusProfile отвечает «Некорректные входные параметры».
+    os.environ["RUSPROFILE_REGION_CODE"] = "16, 02"
     try:
         fake = FakeSession([
             _item("1000000001", 1_100_000_000),
@@ -493,25 +509,59 @@ def main() -> int:
             # мало людей — мимо, показатель только за прошлый год — тоже мимо.
             _item("1000000007", 7_000_000_000, staff="20"),
             _item("1000000008", 6_000_000_000, staff_year="2024"),
+            # Уже заведена в CRM: самая крупная, но в счёт per_industry не идёт —
+            # «собрать N» с выгрузкой в CRM значит N новых.
+            _item("1000000009", 9_500_000_000),
+            # Живая выдача 2026-09-04: ключей sshr в items нет вовсе. Такую
+            # компанию нельзя отсеять вслепую — её численность решит карточка.
+            {k: v for k, v in _item("1000000010", 5_500_000_000).items()
+             if k not in ("sshr", "sshr_year")},
         ])
         leads = RP.harvest(
             [industry],
             min_revenue=1,
-            per_industry=2,
+            per_industry=3,
             session=fake,
+            exclude=FakeIndex({"1000000009"}),
         )
     finally:
         RP.INDUSTRY.pop(industry, None)
-        if old_pages is None:
-            os.environ.pop("RUSPROFILE_MAX_PAGES", None)
-        else:
-            os.environ["RUSPROFILE_MAX_PAGES"] = old_pages
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     assert len(fake.calls) == 1
     assert fake.calls[0]["revenue_from"] == RP.MIN_REVENUE_FLOOR
     assert fake.calls[0]["max_pages"] == RP.MAX_SEARCH_PAGES
-    assert [lead["_inn"] for lead in leads] == ["1000000002", "1000000004"]
-    assert [lead["_revenue"] for lead in leads] == [9_000_000_000, 5_000_000_000]
+    assert fake.calls[0]["region_codes"] == ["16", "02"], fake.calls[0]["region_codes"]
+    assert fake.calls[0]["staff_from"] == RP.DEFAULT_MIN_STAFF, "серверный предфильтр ССЧ не ушёл"
+    assert [lead["_inn"] for lead in leads] == ["1000000002", "1000000010", "1000000004"]
+    assert [lead["_revenue"] for lead in leads] == [9_000_000_000, 5_500_000_000, 5_000_000_000]
+
+    # Гейт по карточке: fail-closed по году и порогу, резерв режется до N на отрасль,
+    # недобор одной отрасли НЕ добивается другой.
+    def _lead(inn, rev, ind, staff, year):
+        return {"_inn": inn, "_revenue": rev, "_industry": ind,
+                "_staff_count": staff, "_staff_year": year}
+    gated = RP.staff_gate([
+        _lead("1", 9e9, "a", 250, 2025),
+        _lead("2", 8e9, "a", 20, 2025),      # ниже порога
+        _lead("3", 7e9, "a", 300, 2024),     # только прошлый год
+        _lead("4", 6e9, "a", 50, 2025),      # ровно порог — проходит
+        _lead("5", 5e9, "a", 70, 2025),      # резерв: третий в отрасли, лишний
+        _lead("6", 4e9, "b", None, None),    # карточка не дала показатель
+        _lead("7", 3e9, "b", 60, 2025),
+    ], per_industry=2, min_staff=50)
+    assert [l["_inn"] for l in gated] == ["1", "4", "7"], [l["_inn"] for l in gated]
+    assert RP.staff_reserve(50, 50) == 10, RP.staff_reserve(50, 50)
+    assert RP.staff_reserve(5, 50) == 3, "резерв не меньше трёх"
+    assert RP.staff_reserve(50, 0) == 0, "без гейта резерв не берётся"
+    only_trim = RP.staff_gate([_lead("8", 1e9, "a", None, None)], 1, 0)
+    assert [l["_inn"] for l in only_trim] == ["8"]
+    assert "oilgas" in RP.INDUSTRY
+    assert "06.10.1" in RP.INDUSTRY["oilgas"]["okved"], "нужны виды ОКВЭД, не только группы"
     assert all(lead["_revenue"] >= RP.MIN_REVENUE_FLOOR for lead in leads)
     marker_item = _item("1000000006", 2_000_000_000)
     marker_item["main_okved_id"] = "!~.~1.01"
@@ -531,7 +581,8 @@ def main() -> int:
         RP._save(leads, nested)
         assert nested.is_file()
 
-    print("test_rusprofile_playwright: OK — cookie safe, floor 1B, descending selection")
+    print("test_rusprofile_playwright: OK — cookie safe, floor 1B, descending selection, "
+          "CRM index skipped before card, staff gate on card")
     return 0
 
 

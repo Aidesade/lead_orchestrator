@@ -27,6 +27,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import re
@@ -83,6 +84,63 @@ def staff_verdict(lead, min_staff, year=STAFF_YEAR):
     if count is None or staff_year != year:
         return "unknown"
     return "ok" if count >= min_staff else "below"
+
+
+def staff_reserve(per_industry, min_staff):
+    """Сколько компаний сверх N брать из выдачи под отсев по карточке (0 без гейта).
+
+    Дефолт — 20% от N, не меньше 3. `LEAD_STAFF_RESERVE` задаёт число явно: нужен
+    для добора, когда верх выдачи уже занят компаниями, которые карточка отвергла
+    (без показателя за STAFF_YEAR): они не в CRM, снова попадут в выборку и снова
+    отсеются, так что резерв должен покрыть и их."""
+    if not min_staff:
+        return 0
+    raw = str(os.environ.get("LEAD_STAFF_RESERVE", "") or "").strip()
+    if not raw:
+        return max(3, (int(per_industry) + 4) // 5)   # ceil(20% от N), не меньше 3
+    try:
+        return max(0, int(raw))
+    except ValueError as exc:
+        raise ValueError(
+            "LEAD_STAFF_RESERVE должен быть целым числом компаний") from exc
+
+
+def staff_gate(leads, per_industry, min_staff, log=None):
+    """Окончательный гейт ССЧ по карточке и обрезка резерва до N на отрасль.
+
+    Выдача advanced-search показателя численности НЕ несёт (проверено вживую
+    2026-09-04: ключей `sshr` в items нет вовсе), а серверный `sshr_from` —
+    предфильтр без года. Поэтому `harvest` берёт из выдачи резерв сверх N,
+    карточка дописывает `_staff_count`/`_staff_year`, а здесь неподходящие
+    отсеиваются fail-closed (ниже порога или нет показателя за STAFF_YEAR) и
+    каждая отрасль режется до N по убыванию выручки — ДО общего отбора, чтобы
+    резерв одной отрасли не добивал другую. `min_staff` = 0 — только обрезка."""
+    log = log or (lambda *_a, **_k: None)
+    per_industry = max(1, int(per_industry))
+    kept, dropped = [], collections.Counter()
+    for lead in leads:
+        verdict = staff_verdict(lead, min_staff) if min_staff else "ok"
+        if verdict == "ok":
+            kept.append(lead)
+        else:
+            dropped[verdict] += 1
+    if min_staff:
+        log(f"[ССЧ] гейт >={min_staff} за {STAFF_YEAR} по карточке: прошло "
+            f"{len(kept)} из {len(leads)}"
+            + (f" | ниже порога {dropped['below']}" if dropped["below"] else "")
+            + (f" | нет показателя за {STAFF_YEAR}: {dropped['unknown']}"
+               if dropped["unknown"] else ""))
+    by_ind = collections.defaultdict(list)
+    for lead in kept:
+        by_ind[lead.get("_industry")].append(lead)
+    out = []
+    for ind, rows in by_ind.items():
+        rows.sort(key=lambda lead: lead.get("_revenue") or 0, reverse=True)
+        if min_staff and len(rows) < per_industry:
+            log(f"[ССЧ] {ind}: после гейта {len(rows)} из {per_industry} — "
+                "резерв выдачи отсев не покрыл")
+        out.extend(rows[:per_industry])
+    return out
 
 # ОКВЭД-2 коды по отраслям (RusProfile использует текущий ОКВЭД-2014).
 # Боль/оффер — те же, что в build_bigleads + ОПК.
@@ -147,6 +205,28 @@ INDUSTRY = {
         "okved": ["05.1", "05.2", "06.1", "06.2", "07.1", "07.2", "08.1", "08.9", "09.1", "09.9"],
         "pain": "Аварийность и простои оборудования, безопасность, геологоразведка, энергоёмкость",
         "offer": "Предиктивное ТОиР, CV-контроль безопасности, ИИ-анализ геоданных, оптимизация добычи и логистики",
+    },
+    # ⚠️ advanced-search с okved_strict матчит ТОЧНЫЙ main_okved_id: «06.10» не
+    # ловит «06.10.1», а по группе «06.1» во всём ПФО находится одна компания
+    # (проверено вживую 2026-09-04). Поэтому здесь перечислены ВСЕ уровни, включая
+    # виды; секции выше уровня групп (mining, agriculture, trade…) тем же XHR
+    # находят почти ничего — не «чинить» их добавлением групп, только видами.
+    "oilgas": {
+        "label": "Нефтегаз (добыча нефти и газа, нефтесервис, нефтепереработка, "
+                 "трубопроводы, газораспределение)",
+        "okved": [
+            "06.10", "06.10.1", "06.10.2", "06.10.3",             # нефть и попутный газ
+            "06.20", "06.20.1", "06.20.2",                        # природный газ, конденсат
+            "09.10", "09.10.1", "09.10.2", "09.10.3", "09.10.4", "09.10.9",  # нефтесервис
+            "19.20", "19.20.1", "19.20.2", "19.20.9",             # нефтепереработка
+            "49.50", "49.50.1", "49.50.11", "49.50.12",           # трубопроводы: нефть
+            "49.50.2", "49.50.21", "49.50.22",                    # трубопроводы: газ
+            "35.21", "35.22", "35.23",                            # газ: производство, ГРО, сбыт
+        ],
+        "pain": "Простои и аварии на промысле и НПЗ, промбезопасность, геология, "
+                "энергоёмкость, регламентная документация",
+        "offer": "Предиктивное ТОиР скважин и установок, CV-контроль ОТ и ПБ, "
+                 "ИИ-анализ геоданных, RAG по регламентам и ПБ",
     },
     "manufacturing": {
         "label": "Обрабатывающие производства",
@@ -563,13 +643,16 @@ def region_code_filter():
     RusProfile отдаёт только этот субъект, и в те же 20 страниц влезает весь регион,
     а не его случайный срез из общероссийского топа. Клиентский фильтр при этом
     НЕ отключается: код — ускоритель выдачи, а решение о регионе остаётся за
-    `region_included()`, иначе опечатка в коде тихо впустила бы чужой субъект."""
+    `region_included()`, иначе опечатка в коде тихо впустила бы чужой субъект.
+    Список через запятую (`16,02,63`) — округ одним запросом, как
+    `STATE_LEAD_REGION_CODE` в госрежиме."""
     return str(os.environ.get("RUSPROFILE_REGION_CODE", "") or "").strip()
 
 
 def _harvest_with_session(session, industries, min_revenue, per_industry, region,
-                          out_path, exclude_regions, max_pages, min_staff=0):
-    region_code = region_code_filter()
+                          out_path, exclude_regions, max_pages, min_staff=0,
+                          exclude=None):
+    region_codes = [c.strip() for c in region_code_filter().split(",") if c.strip()] or None
     inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
     if exclude_regions:                    # явные исключения (обратная совместимость)
         exc = (exc or []) + list(exclude_regions)
@@ -588,14 +671,16 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
         # Поэтому при региональном сборе решает не глубина листания, а серверный
         # фильтр по коду субъекта: тот же construction по Башкортостану дал 25 из
         # тысячи по стране против 54 по коду «02» — вдвое больше и без мусора.
+        # Серверный предфильтр ССЧ (`sshr_from`, без года): в items показателя
+        # нет, окончательно решает карточка — см. staff_gate().
         items = session.search(cfg["okved"], min_revenue, max_pages=max_pages,
-                               region_codes=[region_code] if region_code else None)
+                               region_codes=region_codes, staff_from=min_staff or None)
         items = sorted(
             (it for it in items if isinstance(it, dict)),
             key=lambda it: revenue_value(it.get("finance_revenue")) or -1,
             reverse=True,
         )
-        kept = skipped_staff = 0
+        kept = skipped_staff = skipped_known = 0
         for it in items:
             inn = (it.get("inn") or "").strip()
             if not inn or inn in by_inn:
@@ -613,10 +698,17 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
             # пропустить пустую/некорректную выручку или регрессию API.
             if lead["_revenue"] is None or lead["_revenue"] < min_revenue:
                 continue
-            # Порог ССЧ — по sshr из той же выдачи: карточка ещё не открывалась,
-            # а показатель в XHR уже есть. Нет показателя за STAFF_YEAR — отказ.
-            if min_staff and staff_verdict(lead, min_staff) != "ok":
+            # Порог ССЧ по выдаче — только если она вообще несёт показатель
+            # (живой XHR его не отдаёт, 2026-09-04); иначе решает карточка,
+            # а отказывать вслепую значило бы отсеять всех.
+            if min_staff and "sshr" in it and staff_verdict(lead, min_staff) != "ok":
                 skipped_staff += 1
+                continue
+            # Уже заведённые (индекс CRM) — мимо, и ДО карточки: «собрать N» при
+            # выгрузке в CRM значит N новых, а не N минус дубли, которые CRM
+            # потом всё равно отбросит, зато окно выдачи и карточки уже потрачены.
+            if exclude is not None and exclude.contains(lead):
+                skipped_known += 1
                 continue
             by_inn[inn] = lead
             kept += 1
@@ -625,7 +717,8 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
         log(f"  -> отобрано {kept} по убыванию выручки (порог >={min_revenue/1e9:g} млрд"
             + (f", ССЧ >={min_staff} за {STAFF_YEAR}" if min_staff else "")
             + (f", регион «{region}»" if has_filter else "") + ")"
-            + (f"; по ССЧ отсеяно {skipped_staff}" if skipped_staff else ""))
+            + (f"; по ССЧ отсеяно {skipped_staff}" if skipped_staff else "")
+            + (f"; уже в CRM {skipped_known}" if skipped_known else ""))
         if out_path:
             _save(list(by_inn.values()), out_path)
     res = list(by_inn.values())
@@ -650,11 +743,13 @@ def _browser_session_class():
 
 def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
             headless=False, out_path=None, exclude_regions=None, offscreen=False,
-            session=None, max_pages=None, min_staff=None):
+            session=None, max_pages=None, min_staff=None, exclude=None):
     """Собрать лиды; переданный session удобен для одной Playwright-context Фазы 1.
 
     ``min_staff`` (дефолт — ``LEAD_MIN_STAFF``, 50) — нижняя граница ССЧ за
-    ``STAFF_YEAR``; 0 выключает фильтр."""
+    ``STAFF_YEAR``; 0 выключает фильтр. ``exclude`` — объект с ``contains(lead)``
+    (индекс лидов CRM `crm_push.ExistingLeads`): такие компании не идут в счёт
+    ``per_industry`` и не открываются карточкой."""
     min_revenue = max(float(min_revenue), float(MIN_REVENUE_FLOOR))
     per_industry = max(1, int(per_industry))
     min_staff = lead_min_staff() if min_staff is None else max(0, int(min_staff))
@@ -667,7 +762,7 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
 
     args = (
         industries, min_revenue, per_industry, region, out_path,
-        exclude_regions, max_pages, min_staff,
+        exclude_regions, max_pages, min_staff, exclude,
     )
     if session is not None:
         return _harvest_with_session(session, *args)
@@ -799,7 +894,6 @@ def main():
     inds = [s.strip() for s in (a.industries or "construction,energy,processing").split(",") if s.strip()]
     rows = harvest(inds, min_revenue=a.min_revenue, per_industry=a.per_industry,
                    region=a.region, headless=a.headless, out_path=a.out)
-    import collections
     by = collections.Counter(l["_industry"] for l in rows)
     log(f"\nГОТОВО: {len(rows)} компаний | по отраслям: {dict(by)} | {int(time.time()-t0)}с -> {a.out}")
 
