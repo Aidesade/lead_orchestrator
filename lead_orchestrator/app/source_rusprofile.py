@@ -37,7 +37,10 @@ import time
 import undetected_chromedriver as uc
 
 from browser_util import chrome_major  # version_main под реально установленный Chrome
-from okved2_codes import OKVED2_SECTION_C  # раздел C для отрасли manufacturing
+from okved2_codes import (  # раздел C — отрасль manufacturing, раздел D — energy
+    OKVED2_SECTION_C,
+    OKVED2_SECTION_D,
+)
 
 uc.Chrome.__del__ = lambda self: None
 
@@ -148,8 +151,9 @@ def staff_gate(leads, per_industry, min_staff, log=None):
 INDUSTRY = {
     "energy": {
         "label": "Производство и распределение электроэнергии, газа и воды",
-        "okved": ["35", "35.1", "35.11", "35.12", "35.13", "35.14",
-                  "35.2", "35.21", "35.22", "35.23", "35.3", "35.30"],
+        # Все 49 кодов класса 35: точный матч main_okved_id, а ТЭЦ и сети сидят на
+        # видах 35.11.1 / 35.12.1 / 35.30.3 (партии по Башкортостану 2026-08).
+        "okved": sorted(OKVED2_SECTION_D),
         "pain": "Потери в сетях, аварийность оборудования, прогноз нагрузки, ручные обходы",
         "offer": "Прогноз нагрузки/аварий, ИИ-анализ обходов (дроны/CV), оптимизация режимов, аналитика сбыта",
     },

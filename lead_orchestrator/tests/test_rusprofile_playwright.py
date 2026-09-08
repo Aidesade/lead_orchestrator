@@ -569,6 +569,13 @@ def main() -> int:
     assert all(len(code) >= 5 for code in manu), "коды уровня групп NN.N матчатся почти ни с чем"
     assert all(10 <= int(code[:2]) <= 33 for code in manu), "чужой раздел в manufacturing"
     assert len(manu) == len(set(manu)) == 910, len(manu)
+    # «Энергетика» — класс 35 целиком: ТЭЦ, сети и теплосети регистрируют основной
+    # ОКВЭД видами 35.11.1 / 35.12.1 / 35.30.3, а 12 кодов уровня NN.NN их не ловили
+    # (партии по Башкортостану 2026-08: 9 энергетиков, из них 5 на таких кодах).
+    energy = RP.INDUSTRY["energy"]["okved"]
+    assert {"35.11.1", "35.12.1", "35.30.3", "35.30.11", "35.14", "35.23"} <= set(energy)
+    assert all(code == "35" or code.startswith("35.") for code in energy), "чужой класс в energy"
+    assert len(energy) == len(set(energy)) == 49, len(energy)
 
     # Регион: алиас — целым словом. «мск» голой подстрокой сидит внутри «Пермский»,
     # и Пермский край молча выпадал из отраслевых сборов по ПФО (найдено 2026-09-07).
