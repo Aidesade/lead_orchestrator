@@ -154,6 +154,20 @@ def _check_card_parsers() -> None:
     assert metrics["_revenue_year"] == 2025, metrics
     assert metrics["_revenue_display"] == "2,5 млрд руб.", metrics
 
+    # Компания под управляющей организацией: блока «Руководитель» нет, зато есть
+    # проверка «Массовый руководитель / не состоит» — раньше её хвост и читался как ЛПР
+    # (живые карточки ПАО «Газпром газораспределение Уфа» и ООО «БСК», 2026-09-09).
+    managed = RPW.card_facts(
+        "Юридический адрес\n450112, Республика Башкортостан, город Уфа\n"
+        "Управляющая организация\nАКЦИОНЕРНОЕ ОБЩЕСТВО \"БАШКИРСКАЯ ЭЛЕКТРОСЕТЕВАЯ КОМПАНИЯ\"\n"
+        "с 15 июля 2016 г.\nСреднесписочная численность\n392 сотрудника в 2025 году  3\n"
+        "Массовый руководитель\nне состоит\nМассовый учредитель\nне состоит\n")
+    assert "_ceo_fio" not in managed and "_ceo_post" not in managed, managed
+    assert managed["_managing_org"] == 'АКЦИОНЕРНОЕ ОБЩЕСТВО "БАШКИРСКАЯ ЭЛЕКТРОСЕТЕВАЯ КОМПАНИЯ"', managed
+    assert managed["_staff_count"] == 392, managed
+    indented = RPW.card_facts("  Руководитель  \n  Директор\n  Иванов Иван Иванович\n")
+    assert indented["_ceo_fio"] == "Иванов Иван Иванович", indented
+    assert "_managing_org" not in RPW.card_facts(CARD_LOCKED)
     masked_card = CARD_LOCKED.replace("Гребнева Татьяна Николаевна", "░░░░░░░ ░░░░░░")
     masked = RPW.card_facts(masked_card)
     assert "_ceo_fio" not in masked, "замаскированное ФИО нельзя выдавать за прочитанное"

@@ -101,8 +101,15 @@ def log(message):
 # (должность, ФИО, дата назначения) читается без профессионального доступа, а телефоны
 # и почта в это же время замаскированы. Поэтому разбор руководителя обязан идти ВЫШЕ
 # пейвол-гарда _contacts_from_current — иначе ЛПР теряется вместе с телефонами.
+# Заголовок блока — ОТДЕЛЬНОЙ строкой (`^`): без якоря регэксп цеплялся за хвост
+# «Массовый руководитель» в блоке проверок, и у компаний под управляющей организацией
+# (блока «Руководитель» у них нет вовсе) ЛПР читался как «не состоит / Массовый
+# учредитель» — так в партиях по Башкортостану 2026-08/09 (найдено 2026-09-09).
 _RE_MANAGER = re.compile(
-    r"Руководитель\s*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)", re.I)
+    r"^[ \t]*Руководитель[ \t]*\r?\n\s*([^\r\n]+)\s*\r?\n\s*([^\r\n]+)", re.I | re.M)
+# У таких компаний вместо руководителя — управляющая организация (название юрлица).
+_RE_MANAGING_ORG = re.compile(
+    r"^[ \t]*Управляющая организация[ \t]*\r?\n\s*([^\r\n]+)", re.I | re.M)
 # В подвале карточки: «Генеральный директор ООО "X" - Иванов Иван Иванович (ИНН 123456789012)».
 # 12 цифр — ИНН физлица (у организаций 10), это и отличает ЛПР от самой компании.
 _RE_PERSON_INN = re.compile(r"\(ИНН\s*(\d{12})\)")
@@ -138,6 +145,9 @@ def card_facts(text):
         if not _masked(post) and not _masked(fio):
             facts["_ceo_post"] = post
             facts["_ceo_fio"] = fio
+    managing = _RE_MANAGING_ORG.search(text)
+    if managing and not _masked(managing.group(1)):
+        facts["_managing_org"] = managing.group(1).strip()
     person_inn = _RE_PERSON_INN.search(text)
     if person_inn:
         facts["_ceo_inn"] = person_inn.group(1)
@@ -768,7 +778,7 @@ class RusProfilePlaywrightSession:
             if contacts.get("_ceo_fio") and not lead.get("_ceo_fio"):
                 facts += 1
             for key in (
-                "_ceo_post", "_ceo_fio", "_ceo_inn", "_capital",
+                "_ceo_post", "_ceo_fio", "_ceo_inn", "_managing_org", "_capital",
                 "_staff_count", "_staff_year", "_revenue_year", "_revenue_display",
             ):
                 if contacts.get(key) and not lead.get(key):
