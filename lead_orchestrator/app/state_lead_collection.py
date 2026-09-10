@@ -40,7 +40,7 @@ def load_local_registry_strict(path=None, log=SR.log):
 def _with_session(session, requested_count, crm_index, client_index, local_registry, ownership_verifier,
                   max_pages, max_candidates, deadline, out_path, log,
                   ownership_error_limit, card_error_limit, region_query, region_code,
-                  verify_ownership, tz_limit, min_staff):
+                  verify_ownership, tz_limit, min_staff, city_query):
     from rusprofile_playwright import RusProfileCardSourceError, RusProfileDeadlineReached
     from state_ownership import (StateOwnershipDeadline, StateOwnershipSourceError,
                                  region_matches)
@@ -56,6 +56,9 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
     # выручке, и Татарстана в первых 1000 строк единицы (боевой прогон: 24/1000).
     regions = split_regions(region_query)
     codes = split_regions(region_code)
+    # Город — второй, более узкий срез поверх субъекта: серверный фильтр
+    # RusProfile умеет только код региона, населённый пункт режем сами.
+    cities = SR.city_patterns(city_query)
 
     def in_region(value):
         """Регион подходит, если совпал ХОТЯ БЫ с одним из перечисленных."""
@@ -82,6 +85,7 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         "card_error": 0, "state_below_25": 0,
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
         "region_source": 0, "region_egrul": 0, "region_unknown": 0,
+        "city_source": 0,
         "tz_far": 0, "tz_unknown": 0,
         "time_limit": 0,
     }
@@ -127,6 +131,13 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
             if not verify_ownership and not source_region:
                 stats["region_unknown"] += 1
                 continue
+
+        # Город юрадреса — по адресу выдачи и тоже ДО карточки. Пустой адрес
+        # при заданном городе = отказ (fail-closed, как пустой регион): выписка
+        # ЕГРЮЛ подтверждает субъект, но не населённый пункт.
+        if cities and not SR.city_matches(item.get("address"), cities):
+            stats["city_source"] += 1
+            continue
 
         # Часовой пояс: по региону выдачи, отклонение от МСК не больше tz_limit
         # часов. Регион без известного офсета (или пустой) — отказ: «не поняли,
@@ -287,7 +298,8 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         f"ownership unknown {stats['state_unknown']} | "
         f"вне региона {stats['region_source'] + stats['region_egrul']} | "
         f"регион не подтверждён {stats['region_unknown']} | "
-        f"чужой пояс {stats['tz_far']} | пояс неизвестен {stats['tz_unknown']}")
+        + (f"вне города {stats['city_source']} | " if cities else "")
+        + f"чужой пояс {stats['tz_far']} | пояс неизвестен {stats['tz_unknown']}")
     if len(selected) != requested_count:
         if out_path:
             SR._save(selected, out_path)
@@ -351,15 +363,10 @@ def lead_tz_limit():
 
 
 def lead_region_query():
-    """Требуемый регион юрадреса госкомпании; ""/"*" — фильтр выключен явно.
+    """Требуемый регион юрадреса госкомпании (`STATE_LEAD_REGION`, дефолт Татарстан).
 
-    Значение ``*`` (или «любой») равносильно пустому: PowerShell не умеет
-    передать дочернему процессу ПУСТУЮ переменную ($env:X='' её удаляет,
-    и срабатывает дефолт «Татарстан») — нужен непустой явный отключатель."""
-    value = str(os.environ.get("STATE_LEAD_REGION", "Татарстан") or "").strip()
-    if value.lower().replace("ё", "е") in ("*", "любой", "любая", "все", "any"):
-        return ""
-    return value
+    ``*``/«любой» — явный отключатель фильтра (см. `SR.geo_query`)."""
+    return SR.geo_query("STATE_LEAD_REGION", "Татарстан")
 
 
 def split_regions(value):
@@ -376,6 +383,11 @@ def lead_region_code():
     Пустой ``STATE_LEAD_REGION_CODE=`` отключает только серверный фильтр:
     строгие гейты по выдаче и выписке ЕГРЮЛ работают независимо от него."""
     return str(os.environ.get("STATE_LEAD_REGION_CODE", "16") or "").strip()
+
+
+def lead_city_query():
+    """Населённый пункт юрадреса внутри региона (`STATE_LEAD_CITY`); пусто — фильтра нет."""
+    return SR.geo_query("STATE_LEAD_CITY")
 
 
 def lead_min_revenue():
@@ -412,7 +424,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
                         out_path=None, log=SR.log,
                         ownership_error_limit=3, card_error_limit=3,
                         region=None, verify_ownership=None, tz_limit=None,
-                        min_staff=None):
+                        min_staff=None, city=None):
     """Ровно N новых компаний: CRM→RusProfile→2025→ССЧ→[госдоля ≥25%]→регион/пояс.
 
     ``region`` (дефолт — ``STATE_LEAD_REGION`` = Татарстан) проверяется по субъекту РФ
@@ -422,7 +434,9 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     ``tz_limit`` (дефолт — ``STATE_LEAD_TZ_LIMIT``) — макс. |отклонение| часового
     пояса региона от МСК в часах; None — пояс не проверяется.
     ``min_staff`` (дефолт — ``LEAD_MIN_STAFF``, 50) — нижняя граница ССЧ за
-    ``SR.STAFF_YEAR`` по карточке; 0 выключает гейт."""
+    ``SR.STAFF_YEAR`` по карточке; 0 выключает гейт.
+    ``city`` (дефолт — ``STATE_LEAD_CITY``) сужает отбор до населённого пункта
+    юрадреса ВНУТРИ региона: серверный фильтр RusProfile города не знает."""
     try:
         requested_count = int(requested_count)
     except (TypeError, ValueError) as exc:
@@ -454,6 +468,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     card_error_limit = max(1, int(card_error_limit))
     region = lead_region_query() if region is None else str(region or "").strip()
     region_code = lead_region_code()
+    city = lead_city_query() if city is None else str(city or "").strip()
     if verify_ownership is None:
         verify_ownership = ownership_enabled()
     tz_limit = lead_tz_limit() if tz_limit is None else int(tz_limit)
@@ -464,6 +479,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
         + f" | регион: {region or 'любой'}"
         + (f" (по {'выписке ЕГРЮЛ' if verify_ownership else 'выдаче RusProfile'})"
            if region else "")
+        + (f" | город: {city} (по юрадресу выдачи)" if city else "")
         + (f" | серверный фильтр выдачи: код {region_code}"
            if region and region_code else "")
         + (f" | часовой пояс: МСК±{tz_limit} ч" if tz_limit is not None else ""))
@@ -492,7 +508,7 @@ def harvest_state_owned(requested_count, *, headless=False, offscreen=False,
     args = (
         requested_count, crm_index, client_index, local_registry, ownership_verifier, max_pages,
         max_candidates, deadline, out_path, log, ownership_error_limit, card_error_limit,
-        region, region_code, verify_ownership, tz_limit, min_staff,
+        region, region_code, verify_ownership, tz_limit, min_staff, city,
     )
     if session is not None:
         if not hasattr(session, "contacts_by_url"):

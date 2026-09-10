@@ -723,16 +723,21 @@ def _push_collected_to_crm(leads, json_out):
             f'py crm_push.py --leads "{json_out}"')
 
 
-def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True):
+def _collect_state_owned(count, headless, offscreen, base, account, json_out, push_crm=True,
+                         city=None):
     """Строгая Фаза 1: ровно N новых компаний с госдолей ≥25% и юрадресом региона
-    (дефолт — Татарстан, тумблер STATE_LEAD_REGION)."""
+    (дефолт — Татарстан, тумблер STATE_LEAD_REGION).
+
+    ``city`` (флаг --city, иначе STATE_LEAD_CITY) сужает отбор до населённого
+    пункта юрадреса внутри региона."""
     import source_rusprofile as RP
     import pipeline
     import rusprofile_session as RPS
     from crm_push import CRMIndexError, client_facts, fetch_existing_clients, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
-    from state_lead_collection import (lead_min_revenue, lead_region_query, lead_tz_limit,
-                                       load_local_registry_strict, ownership_enabled)
+    from state_lead_collection import (lead_city_query, lead_min_revenue, lead_region_query,
+                                       lead_tz_limit, load_local_registry_strict,
+                                       ownership_enabled)
     from state_ownership import OwnershipVerifier, RosimRegistry, StateOwnershipDeadline
 
     source = (os.environ.get("LEAD_SOURCE") or "rusprofile").strip().lower()
@@ -778,6 +783,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     except RuntimeError as exc:
         raise SystemExit(f"локальный реестр: {exc}") from None
     region_query = lead_region_query()
+    city_query = lead_city_query() if city is None else str(city or "").strip()
     tz_limit = lead_tz_limit()
     try:
         min_revenue = lead_min_revenue()
@@ -793,6 +799,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
         + ("прямая/косвенная госдоля >=25% | " if ownership_enabled()
            else "госдоля НЕ проверяется | ")
         + f"регион: {region_query or 'любой'}"
+        + (f" | город: {city_query}" if city_query else "")
         + (f" | пояс МСК±{tz_limit} ч" if tz_limit is not None else ""))
     from rusprofile_playwright import (
         RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
@@ -806,7 +813,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
                     count, session=session, crm_index=crm_index,
                     client_index=client_index, local_registry=local_registry,
                     ownership_verifier=verifier, deadline=deadline,
-                    out_path=json_out, log=print)
+                    out_path=json_out, log=print, city=city_query)
             break
         except RP.StateLeadExhausted as exc:
             reasons = ", ".join(
@@ -838,7 +845,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
 
 
 def _collect(industries, count, min_revenue, region, headless, offscreen, base, account, json_out,
-             crm_index=None):
+             crm_index=None, city=None):
     """ФАЗА 1 (первый агент): сбор -> контакты -> отбор -> JSON -> папки+заготовки на Диске.
     Источник — env LEAD_SOURCE: 'rusprofile' (по умолчанию, Playwright+cookie),
     'ofdata' или 'checko' (явные API-пути отката). Возвращает picked[].
@@ -846,7 +853,10 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     `crm_index` (`crm_push.ExistingLeads`, приходит с --push-crm) — уже заведённые
     в CRM компании отсеиваются в выдаче RusProfile ДО карточки, чтобы «N на
     отрасль» означало N новых. API-пути индекс не применяют: дубли у них отбросит
-    сама выгрузка, но объём в итоге окажется меньше запрошенного."""
+    сама выгрузка, но объём в итоге окажется меньше запрошенного.
+
+    `city` (флаг --city, иначе RUSPROFILE_CITY) — населённый пункт юрадреса:
+    сужает выдачу RusProfile до города внутри региона. API-пути его не знают."""
     import math
     import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
@@ -860,6 +870,9 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     if crm_index is not None and source not in ("rusprofile", "rp"):
         print("[CRM] ⚠ отсев уже заведённых до карточки работает только с RusProfile "
               f"(LEAD_SOURCE={source}); дубли отбросит выгрузка, итог может быть меньше N")
+    if city and source not in ("rusprofile", "rp"):
+        raise SystemExit(
+            f"--city работает только через RusProfile; получено LEAD_SOURCE={source!r}")
     if source in ("ofdata", "ofdata_api"):
         return _collect_ofdata(inds, count, min_revenue, region, base, account, json_out, per_ind)
     if source in ("checko", "checko_api", "api"):
@@ -883,6 +896,7 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit(str(e)) from None
     print(f"[1/2] RusProfile/{browser}: {inds} | порог >={threshold / 1e9:g} млрд"
           + (f" | регион {region}" if region else "")
+          + (f" | город {city}" if city else "")
           + (f" | ССЧ >={min_staff} за {RP.STAFF_YEAR} (сервер + карточка, "
              f"резерв +{reserve} на отрасль)" if min_staff else " | ССЧ не проверяется"))
     leads = []
@@ -900,7 +914,7 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
                     leads = RP.harvest(
                         inds, min_revenue=threshold, per_industry=per_ind + reserve,
                         region=region, out_path=json_out, session=rs,
-                        exclude=crm_index, min_staff=min_staff)
+                        exclude=crm_index, min_staff=min_staff, city=city)
                     if not leads:
                         raise RusProfilePlaywrightError(
                             "расширенный поиск вернул пустой список")
@@ -925,7 +939,8 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
                 leads = RP.harvest(
                     inds, min_revenue=threshold, per_industry=per_ind + reserve,
                     region=region, headless=headless, out_path=json_out,
-                    offscreen=offscreen, exclude=crm_index, min_staff=min_staff)
+                    offscreen=offscreen, exclude=crm_index, min_staff=min_staff,
+                    city=city)
             except Exception as e:
                 print(f"[1/2] RusProfile/UC: {str(e)[:160]}")
                 leads = []
@@ -1394,6 +1409,9 @@ async def main():
                     help="сколько лидов НА КАЖДУЮ отрасль (перекрывает --count: итог = N × число отраслей)")
     ap.add_argument("--min-revenue", type=float, default=1e9, help="порог выручки, ₽ (с --industries)")
     ap.add_argument("--region", default=None, help="регион названием/аббревиатурой (с --industries)")
+    ap.add_argument("--city", default=None,
+                    help="населённый пункт юрадреса внутри региона, напр. \"Октябрьский\" "
+                         "(работает и с --industries, и со --state-owned; только RusProfile)")
     ap.add_argument("--show-browser", dest="show_browser", action="store_true",
                     help="показать окно Chrome при сборе (по умолчанию СКРЫТО/headless)")
     ap.add_argument("--headless", action="store_true",
@@ -1541,7 +1559,7 @@ async def main():
         if a.state_owned:
             leads = await asyncio.to_thread(
                 _collect_state_owned, a.count, headless, offscreen,
-                a.base, a.account, json_out, not a.dry_run)
+                a.base, a.account, json_out, not a.dry_run, a.city)
         else:
             crm_index = None
             if a.push_crm:
@@ -1557,7 +1575,7 @@ async def main():
                       "— уже заведённые отсеиваются до карточки")
             leads = await asyncio.to_thread(
                 _collect, a.industries, a.count, a.min_revenue, a.region,
-                headless, offscreen, a.base, a.account, json_out, crm_index)
+                headless, offscreen, a.base, a.account, json_out, crm_index, a.city)
     elif a.leads:                                     # готовый JSON — только ресёрч
         leads = json.load(open(a.leads, encoding="utf-8"))
     else:

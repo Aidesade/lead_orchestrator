@@ -738,6 +738,57 @@ def check_staff_gate():
     print("  ✓ ССЧ: ниже 50 и без показателя за 2025 — отказ, ровно 50 проходит, 0 выключает")
 
 
+def check_city_filter():
+    """Город внутри региона: матч по населённому пункту юрадреса, а не подстрокой.
+
+    Боевой замер по Башкортостану 2026-09-11: из 22 адресов со словом
+    «октябрьск» шесть были улицей Октябрьской Революции в Уфе. Адрес пустой —
+    отказ (fail-closed): выписка ЕГРЮЛ подтверждает субъект, но не город."""
+    inns = [valid_test_inn(i) for i in range(120, 124)]
+    target = item(inns[0], "ООО Октябрьский завод")
+    target["address"] = "452606, Республика Башкортостан, город Октябрьский, Северная ул, зд. 60"
+    street = item(inns[1], "ООО Уфимская контора")
+    street["address"] = "450057, Республика Башкортостан, г. Уфа, ул. Октябрьской Революции, д. 48"
+    district = item(inns[2], "ООО Районная")
+    district["address"] = "452000, Республика Башкортостан, Октябрьский р-н, с. Ивановка"
+    blank = item(inns[3], "ООО Без адреса")
+    blank["address"] = ""
+    rows = [target, street, district, blank]
+    for row in rows:                       # регион у всех один — отбирает только город
+        row["region_name"] = "Республика Башкортостан"
+
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        1, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        region="Башкортостан", city="Октябрьский", verify_ownership=False,
+        log=lambda _line: None)
+    assert [lead["_inn"] for lead in leads] == [inns[0]], leads
+    for row in (street, district, blank):
+        assert row["url"] not in session.fact_calls, \
+            f"чужой город дошёл до карточки: {row['name']}"
+
+    # Недобор из-за города — обычное исчерпание с внятной причиной.
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    try:
+        SR.harvest_state_owned(
+            2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            region="Башкортостан", city="Октябрьский", verify_ownership=False,
+            log=lambda _line: None)
+    except SR.StateLeadExhausted as exc:
+        assert exc.found == 1 and exc.stats["city_source"] == 3, exc.stats
+    else:
+        raise AssertionError("недобор по городу принят за готовый результат")
+
+    # Пустой город — фильтра нет вовсе, адрес никого не отсекает.
+    session = FakeSession(rows, {row["url"]: facts() for row in rows})
+    leads = SR.harvest_state_owned(
+        4, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+        region="Башкортостан", city="", verify_ownership=False,
+        log=lambda _line: None)
+    assert len(leads) == 4, [lead["_inn"] for lead in leads]
+    print("  ✓ город: населённый пункт юрадреса, улица и район не в счёт")
+
+
 def main():
     print("добор госкомпаний — офлайн-регрессии:")
     check_exact_n_and_order()
@@ -754,6 +805,7 @@ def main():
     check_deadline_inside_search_is_not_exhaustion()
     check_invalid_target()
     check_region_filter()
+    check_city_filter()
     check_multi_region()
     check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()

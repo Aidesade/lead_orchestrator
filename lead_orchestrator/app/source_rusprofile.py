@@ -649,6 +649,73 @@ def parse_region_query(query):
     return (inc or None), (exc or None)
 
 
+# Тип населённого пункта в юрадресе RusProfile пишется двумя порядками:
+# «г. Октябрьский» / «город Октябрьский» (тип впереди) и «Октябрьский г»
+# (тип позади, формат ФИАС). Район из фильтра исключён намеренно: «Октябрьский
+# р-н» — не город Октябрьский.
+CITY_KINDS = r"(?:г|гор|город|пгт|дп|рп|с|село|п|пос|поселок|станица|аул|деревня)"
+
+
+# Тип НП, написанный пользователем: «г. Октябрьский» -> «октябрьский». Без этого
+# оба шаблона матча потребовали бы ВТОРОЙ тип перед введённым («г. г. Октябрьский»)
+# и фильтр молча не нашёл бы ничего. Пробел/точка обязательны, иначе «Салават»
+# лишился бы первой буквы как мнимого «с.».
+_CITY_PREFIX = re.compile(rf"^{CITY_KINDS}\.?\s+")
+
+
+def city_patterns(query):
+    """Свободный текст города -> список имён (lower, без Ё) для матча по юрадресу.
+    Несколько городов перечисляются через запятую. None = фильтра нет."""
+    text = str(query or "").strip().lower().replace("ё", "е")
+    names = [_CITY_PREFIX.sub("", tok.strip()) for tok in text.split(",") if tok.strip()]
+    return [name for name in names if name] or None
+
+
+def city_matches(address, patterns):
+    """True, если юрадрес указывает на один из городов фильтра (или фильтра нет).
+
+    Матч идёт по НАСЕЛЁННОМУ ПУНКТУ, а не подстрокой по всему адресу: боевой
+    замер по Башкортостану 2026-09-11 — из 22 адресов со словом «октябрьск»
+    шесть оказались улицей Октябрьской Революции в Уфе и Октябрьской улицей в
+    Салавате. Пустой адрес при заданном фильтре = отказ (fail-closed, как у
+    региона: «не поняли, где компания» не значит «в нашем городе»)."""
+    if not patterns:
+        return True
+    text = str(address or "").lower().replace("ё", "е")
+    if not text:
+        return False
+    for name in patterns:
+        esc = re.escape(name)
+        # Тип впереди: «, г. Октябрьский» / «, город Октябрьский». Хвост
+        # «р-н»/«район» отсекается лукахедом — район это не город.
+        ahead = rf"(?:^|[,;(])\s*{CITY_KINDS}\.?\s*{esc}(?![а-яa-z])(?!\s*(?:р-?н|район))"
+        # Тип позади: «, Октябрьский г,» (формат ФИАС).
+        behind = rf"(?:^|[,;(])\s*{esc}\s+{CITY_KINDS}\.?(?=[,;)]|$)"
+        if re.search(ahead, text) or re.search(behind, text):
+            return True
+    return False
+
+
+# Явные отключатели гео-фильтра: PowerShell не умеет передать дочернему процессу
+# ПУСТУЮ переменную ($env:X='' её удаляет, и срабатывает дефолт), поэтому нужен
+# непустой «фильтра нет».
+GEO_OFF_MARKERS = ("*", "любой", "любая", "все", "any")
+
+
+def geo_query(name, default=""):
+    """Значение гео-фильтра (регион/город) из env; ""/"*"/«любой» — выключен явно."""
+    value = str(os.environ.get(name, default) or "").strip()
+    return "" if value.lower().replace("ё", "е") in GEO_OFF_MARKERS else value
+
+
+def city_filter():
+    """Город клиентского фильтра обычного сбора (`RUSPROFILE_CITY`).
+
+    Регион остаётся отдельным фильтром: город сужает выдачу субъекта, а не
+    заменяет его — серверный `region`-код по-прежнему решает, что вообще придёт."""
+    return geo_query("RUSPROFILE_CITY")
+
+
 def region_code_filter():
     """Код субъекта РФ для СЕРВЕРНОГО фильтра выдачи (`RUSPROFILE_REGION_CODE`).
 
@@ -664,8 +731,9 @@ def region_code_filter():
 
 def _harvest_with_session(session, industries, min_revenue, per_industry, region,
                           out_path, exclude_regions, max_pages, min_staff=0,
-                          exclude=None):
+                          exclude=None, city=None):
     region_codes = [c.strip() for c in region_code_filter().split(",") if c.strip()] or None
+    cities = city_patterns(city)
     inc, exc = parse_region_query(region)  # 'НЕ Москва' -> inc=None, exc=['москва']
     if exclude_regions:                    # явные исключения (обратная совместимость)
         exc = (exc or []) + list(exclude_regions)
@@ -676,7 +744,8 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
     for ind in industries:
         cfg = INDUSTRY[ind]
         log(f"\n=== {ind}: {cfg['label']}"
-            + (f" | регион: {region}" if has_filter else "") + " ===")
+            + (f" | регион: {region}" if has_filter else "")
+            + (f" | город: {', '.join(cities)}" if cities else "") + " ===")
         # Живой ответ RusProfile не упорядочен по finance_revenue. Берём все
         # доступные страницы (API ограничивает их двадцатью), затем сортируем.
         # ⚠️ Двадцать страниц — это 1000 записей и жёсткий потолок САМОГО RusProfile:
@@ -693,7 +762,7 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
             key=lambda it: revenue_value(it.get("finance_revenue")) or -1,
             reverse=True,
         )
-        kept = skipped_staff = skipped_known = 0
+        kept = skipped_staff = skipped_known = skipped_city = 0
         for it in items:
             inn = (it.get("inn") or "").strip()
             if not inn or inn in by_inn:
@@ -705,6 +774,10 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
                 continue
             if region_excluded(reg, exclude_regions):
                 skipped_excl += 1
+                continue
+            # Город режется по юрадресу выдачи — до карточки, как и регион.
+            if cities and not city_matches(it.get("address"), cities):
+                skipped_city += 1
                 continue
             lead = item_to_lead(it, cfg, ind)
             # Сервер уже получил finance_revenue_from; перепроверка не даёт
@@ -729,7 +802,9 @@ def _harvest_with_session(session, industries, min_revenue, per_industry, region
                 break
         log(f"  -> отобрано {kept} по убыванию выручки (порог >={min_revenue/1e9:g} млрд"
             + (f", ССЧ >={min_staff} за {STAFF_YEAR}" if min_staff else "")
-            + (f", регион «{region}»" if has_filter else "") + ")"
+            + (f", регион «{region}»" if has_filter else "")
+            + (f", город «{', '.join(cities)}»" if cities else "") + ")"
+            + (f"; вне города {skipped_city}" if skipped_city else "")
             + (f"; по ССЧ отсеяно {skipped_staff}" if skipped_staff else "")
             + (f"; уже в CRM {skipped_known}" if skipped_known else ""))
         if out_path:
@@ -756,16 +831,18 @@ def _browser_session_class():
 
 def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
             headless=False, out_path=None, exclude_regions=None, offscreen=False,
-            session=None, max_pages=None, min_staff=None, exclude=None):
+            session=None, max_pages=None, min_staff=None, exclude=None, city=None):
     """Собрать лиды; переданный session удобен для одной Playwright-context Фазы 1.
 
     ``min_staff`` (дефолт — ``LEAD_MIN_STAFF``, 50) — нижняя граница ССЧ за
     ``STAFF_YEAR``; 0 выключает фильтр. ``exclude`` — объект с ``contains(lead)``
     (индекс лидов CRM `crm_push.ExistingLeads`): такие компании не идут в счёт
-    ``per_industry`` и не открываются карточкой."""
+    ``per_industry`` и не открываются карточкой. ``city`` (дефолт —
+    ``RUSPROFILE_CITY``) сужает выдачу до населённого пункта юрадреса."""
     min_revenue = max(float(min_revenue), float(MIN_REVENUE_FLOOR))
     per_industry = max(1, int(per_industry))
     min_staff = lead_min_staff() if min_staff is None else max(0, int(min_staff))
+    city = city_filter() if city is None else str(city or "").strip()
     if max_pages is None:
         max_pages = os.environ.get("RUSPROFILE_MAX_PAGES", str(MAX_SEARCH_PAGES))
     try:
@@ -775,7 +852,7 @@ def harvest(industries, min_revenue=1e9, per_industry=40, region=None,
 
     args = (
         industries, min_revenue, per_industry, region, out_path,
-        exclude_regions, max_pages, min_staff, exclude,
+        exclude_regions, max_pages, min_staff, exclude, city,
     )
     if session is not None:
         return _harvest_with_session(session, *args)

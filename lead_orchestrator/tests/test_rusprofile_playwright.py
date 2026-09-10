@@ -45,12 +45,13 @@ class FakeIndex:
 
 
 def _item(inn, revenue, *, region="Республика Татарстан", inactive=False,
-          staff="250", staff_year="2025"):
+          staff="250", staff_year="2025", address=""):
     return {
         "inn": inn,
         "name": f"Компания {inn}",
         "finance_revenue": revenue,
         "region": region,
+        "address": address,
         "inactive": inactive,
         "link": f"/id/{inn}",
         "main_okved_id": "10.11",
@@ -604,6 +605,73 @@ def main() -> int:
                  "Чувашская республика", "Республика Марий Эл"):
         assert RP.region_included(name, pfo_inc), name
     assert not RP.region_included("Москва", pfo_inc), "Москва пролезла в ПФО"
+
+    # Город — отдельный, более узкий срез: матч по населённому пункту юрадреса.
+    okt = RP.city_patterns("Октябрьский")
+    assert okt == ["октябрьский"], okt
+    assert RP.city_patterns("") is None, "пустой город — это «фильтра нет»"
+    assert RP.city_patterns("Уфа, Октябрьский") == ["уфа", "октябрьский"]
+    for good in (
+            "452606, Республика Башкортостан, город Октябрьский, Северная ул, зд. 60",
+            "452601, Республика Башкортостан, г. Октябрьский, ул. Садовое Кольцо, д. 30",
+            "Республика Башкортостан, г.Октябрьский, ул. Мира",
+            "452606, Республика Башкортостан, Октябрьский г, ул Северная, д 1"):
+        assert RP.city_matches(good, okt), good
+    for bad in (
+            "450057, Республика Башкортостан, г. Уфа, ул. Октябрьской Революции, д. 48",
+            "453266, Республика Башкортостан, г. Салават, Октябрьская ул., д. 37",
+            "452000, Республика Башкортостан, Октябрьский р-н, с. Ивановка",
+            ""):
+        assert not RP.city_matches(bad, okt), bad
+    assert RP.city_matches("что угодно", None), "пустой фильтр обязан пропускать всё"
+
+    # Тип НП во ВВОДЕ срезается: иначе шаблон потребовал бы второй тип перед ним
+    # и «--city "г. Октябрьский"» молча не нашёл бы ничего.
+    assert RP.city_patterns("г. Октябрьский") == ["октябрьский"]
+    assert RP.city_patterns("город Октябрьский, с. Ивановка") == ["октябрьский", "ивановка"]
+    assert RP.city_patterns("Салават") == ["салават"], "«с» съело первую букву города"
+    assert RP.city_matches(
+        "452606, Республика Башкортостан, город Октябрьский, Северная ул",
+        RP.city_patterns("г. Октябрьский"))
+    # Отключатель env — как у региона в госрежиме: «*» не должен уехать именем города
+    # (иначе фильтр молча не совпал бы ни с чем и сбор вернул бы ноль).
+    saved = os.environ.get("RUSPROFILE_CITY")
+    try:
+        for marker in ("*", "любой", "ЛЮБАЯ"):
+            os.environ["RUSPROFILE_CITY"] = marker
+            assert RP.city_filter() == "", marker
+        os.environ["RUSPROFILE_CITY"] = "Октябрьский"
+        assert RP.city_filter() == "Октябрьский"
+    finally:
+        os.environ.pop("RUSPROFILE_CITY", None)
+        if saved is not None:
+            os.environ["RUSPROFILE_CITY"] = saved
+
+    # Проводка города в обычный сбор: env-дефолт резолвится в harvest() (как порог
+    # ССЧ), а режется город клиентски, по адресу выдачи — серверный фильтр
+    # RusProfile умеет только код субъекта.
+    city_industry = "_rusprofile_city_test"
+    RP.INDUSTRY[city_industry] = {"label": "Тест города", "okved": ["10.11"],
+                                  "pain": "", "offer": ""}
+    old_city = os.environ.get("RUSPROFILE_CITY")
+    os.environ["RUSPROFILE_CITY"] = "Октябрьский"
+    try:
+        city_leads = RP.harvest(
+            [city_industry], min_revenue=1, per_industry=2, min_staff=0,
+            session=FakeSession([
+                _item("1000000011", 9_000_000_000,
+                      address="452606, Респ Башкортостан, г Октябрьский, ул Мира, д 1"),
+                _item("1000000012", 8_000_000_000,
+                      address="450057, Респ Башкортостан, г Уфа, ул Октябрьской Революции, д 48"),
+            ]))
+    finally:
+        RP.INDUSTRY.pop(city_industry, None)
+        if old_city is None:
+            os.environ.pop("RUSPROFILE_CITY", None)
+        else:
+            os.environ["RUSPROFILE_CITY"] = old_city
+    assert [lead["_inn"] for lead in city_leads] == ["1000000011"], city_leads
+
     assert all(lead["_revenue"] >= RP.MIN_REVENUE_FLOOR for lead in leads)
     marker_item = _item("1000000006", 2_000_000_000)
     marker_item["main_okved_id"] = "!~.~1.01"
