@@ -15,6 +15,7 @@ import json
 import os
 import time
 
+import site_verify as SV
 import source_rusprofile as SR
 from inn_util import valid_inn
 
@@ -86,6 +87,7 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         "state_unknown": 0, "ownership_source_error": 0, "accepted": 0,
         "region_source": 0, "region_egrul": 0, "region_unknown": 0,
         "city_source": 0,
+        "site_no_site": 0, "site_unreachable": 0, "site_no_phone": 0,
         "tz_far": 0, "tz_unknown": 0,
         "time_limit": 0,
     }
@@ -265,6 +267,17 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
             stats["time_limit"] = 1
             break
         SR._merge_state_contacts(lead, accepted_contacts)
+        # Сайт и телефоны — последний гейт, уже по контактам карточки: компания
+        # без живого сайта или без опубликованных на нём телефонов в добор не
+        # идёт (решение 2026-09-11). Отрасль ЖКХ стадию не проходит вовсе —
+        # телефоны там добываются иначе, см. site_verify.
+        site_verdict = SV.verify_lead(lead, deadline=deadline)
+        if site_verdict == "deadline":
+            stats["time_limit"] = 1
+            break
+        if site_verdict in SV.DROP_VERDICTS:
+            stats[f"site_{site_verdict}"] += 1
+            continue
         lead["_source_region"] = source_region
         if result is not None:
             lead.update({
@@ -299,6 +312,9 @@ def _with_session(session, requested_count, crm_index, client_index, local_regis
         f"вне региона {stats['region_source'] + stats['region_egrul']} | "
         f"регион не подтверждён {stats['region_unknown']} | "
         + (f"вне города {stats['city_source']} | " if cities else "")
+        + (f"без сайта {stats['site_no_site']} | "
+           f"сайт не отвечает {stats['site_unreachable']} | "
+           f"без телефонов на сайте {stats['site_no_phone']} | " if SV.enabled() else "")
         + f"чужой пояс {stats['tz_far']} | пояс неизвестен {stats['tz_unknown']}")
     if len(selected) != requested_count:
         if out_path:

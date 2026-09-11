@@ -733,6 +733,7 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
     import source_rusprofile as RP
     import pipeline
     import rusprofile_session as RPS
+    import site_verify as SV
     from crm_push import CRMIndexError, client_facts, fetch_existing_clients, fetch_existing_leads
     from crm_push import is_configured as crm_push_configured
     from state_lead_collection import (lead_city_query, lead_min_revenue, lead_region_query,
@@ -800,7 +801,9 @@ def _collect_state_owned(count, headless, offscreen, base, account, json_out, pu
            else "госдоля НЕ проверяется | ")
         + f"регион: {region_query or 'любой'}"
         + (f" | город: {city_query}" if city_query else "")
-        + (f" | пояс МСК±{tz_limit} ч" if tz_limit is not None else ""))
+        + (f" | пояс МСК±{tz_limit} ч" if tz_limit is not None else "")
+        + (" | сайт и телефоны проверяются" if SV.enabled()
+           else " | сайт НЕ проверяется"))
     from rusprofile_playwright import (
         RusProfileDeadlineReached, RusProfilePlaywrightError, RusProfilePlaywrightSession,
     )
@@ -860,6 +863,7 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
     import math
     import source_rusprofile as RP          # конфиг отраслей INDUSTRY нужен обоим источникам
     import pipeline
+    import site_verify as SV
 
     inds = [s.strip() for s in industries.split(",") if s.strip() in RP.INDUSTRY]
     if not inds:
@@ -887,18 +891,24 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("нет cookie RusProfile — один раз: py rusprofile_session.py --login")
     threshold = max(float(min_revenue), float(RP.MIN_REVENUE_FLOOR))
     browser = (os.environ.get("RUSPROFILE_BROWSER") or "playwright").strip().lower()
-    # Гейт ССЧ: сервер фильтрует выдачу по sshr_from, а год подтверждает карточка
-    # (staff_gate), поэтому из выдачи берётся резерв сверх N на отрасль.
+    # Резерв выдачи нужен обоим гейтам по карточке: ССЧ (сервер фильтрует выдачу
+    # по sshr_from, а год подтверждает только карточка — staff_gate) и проверке
+    # сайта. Оба отсеивают уже ПОСЛЕ открытия карточки, поэтому без запаса сверх
+    # N «N на отрасль» молча превратилось бы в недобор.
     try:
         min_staff = RP.lead_min_staff()
-        reserve = RP.staff_reserve(per_ind, min_staff)
+        staff_res = RP.staff_reserve(per_ind, min_staff)
+        site_res = SV.site_reserve(per_ind)
     except ValueError as e:
         raise SystemExit(str(e)) from None
+    reserve = staff_res + site_res
     print(f"[1/2] RusProfile/{browser}: {inds} | порог >={threshold / 1e9:g} млрд"
           + (f" | регион {region}" if region else "")
           + (f" | город {city}" if city else "")
           + (f" | ССЧ >={min_staff} за {RP.STAFF_YEAR} (сервер + карточка, "
-             f"резерв +{reserve} на отрасль)" if min_staff else " | ССЧ не проверяется"))
+             f"резерв +{staff_res} на отрасль)" if min_staff else " | ССЧ не проверяется")
+          + (f" | сайт и телефоны проверяются (резерв +{site_res} на отрасль)"
+             if SV.enabled() else " | сайт не проверяется"))
     leads = []
     res = {}
     if browser in ("playwright", "pw"):
@@ -971,8 +981,15 @@ def _collect(industries, count, min_revenue, region, headless, offscreen, base, 
         raise SystemExit("Контакты RusProfile закрыты — платная сессия протухла. Один раз: "
                          f"py rusprofile_session.py --login (сырой список уже сохранён: {json_out})")
     # Окончательный гейт ССЧ по карточке и обрезка резерва до N на отрасль —
-    # ДО _select, иначе резерв одной отрасли добил бы недобор другой.
-    leads = RP.staff_gate(leads, per_ind, min_staff, log=print)
+    # ДО _select, иначе резерв одной отрасли добил бы недобор другой. При включённой
+    # проверке сайта первая обрезка оставляет ещё и её резерв: гейт ССЧ бесплатен
+    # (данные уже в карточке), а сайт — это запросы наружу, и гонять их для
+    # компаний, отсеянных по численности, незачем.
+    leads = RP.staff_gate(leads, per_ind, min_staff, log=print,
+                          limit=per_ind + site_res)
+    leads, _ = SV.gate(leads, log=print)
+    if site_res:
+        leads = RP.staff_gate(leads, per_ind, 0, log=print)   # финальная обрезка до N
     picked = pipeline._select(leads, count, inds)
     pipeline._save(picked, json_out)
     print(f"[1/2] собрано {len(picked)} | JSON: {json_out}")
@@ -1450,7 +1467,20 @@ async def main():
                          "SMTP-проверка email — env PERSON_VERIFY_EMAIL=1, соцсети — PERSON_SOCIAL=1")
     ap.add_argument("--no-person-enrich", dest="person_enrich", action="store_false",
                     help="не обогащать ЛПР прямыми контактами")
+    # Проверка сайта и телефонов в ФАЗЕ 1 (site_verify) — ВКЛючена по умолчанию.
+    # Компания без живого сайта или без телефонов на нём в сбор не попадает;
+    # отрасль ЖКХ стадию не проходит (LEAD_SITE_VERIFY_SKIP).
+    _sv_default = (os.environ.get("LEAD_SITE_VERIFY", "1").strip().lower()
+                   not in ("0", "false", "no", "off", "нет"))
+    ap.add_argument("--site-verify", dest="site_verify", action="store_true",
+                    default=_sv_default,
+                    help="ФАЗА 1: проверять сайт компании и телефоны на нём — ВКЛ по умолчанию "
+                         "(телефон с сайта становится основным, номер карточки — в _phone_rusprofile)")
+    ap.add_argument("--no-site-verify", dest="site_verify", action="store_false",
+                    help="не проверять сайт и телефоны в ФАЗЕ 1 (=LEAD_SITE_VERIFY=0)")
     a = ap.parse_args()
+    # Значение флага едет дальше через env: его читают и модуль стадии, и дети.
+    os.environ["LEAD_SITE_VERIFY"] = "1" if a.site_verify else "0"
     _model_flag = str(a.model or "").strip().lower()
     # kimi* и glm* — оба шлюзовых runtime (OpenAI-совместимый путь), остальное -> claude.
     model_runtime = ("kimi" if _model_flag.startswith("kimi")

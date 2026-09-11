@@ -205,6 +205,9 @@ py company_research_agent.py --contacts "АО Рязаньавтодор 6234065
 # разовый прямой контакт ЛПР (ФИО+ИНН -> рабочие email/телефоны, только легитимные источники).
 # ⚠️ standalone-дефолты ПРОТИВОПОЛОЖНЫ оркестраторным: SMTP-проба и соцпоиск ВКЛ:
 py person_enrich.py "Руденко Сергей Александрович" 6234065445 --no-verify --no-social
+# разово по готовому JSON: жив ли сайт и какие телефоны на нём (та же стадия, что в ФАЗЕ 1):
+py site_verify.py "D:\лиды\leads_mining.json"          # только отчёт -> *_verified.json
+py site_verify.py "D:\лиды\leads_mining.json" --gate   # ещё и выбросить компании без сайта/телефонов
 # гипотезы почты ключевых сотрудников по домену компании (детерминированно, без LLM):
 py email_guess.py "Руденко Сергей Александрович" avtodor-rzn.ru
 py email_guess.py --leads "D:\лиды\leads_mining.json" --out "D:\лиды\emails_mining.json"
@@ -236,7 +239,8 @@ py -m uvicorn web.api.main:app --port 8000             # затем web/ui: npm 
 `--region "..."` (поддерживает ОТРИЦАНИЕ: `"НЕ Москва"`, `!X`, `-X`, `кроме X`; смешивание через
 запятую), `--city "Октябрьский"` (населённый пункт ЮРАДРЕСА внутри региона — работает и с
 `--industries`, и со `--state-owned`, только RusProfile; добавлено 2026-09-11), `--workers N` (2, авто→1 при <3 ГБ RAM — только в боевом запуске, в dry-run проверки нет),
-`--model kimi|glm`, `--no-presentation`, `--no-person-enrich`, `--show-browser`, `--out <json>`
+`--model kimi|glm`, `--no-presentation`, `--no-person-enrich`, `--no-site-verify` (ФАЗА 1 без
+проверки сайта и телефонов; по умолчанию проверка ВКЛ, см. ниже), `--show-browser`, `--out <json>`
 (плюс `--collect-only` — стоп после ФАЗЫ 1 и `--push-crm` — выгрузить собранное в CRM; второй
 работает только с первым: после ФАЗЫ 2 у госрежима свой batch исследованных лидов. С `--push-crm`
 обычный сбор, как и госрежим, читает GET-индекс CRM ДО RusProfile (fail-closed) и отсеивает уже
@@ -268,6 +272,7 @@ py test_research_enrichment.py   # scheduler/контракты/cache/DOCX-adapt
 py test_email_guess.py           # подбор почты: транслит, схема домена, привязка адреса к человеку
 py test_email_verify.py          # проверка ящика без отправки: коды SMTP, catch-all, «не проверили» ≠ «нет ящика»
 py test_rusprofile_playwright.py # cookie, порог 1 млрд, revenue-sort + разбор карточки (ЛПР под пейволом)
+py test_site_verify.py           # стадия ФАЗЫ 1 «сайт и телефоны»: отсев мёртвых сайтов, приоритет телефона сайта, ЖКХ мимо стадии
 py test_outreach.py              # ВЕТКА outreach: реестр, выбор адреса ЛПР, сборка письма
 py test_outlook_send.py          # ВЕТКА outreach: аккаунт tatar.ru, вложение, черновик vs отправка
 py test_crm_push.py              # ВЕТКА outreach, стадия 9: маппинг в контракт CRM (вкл. ССЧ), push_staff/purge_leads, сбой не летит наружу
@@ -297,7 +302,8 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 `... research_enrichment_agent.py --selftest`, плюс `patches/apply_patches.py --check`.
 
 **Docker build-gate** (`Dockerfile`) падает, если не прошли: `py_compile`, `test_deep_research.py`,
-`test_source_ofdata.py`, `test_source_girbo.py`, `test_rusprofile_playwright.py`, `test_kimi_only.py`,
+`test_source_ofdata.py`, `test_source_girbo.py`, `test_rusprofile_playwright.py`,
+`test_site_verify.py`, `test_kimi_only.py`,
 `test_claude_runtime.py`, `test_glm_runtime.py`, `test_kimi_agent_freedom.py`, `test_research_enrichment.py`,
 `test_email_guess.py`, `test_email_verify.py`, `test_outreach.py`, `test_verify_xlsx.py`,
 `test_outlook_send.py`, `test_crm_push.py`, `test_crm_staff_sync.py`, `test_state_ownership.py`,
@@ -392,6 +398,41 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 матчится по выдаче), `STATE_LEAD_TZ_LIMIT` (пусто; `=N` — принимать только регионы с
 часовым поясом в пределах МСК±N ч, карта поясов — `_REGION_TZ` в `state_lead_collection`).
 
+**Проверка сайта и телефонов (`site_verify`, добавлено 2026-09-11)** — стадия ФАЗЫ 1 сразу
+после карточки RusProfile, работает в ОБОИХ сборах (отраслевом и госрежиме). По компании:
+жив ли домен из карточки, его ли это сайт (ИНН в реквизитах страницы → `_site_inn_confirmed`)
+и какие телефоны на нём опубликованы (`tel:`-ссылки + текст контактных страниц).
+**Телефон с сайта становится основным `phone`** (и едет в CRM), номер карточки сохраняется в
+`_phone_rusprofile` и остаётся в `_phones` следом — ни один известный номер не теряется;
+совпадение проверяется по последним 10 цифрам (`_phone_verified`), почта — по адресу или
+домену (`_email_verified`). Причина: контакты RusProfile/Checko — перепечатка ЕГРЮЛ без даты,
+на прозвоне 200 компаний ~40 номеров оказались мёртвыми (замер, из-за которого написан
+`contact_source_probe.py`), а сайт компании свежее.
+
+- ⚠️ **Гейт жёсткий: нет живого сайта или нет телефонов на нём — компания выбрасывается из
+  сбора** (решение 2026-09-11). Поэтому из выдачи берётся ВТОРОЙ резерв сверх N
+  (`site_verify.site_reserve`, дефолт 30% от N, не меньше 3, тумблер `LEAD_SITE_RESERVE`) —
+  плюсом к резерву ССЧ. В госрежиме гейт стоит внутри цикла добора, поэтому «ровно N» цело,
+  а причины недобора видны в `StateLeadExhausted` (`site_no_site`/`site_unreachable`/
+  `site_no_phone`). ⚠️ В госрежиме проверка идёт ПОСЛЕДОВАТЕЛЬНО внутри цикла добора и тратит
+  общий `STATE_LEAD_MAX_SECONDS` (1200 с): на партии в сотню компаний дедлайн надо поднимать,
+  иначе прогон упрётся в `time_limit` вместо N.
+- ⚠️ **Отрасль ЖКХ (`water`) стадию НЕ проходит и по ней НЕ отсеивается** — телефоны там
+  добываются иначе. Список — `LEAD_SITE_VERIFY_SKIP` (дефолт `water`, синоним `жкх`; пустое
+  значение осознанно выключает исключения и проверяет всех).
+- Порядок в отраслевом сборе: гейт ССЧ (бесплатный, по карточке) → проверка сайта (запросы
+  наружу) → финальная обрезка до N. `staff_gate(..., limit=N+резерв_сайта)` отдаёт первой
+  обрезке запас, диагностика недобора при этом считается по настоящему N.
+- ⚠️ **Крупная компания за антиботом читается не всегда.** Замер 2026-09-11 обычным HTTP:
+  `kamaz.ru`, `tatavtodor.ru`, `sibur.ru` отдают телефоны с первой-второй страницы, а
+  `tatneft.ru` не отвечает ни по http, ни по https при живом домене (WAF/гео). Такие компании
+  попадают в «сайт не отвечает» и при жёстком гейте отсеиваются, поэтому вердикт различает
+  «домена нет» (`_site_dns_ok=False`) и «сервер не пустил» — в логе это отдельные цифры.
+  Браузерного фолбэка (Playwright) у стадии сознательно нет: он стоит как весь остальной сбор.
+- Стадия ходит ТОЛЬКО на сайт самой компании, по HTTP, без браузера и LLM; бюджет —
+  `LEAD_SITE_PAGES` ПОПЫТОК загрузки (6) с `LEAD_SITE_TIMEOUT` (9 с), потоков —
+  `LEAD_SITE_VERIFY_WORKERS` (8). Выключается `--no-site-verify` / `LEAD_SITE_VERIFY=0`.
+
 Дальше: отбор → `D:\лиды\leads_<отрасли>.json` (`--out`; .xlsx из боевой ФАЗЫ 1 убран 2026-07-06)
 → при `ORQ_STORE=disk` ещё и дерево `<--base>/<отрасль>/<категория полноты контактов>/<компания>/`
 с 3 файлами-заглушками, которые ФАЗА 2 перезапишет. Категория — по наличию email/телефона/сайта/ЛПР
@@ -482,7 +523,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 
 ## Карта кода
 
-Только то, что нужно знать до правки; утилиты (`email_finder`, `site_verify`, `harvest_inn_site`,
+Только то, что нужно знать до правки; утилиты (`email_finder`, `harvest_inn_site`,
 `inn_util`, `webutil`, `browser_util`, `build_excel`, `dadata_enrich`, `checko_enrich`,
 `revenue_enrich`, `okved2_codes`) открываются по имени.
 
@@ -506,6 +547,7 @@ kimi-режим — из venv Kimi-папки (см. её `CLAUDE.md`):
 | `outlook_send.py` | транспорт через Outlook Desktop (`win32com`, COM по потокам): выбор аккаунта `@tatar.ru` через `SendUsingAccount`, вложение one-pager, `Save()` vs `Send()`. Единственное место в репо, откуда письмо уходит наружу |
 | `outreach_letter.py` | текст письма: `build_prompt` (только проверенные факты) → модель через `claude_kimi_adapter` со спекой `kimi_agent/outreach_letter.yaml` → `parse_reply` → подпись и отписка КОДОМ |
 | `source_rusprofile.py` / `rusprofile_playwright.py` / `rusprofile_session.py` | штатный источник Фазы 1: карта `INDUSTRY` (22, вкл. `oilgas`), регион-фильтр с отрицанием; единая Playwright-context; создание cookie (`--login`, UC остался как `RUSPROFILE_BROWSER=uc`). `card_by_inn()` — карточка по ИНН тем же advanced-search XHR (`query`=ИНН): нужна лидам НЕ из RusProfile, у которых нет `_rusprofile_url`; публичный `/search?query=` отдаёт 404 (2026-08-28), а XHR сразу несёт ЛПР, адрес, ОКВЭД и выручку. По умолчанию ищет только ДЕЙСТВУЮЩИЕ — «не нашлось» значит в том числе «ликвидировано» |
+| `site_verify.py` | **стадия ФАЗЫ 1 «сайт и телефоны»** (оба сбора RusProfile): жив ли домен карточки, его ли это сайт (ИНН в реквизитах), какие телефоны на нём опубликованы (`tel:` + текст). Телефон сайта становится основным, номер карточки — в `_phone_rusprofile`. `verify_lead` — одна компания (её зовёт госдобор), `gate` — пачка в потоках (её зовёт `orchestrator._collect`), `site_reserve` — запас выдачи под отсев. ЖКХ (`water`) стадию не проходит. Сеть — только HTTP на сайт компании, без браузера и LLM |
 | `source_ofdata.py` / `source_checko.py` | API-пути (Docker и откат) |
 | `source_girbo.py` | **перечисление РЕГИОНА через ГИР БО ФНС** — бесплатно, без ключа. Нужен потому, что OfData и Checko матчат ОКВЭД ТОЧНО, а крупный бизнес сидит на детализированных кодах (Татнефть `19.20.1`, КАМАЗ `29.10.4`) и по `19.20` не находится вовсе. Поиск ГИР БО принимает ПРЕФИКС ИНН, а первые 4 цифры ИНН — код инспекции, то есть регион; в каждой записи сразу ОКВЭД, регион и выручка (`bfo.gainSum`, в ТЫСЯЧАХ ₽). Отрасль сопоставляется у нас и потому ПРЕФИКСНО. Пределы (замерены, документации нет): `size`≤200, `page*size`<10000 (дальше HTTP 500 — префикс дробится на пятизначный), пустой `query` не работает. Контактов не даёт — их добирает `ofdata_contacts_pass` |
 | `disk_organize.py` | пути/имена на Диске и в локальном хранилище поверх `connectors/yadisk_client` (`_mkdir`/`_upload` с ретраями на 423 и транзиентные сбои), заглушки .docx/.pdf (`_make_pdf` — голый stdlib-PDF, текст транслитерирован: базовые шрифты PDF кириллицу не несут) |
@@ -737,6 +779,16 @@ Microsoft 365 принимает почти всё и проверяет пол�
 (замер 2026-09-04 по ПФО: отказ карточки 24 из 60 в `processing`, 13 из 60 в `oilgas`). Источники без ССЧ (`ofdata`, `checko`,
 ГИР БО) порог не применяют — у них показателя нет. Кэш свода для CRM —
 `<ORQ_DATA_ROOT>/orq_cache/staff_index.json` (`STAFF_INDEX_TTL_D`, 30 дней).
+
+**Проверка сайта и телефонов (`site_verify`, оба сбора RusProfile):** `LEAD_SITE_VERIFY` (1;
+`0` или `--no-site-verify` — стадии нет вовсе и никто по сайту не отсеивается),
+`LEAD_SITE_VERIFY_SKIP` (`water` — ЖКХ; синоним `жкх`, пустое значение = проверять всех),
+`LEAD_SITE_RESERVE` (резерв выдачи под отсев; дефолт 30% от N, не меньше 3 — цифра оценочная,
+боевого замера доли мёртвых сайтов пока нет), `LEAD_SITE_VERIFY_WORKERS` (8),
+`LEAD_SITE_PAGES` (6 ПОПЫТОК загрузки на компанию: неудачная стоит того же таймаута, что
+удачная), `LEAD_SITE_TIMEOUT` (9 с). Поля в лиде — `_site_verdict`/`_site_reachable`/
+`_site_inn_confirmed`/`_site_phones`/`_phone_verified`/`_phone_rusprofile`. Подробности —
+в разделе ФАЗЫ 1.
 
 **Капы источников:** `RUSPROFILE_MAX_PAGES` (20), `RUSPROFILE_REGION_CODE` (пусто; код субъекта
 для СЕРВЕРНОГО фильтра обычного сбора, список через запятую = округ одним запросом, как

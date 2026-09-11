@@ -109,7 +109,7 @@ def staff_reserve(per_industry, min_staff):
             "LEAD_STAFF_RESERVE должен быть целым числом компаний") from exc
 
 
-def staff_gate(leads, per_industry, min_staff, log=None):
+def staff_gate(leads, per_industry, min_staff, log=None, limit=None):
     """Окончательный гейт ССЧ по карточке и обрезка резерва до N на отрасль.
 
     Выдача advanced-search показателя численности НЕ несёт (проверено вживую
@@ -118,9 +118,14 @@ def staff_gate(leads, per_industry, min_staff, log=None):
     карточка дописывает `_staff_count`/`_staff_year`, а здесь неподходящие
     отсеиваются fail-closed (ниже порога или нет показателя за STAFF_YEAR) и
     каждая отрасль режется до N по убыванию выручки — ДО общего отбора, чтобы
-    резерв одной отрасли не добивал другую. `min_staff` = 0 — только обрезка."""
+    резерв одной отрасли не добивал другую. `min_staff` = 0 — только обрезка.
+
+    `limit` — до скольких резать отрасль, если это НЕ финальный размер: сбор с
+    проверкой сайта режет до N + резерв сайта, а до N доводит вторым вызовом уже
+    после неё. Диагностика недобора при этом считается по настоящему N."""
     log = log or (lambda *_a, **_k: None)
     per_industry = max(1, int(per_industry))
+    limit = per_industry if limit is None else max(per_industry, int(limit))
     kept, dropped = [], collections.Counter()
     for lead in leads:
         verdict = staff_verdict(lead, min_staff) if min_staff else "ok"
@@ -143,7 +148,7 @@ def staff_gate(leads, per_industry, min_staff, log=None):
         if min_staff and len(rows) < per_industry:
             log(f"[ССЧ] {ind}: после гейта {len(rows)} из {per_industry} — "
                 "резерв выдачи отсев не покрыл")
-        out.extend(rows[:per_industry])
+        out.extend(rows[:limit])
     return out
 
 # ОКВЭД-2 коды по отраслям (RusProfile использует текущий ОКВЭД-2014).

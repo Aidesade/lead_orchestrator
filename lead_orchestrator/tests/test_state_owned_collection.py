@@ -7,11 +7,17 @@ import pathlib
 import sys
 import tempfile
 import time
+import urllib.error
 from decimal import Decimal
 
 HERE = pathlib.Path(__file__).resolve().parent
 APP = HERE.parent / "app"          # код пайплайна лежит рядом, в app/
 sys.path.insert(0, str(APP))
+
+# Стадия «сайт и телефоны» в добор встроена, но ходит в сеть -> здесь она
+# выключена, а её поведение проверяет отдельный check_site_gate() ниже и
+# test_site_verify.py. Переменная задаётся ДО импорта — читается она на вызове.
+os.environ["LEAD_SITE_VERIFY"] = "0"
 
 import source_rusprofile as SR  # noqa: E402
 import rusprofile_playwright as RPW  # noqa: E402
@@ -738,6 +744,77 @@ def check_staff_gate():
     print("  ✓ ССЧ: ниже 50 и без показателя за 2025 — отказ, ровно 50 проходит, 0 выключает")
 
 
+def check_site_gate():
+    """Сайт и телефоны: компания без живого сайта или без телефонов на нём не принимается.
+
+    Гейт стоит ПОСЛЕ контактов карточки (раньше сайт просто неизвестен) и режет
+    только те отрасли, которые стадию проходят: ЖКХ идёт мимо неё."""
+    inns = [valid_test_inn(i) for i in range(40, 45)]
+    names = ["ООО Без сайта", "ООО Мёртвый сайт", "ООО Без телефонов",
+             "ООО Водоканал", "ООО С телефоном"]
+    rows = [item(inn, name, revenue=5_000_000_000 - index * 1000)
+            for index, (inn, name) in enumerate(zip(inns, names))]
+    rows[3]["main_okved_id"] = "36.00"        # ЖКХ: отрасль water, стадию не проходит
+    metrics = {row["url"]: facts() for row in rows}
+    sites = {inns[0]: "", inns[1]: "dead.test", inns[2]: "nophone.test",
+             inns[3]: "", inns[4]: "live.test"}
+
+    class SiteSession(FakeSession):
+        def contacts_by_url(self, url, *, deadline=None):
+            super().contacts_by_url(url, deadline=deadline)
+            return {"emails": [], "phones": [],
+                    "website": sites[url.rsplit("/", 1)[-1]], "founders": []}
+
+    live = (f"<a href=\"tel:+7 (843) 292-11-22\">звонить</a>"
+            f"<footer>ИНН {inns[4]}</footer>")
+
+    def fake_fetch(url, timeout=None):
+        if "live.test" in url:
+            return live
+        if "nophone.test" in url:
+            return "<p>Сайт есть, телефонов нет</p>"
+        raise urllib.error.URLError("dead")
+
+    session = SiteSession(rows, metrics)
+    saved_fetch = SLC.SV._fetch
+    SLC.SV._dns_ok = lambda _url: False     # резолв домена — тоже сеть
+    os.environ["LEAD_SITE_VERIFY"] = "1"
+    SLC.SV._fetch = fake_fetch
+    try:
+        leads = SR.harvest_state_owned(
+            2, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            verify_ownership=False, region="", log=lambda *_: None)
+    finally:
+        SLC.SV._fetch = saved_fetch
+        os.environ["LEAD_SITE_VERIFY"] = "0"
+    assert [lead["_inn"] for lead in leads] == [inns[3], inns[4]], \
+        [lead["name"] for lead in leads]
+    zhkh, live_lead = leads
+    assert zhkh["_site_verdict"] == "skip", zhkh.get("_site_verdict")
+    assert live_lead["_site_verdict"] == "ok", live_lead.get("_site_verdict")
+    assert live_lead["phone"] == "+78432921122", live_lead["phone"]
+    assert live_lead["_site_inn_confirmed"] is True
+
+    # недобор из-за сайта виден в статистике причин, а не молча превращается в N-1
+    session = SiteSession(rows[:3], {row["url"]: facts() for row in rows[:3]})
+    os.environ["LEAD_SITE_VERIFY"] = "1"
+    SLC.SV._fetch = fake_fetch
+    try:
+        SR.harvest_state_owned(
+            1, session=session, crm_index=FakeCRM(), local_registry=FakeLocal(),
+            verify_ownership=False, region="", log=lambda *_: None)
+    except SR.StateLeadExhausted as exc:
+        assert exc.stats["site_no_site"] == 1, exc.stats
+        assert exc.stats["site_unreachable"] == 1, exc.stats
+        assert exc.stats["site_no_phone"] == 1, exc.stats
+    else:
+        raise AssertionError("компания без живого сайта прошла добор")
+    finally:
+        SLC.SV._fetch = saved_fetch
+        os.environ["LEAD_SITE_VERIFY"] = "0"
+    print("  ✓ сайт: мёртвый домен и сайт без телефонов в добор не идут, ЖКХ — мимо стадии")
+
+
 def check_city_filter():
     """Город внутри региона: матч по населённому пункту юрадреса, а не подстрокой.
 
@@ -806,6 +883,7 @@ def main():
     check_invalid_target()
     check_region_filter()
     check_city_filter()
+    check_site_gate()
     check_multi_region()
     check_no_ownership_and_timezone()
     check_corrupt_local_registry_is_hard()
